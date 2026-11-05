@@ -596,6 +596,44 @@ in Multi Level. Inspect its timing. Hanging poses, object interaction and larger
 animation edits are best handled in a 3D animation editor. Contact detection is
 an estimate and can leave residual sliding or penetration.
 
+## Self-contacts and pose corrections
+
+Self-contacts hold a hand on another body part (a hand holding a foot, hands
+together, a hand on the hip) over frame intervals. Foot pose rows set the foot's
+shape per interval. Both are edited on the timeline below the lock tracks, saved
+in the project at once and applied by **Apply Correction** together with the
+locks. They appear once the result has been corrected (otherwise the timeline shows
+**Apply Correction to edit self-contacts**). The same data is edited from the
+command line with `rgbmocap-cli contacts` (see [CLI.md](CLI.md)).
+
+| Row or control | Function |
+| --- | --- |
+| **RH→RF, LH→Hd, ...** | One row per pair: the hand (effector) and what it holds (target). Drag empty space to add an interval, drag it to move, drag its edges to resize; Delete removes the selected interval; Ctrl+Z / Ctrl+Y are shared with the locks. One hand holds one target at a time, so intervals of the same hand cannot overlap. |
+| **+ Pair** row | Right-click → **Add Contact Pair...** or **Suggest Contacts**. |
+| Row right-click | **Edit Pair Settings...**, **Disable/Enable Pair**, **Accept This Suggestion**, **Accept All Suggestions in Row**, **Reset Row to Automatic** (ranges become the suggestions), **Remove Row**. |
+| **Pair settings** | **Palm distance**: automatic or metres from palm to target. **Reciprocal**: Off (only the arm moves), Auto (also move the target limb when the arm cannot reach) or Always. **Grip**: Off (palm and fingers keep the captured pose; default) or Auto (turn the palm onto the target and curl the fingers). **Apply this pair**: off keeps the row but does not apply it. |
+| **Suggest Contacts** | Finds frames where a hand probably touches the body (the review missed-contact check; ExMR only, no AI models run) and shows them as hatched intervals marked Suggested. Double-click or right-click to accept. Each run replaces the previous suggestions. |
+| **L pose / R pose** | Foot articulation per interval: **Match 2D** (fit ankle and toes to the video's heel-toe direction), **Pointe** (foot in line with the shin, support on the toe tip), **Flat**, **Flexed**. Right-click to change mode, strength or limits (**dancer** allows full pointe). |
+| **Δ orig** | Largest joint change per frame against the original layer: green small, amber medium, red large, with the maximum at the right. |
+| **Show Original** / opacity | Draws the original layer as a translucent blue-tinted body and skeleton with the corrected body: the pose before self-contacts, or the uncorrected motion when there are none. The opacity box sets its strength. Display only. |
+| Contact lines and labels | During an active interval a line joins hand and target with discs in the row's colour. The label gives the residual after correction (green up to 2 cm, amber up to 4 cm, red above) or **pending: Apply Correction**, plus the joint gap. |
+| **Camera Preview** | With Show Original on, the original skeleton is drawn in blue beside the corrected one over the video, together with the 2D keypoints, so placement and contacts can be compared with the footage. |
+
+Edits mark the corrected result as pending until **Apply Correction**. The original
+reconstruction is never modified. To get the motion without self-contacts back,
+disable the pairs (or remove the rows) and apply correction again; nothing else is
+lost. Limb placement and pose smoothing rows are stored in the same files but have
+no timeline rows yet; they are written by tools.
+
+Data files in the model project, per result base (for example `initial`):
+
+| File | Contents |
+| --- | --- |
+| `selfcontact_<base>_state.json` | Commits the current revision and the motion's frame count and rate. Edits saved for a different length or rate are not applied. |
+| `selfcontact_<base>_edit0.json`, `_edit1.json` | Two alternating payloads: self-contact `tracks`, foot `articulation`, limb `placement`, pose `smoothing`. Frames are zero-based and end-exclusive. |
+| `<kind>_before_selfcontact.pt` | The corrected pose before the self-contact pass, written by correction for the comparison. Used only while it matches the current correction report. |
+| `<kind>_correction.json` | The correction report, including self-contact residuals, placement errors and changed joints. |
+
 ## People, preview and navigation
 
 | Control | Function |

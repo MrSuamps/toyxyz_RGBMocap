@@ -290,6 +290,8 @@ are relabelled and listed under `keypoint_swaps`.
 | `joint_twist` | A knee (40 deg), elbow (80) or wrist (80) twists about its own bone: candy-wrap risk. | None. |
 | `finger_pose` | A finger joint is more than 10 deg past its flexion / spread / twist range (SMPL-X hand pose relative to the flat hand). | None. |
 | `hand_orientation` | On frames with confident hand keypoints, the 2D wrist-to-middle-knuckle direction differs by more than 50 deg from the motion, or the thumb and pinky sides are swapped. | None. |
+| `self_penetration` | On the posed SMPL-X mesh, a hand or forearm is more than 1 cm inside a leg, the head, the torso or the other arm, or the legs pass through each other (high from 2.5 cm). | None (self-contact solver or limb placement). |
+| `contact_gap` | During an enabled self-contact interval the hand skin floats more than 1.5 cm from the target skin (high from a 4 cm median). | None (`correct` with the track enabled). |
 
 `suggested_fixes` contains the high and medium issues in rank order. A pin whose limb and ease window would overlap an
 earlier pin is left out (noted on the issue), because `fix` rejects overlapping pins. Typical loop: `review`, run `fix`
@@ -300,7 +302,13 @@ Anatomy checks read joint rotations: for a project result the model's SMPL-X pos
 to the hand mean), for `--motion` the FBX bone rotations relative to its bind pose (a second Blender read; finger checks
 are skipped there because the bind bakes the relaxed hand). Interior angles are 180 deg when straight; the hinge sign
 follows the export's knee/elbow axes. `--no-anatomy` skips them. `report.json` lists their thresholds and the confident
-hand-keypoint frames under `anatomy`.
+hand-keypoint frames under `anatomy`. `self_penetration` and `contact_gap` need the SMPL-X mesh, so they run on project
+results only; `anatomy.skin_contact` adds per declared self-contact the penetration depth and skin gap over its frames.
+
+Limb placement: `report.json` `stats.placement` holds each limb's 2D error (median, p90, max; torso units). When the
+result has limb placement rows, each row also gets its error before placement, as solved, and in the reviewed motion,
+with `kept` false when a later pass (self-contacts, smoothing) pulled the limb away from the video again; `summary.md`
+shows them as a table.
 
 `--compare original|before-selfcontact` (corrected results only) also reviews the reference layer over the same frames:
 the uncorrected base result, or `<kind>_before_selfcontact.pt` written by `correct` when self-contacts changed the motion
@@ -315,6 +323,7 @@ change, and `images\compare_delta_<layer>.png` (one column per frame, white tick
 ```
 rgbmocap-cli.cmd render --project P [--model M] [--result KIND] [--frames A-B] [--step N] [--views camera,front,side,orbit]
                         [--compare [original|before-selfcontact]] [--focus BONE,BONE] [--out DIR] [--mp4] [--size PX]
+rgbmocap-cli.cmd render --project P --sheet [--frames A-B|A,B,C] [--compare original|before-selfcontact] [--add LABEL=FILE] [--out DIR]
 ```
 
 Draws the model's own SMPL-X mesh (the GUI Mesh view geometry: shape and pose correctives, never the bound display
@@ -326,6 +335,15 @@ else `original`, with a note when an outdated file was skipped. A red line marks
 distance. Without `--frames` the self-contact intervals plus 10 frames are rendered. Writes `<view>_f<frame>.png`,
 `<view>.mp4` with `--mp4` (FFmpeg) and `render.json` (frames, layers, distances per track and frame, and the largest
 vertex difference to the project's GUI mesh preview). Default folder: `<model project>\render\<result>-<time>\`.
+
+`--sheet` writes one comparison image per enabled self-contact track instead (ExMR): one row per frame, columns
+**Video** (a crop around the contact), **Before** and **After** drawn over the same crop, then each layer in a close 3D
+view of the touching limbs only (90 deg from the camera). Each tile states the hand's depth inside the target or the skin
+gap, the arm's depth inside the target, and the angle between the model's wrist-to-knuckle direction (magenta arrow)
+and the video's (green). `--frames A-B` (default: the track's ranges) gives four evenly spaced frames, `A,B,C` exactly
+those frames. Before is `--compare` (default `original`); `--add LABEL=FILE` adds another result file in the same params
+format (for example a saved grip-off result) as a column, repeatable. Writes `sheet_<id>_f<first>-<last>.png` and
+`sheet.json` into `--out` (default `<model project>\render\<result>-sheet-<time>\`).
 
 ## Self-contacts
 
@@ -381,6 +399,11 @@ default to e.g. `lf-pointe`), use the same inclusive `--frames` and make the cor
 remove --all` keeps the tracks and `remove --all` keeps the foot entries, unless the files belong to motion with a
 different length or frame rate: then `remove --all` deletes everything. `contacts list` also shows the entries and,
 after `correct`, any skipped or joint-limited intervals. FlowHMR correction does not apply foot articulation.
+
+The same files can also hold limb placement rows (`placement`: fit an arm or leg chain to the video's 2D keypoints,
+applied before the self-contacts) and pose smoothing rows (`smoothing`, applied last). `contacts` does not edit or list
+them yet; they are written with `mocap.self_contact_store.save_placement` / `save_smoothing`, and `remove --all` keeps
+them.
 
 ## Notes
 
