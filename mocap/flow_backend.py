@@ -457,7 +457,7 @@ def run_post(project,stage,result,emit,force=False):
         try:
             report=json.loads((project/(kind+'_correction.json')).read_text(encoding='utf-8'))
             from .correction import backend
-            cached=(not force and result_is_current(project,kind) and report.get('code')==code_identity()
+            cached=(not force and result_is_current(project,kind) and report.get('code')==code_identity(project)
                     and report.get('backend_sha256')==sha256(Path(backend().__file__)))
             if cached:validate_motion(load_tensor(project/(kind+'.pt')),report['frames'])
         except Exception:cached=False  # Cache decoding failure is recoverable, not an inference failure.

@@ -25,7 +25,7 @@ These work before or after the command.
 | `--no-lock` | Do not take the app lock. Normally the CLI refuses to run while RGB MoCap, an install or an update is running. |
 | `--view` | When the command succeeds, open its project in the RGB MoCap GUI (its own window and console). If the GUI is already open, the CLI prints the folder to open with **File > Open Project...** instead. `batch` opens the last clip that succeeded. |
 
-`--help`, `--dry-run`, `models`, `review` and `fix` never take the lock, so they work while the app is open (`review` and `fix` only read projects and write to their own output folders). `contacts list` and `contacts suggest` without `--accept` do not take it either.
+`--help`, `--dry-run`, `models`, `review` and `fix` never take the lock, so they work while the app is open (`review` and `fix` only read projects and write to their own output folders). `contacts list`, `contacts feet list` and `contacts suggest` without `--accept` do not take it either.
 
 Exit codes: `0` ok, `1` failed, `2` invalid arguments, `3` missing models, `4` the app (or an install/update) is running,
 `130` cancelled with Ctrl+C. Ctrl+C stops the running worker and its child processes; completed stages are reused next time.
@@ -303,7 +303,8 @@ follows the export's knee/elbow axes. `--no-anatomy` skips them. `report.json` l
 hand-keypoint frames under `anatomy`.
 
 `--compare original|before-selfcontact` (corrected results only) also reviews the reference layer over the same frames:
-the uncorrected base result, or `<kind>_before_selfcontact.pt` written by `correct` when self-contacts changed the motion.
+the uncorrected base result, or `<kind>_before_selfcontact.pt` written by `correct` when self-contacts changed the motion
+(refused when outdated: the result is stale or the file's stat no longer matches the report).
 `report.json` then has a `compare` block: the issue diff (`fixed`, `new`, `unchanged` matched by check, joints and
 overlapping frames), untouched-frame identity (against `before-selfcontact`, frames and joints outside the
 `self_contact.changed` rows of `<kind>_correction.json` must be bit-identical), the per-frame maximum joint-rotation
@@ -320,7 +321,8 @@ Draws the model's own SMPL-X mesh (the GUI Mesh view geometry: shape and pose co
 skin) with a software rasteriser, so it needs no GPU. Views: `camera` over the video frame with the project's per-frame
 camera (ExMR), `front` and `side` from the body's mean heading, and `orbit`, four close views around each self-contact
 (or `--focus`). `--compare` puts the reference layer (grey) beside the result (orange); without a value it picks
-`before-selfcontact` when that file exists, else `original`. A red line marks each self-contact with its palm-to-target
+`before-selfcontact` when that file is current (its stat matches `<kind>_correction.json` and the result is not stale),
+else `original`, with a note when an outdated file was skipped. A red line marks each self-contact with its palm-to-target
 distance. Without `--frames` the self-contact intervals plus 10 frames are rendered. Writes `<view>_f<frame>.png`,
 `<view>.mp4` with `--mp4` (FFmpeg) and `render.json` (frames, layers, distances per track and frame, and the largest
 vertex difference to the project's GUI mesh preview). Default folder: `<model project>\render\<result>-<time>\`.
@@ -355,8 +357,30 @@ edits and shared with the app. The project needs a corrected result first (`corr
   skipping frames another enabled track already holds with the same hand; `edit --id ID --accept` accepts one track.
 - `list` prints the tracks, intervals, suggestions, settings and, after `correct`, the last residuals per track.
 - Every change gives the tracks a new revision, so the corrected result and its exports become stale until `correct`
-  runs again (the command says so). `remove --all` deletes the files; a result corrected without self-contacts is then
+  runs again (the command says so). `remove --all` deletes the tracks (foot articulation is kept, see below); with nothing
+  left the files are deleted and a result corrected without self-contacts is then
   current again. `--dry-run` validates a change without writing it.
+
+### Foot articulation
+
+```
+rgbmocap-cli.cmd contacts feet list    --project P [--model M]
+rgbmocap-cli.cmd contacts feet add     --project P --foot LeftFoot|RightFoot --mode pointe|flat|flexed|match --frames A-B[,C-D]
+                                       [--strength S] [--profile default|dancer] [--id ID] [--disabled]
+rgbmocap-cli.cmd contacts feet edit    --project P --id ID [--foot ...] [--mode ...] [--frames ...] [--add-frames ...]
+                                       [--remove-frames ...] [--strength S] [--profile ...] [--enable|--disable]
+rgbmocap-cli.cmd contacts feet remove  --project P --id ID | --all
+```
+
+An entry poses one foot's ankle and toes over frame intervals; `correct` applies it before the foot locks, so locks and
+grounding see the articulated foot. Modes: `pointe` (foot in line with the shin, support on the toe box), `flat` (sole
+level), `flexed` (dorsiflexed), `match` (fit the ankle to the video's 2D foot direction; ExMR only). `--strength` blends
+from the source foot (0) to the full mode (1, default); `--profile dancer` allows plantarflexion up to 90 deg (default
+50). One enabled mode per foot and frame. Entries live in the same `selfcontact_<base>_*.json` files as the tracks (ids
+default to e.g. `lf-pointe`), use the same inclusive `--frames` and make the corrected result stale the same way. `feet
+remove --all` keeps the tracks and `remove --all` keeps the foot entries, unless the files belong to motion with a
+different length or frame rate: then `remove --all` deletes everything. `contacts list` also shows the entries and,
+after `correct`, any skipped or joint-limited intervals. FlowHMR correction does not apply foot articulation.
 
 ## Notes
 

@@ -153,5 +153,21 @@ class SolverTest(unittest.TestCase):
             self.assertLess(entry['elbows'][name]['ease_fold_deg'], 3.)
 
 
+class CloseGoalTest(unittest.TestCase):
+    """A goal nearer the shoulder than the wrist needs elbow bend, never a reciprocal move toward the shoulder."""
+
+    def test_elbow_config_widens_only_for_close_goals(self):
+        root, q = clip()
+        j, g = fk(REST, root.astype(float), q.astype(float))
+        far = j[:, 21] + (j[:, 21] - j[:, 17]) * .2
+        self.assertIs(sc.elbow_config(REST, j, g, 1, far, OFFSETS, np.zeros(N, bool)), sc.ARM_CONFIG)
+        close = j[:, 17] + (j[:, 21] - j[:, 17]) * .3
+        config = sc.elbow_config(REST, j, g, 1, close, OFFSETS, np.ones(N, bool))
+        self.assertGreater(config['elbow_limit_deg'], sc.ARM_CONFIG['elbow_limit_deg'])
+        self.assertLessEqual(config['elbow_limit_deg'], sc.ELBOW_LIMIT_MAX_DEG)
+        self.assertEqual({k: v for k, v in config.items() if k != 'elbow_limit_deg'},
+                         {k: v for k, v in sc.ARM_CONFIG.items() if k != 'elbow_limit_deg'})
+
+
 if __name__ == '__main__':
     unittest.main()

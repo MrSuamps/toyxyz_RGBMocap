@@ -108,40 +108,20 @@ class GripTest(unittest.TestCase):
         pronated = sc.wrist_local(0., 0., 40., REST, 1) @ sc.THUMB
         self.assertLess(flexed[1], -.3); self.assertGreater(radial[2], .1); self.assertLess(pronated[1], -.5)
 
-    def test_grip_keeps_wrist_within_limits(self):
-        for target, reciprocal in (('RightUpLeg', 'off'), ('RightFoot', 'auto'), ('LeftForeArm', 'off'), ('RightLeg', 'off')):
-            root, _, q, report = solve([track(target=target, reciprocal=reciprocal, grip='auto')])
-            entry = report['tracks'][0]; lo, hi = entry['window']
-            f, r, p = (x[lo:hi] for x in wrist_angles(root, q, 1))
-            self.assertLessEqual(sc.swing_cone(f, r)[30 - lo:60 - lo].max(), 1 + 1e-3, target)
-            self.assertLessEqual(np.abs(p[30 - lo:60 - lo]).max(), 80 + .1, target)
-            self.assertEqual(entry['wrist']['result']['frames_outside_limits'], 0, target)
-
-    def test_palm_faces_reachable_limb(self):
+    def test_grip_auto_without_video_keeps_the_source_wrist(self):
+        """Without hand keypoints grip auto is grip off: same arm, wrist world rotation kept, nothing declared."""
         for target, reciprocal in (('RightUpLeg', 'off'), ('RightFoot', 'auto'), ('LeftForeArm', 'off')):
-            _, _, _, off = solve([track(target=target, reciprocal=reciprocal)])
-            _, _, _, grip = solve([track(target=target, reciprocal=reciprocal, grip='auto')])
-            before, after = off['tracks'][0]['palm_facing_deg'], grip['tracks'][0]['palm_facing_deg']
-            self.assertLess(after['after_max'], 30., target)
-            self.assertLess(after['after_median'], before['after_median'], target)
-            self.assertLess(grip['tracks'][0]['residual_max_m'], .02, target)
+            _, _, off_q, off = solve([track(target=target, reciprocal=reciprocal)])
+            _, _, auto_q, auto = solve([track(target=target, reciprocal=reciprocal, grip='auto')])
+            self.assertEqual(off_q.tobytes(), auto_q.tobytes(), target)
+            self.assertEqual(auto['wrist_changed'], []); self.assertEqual(auto['fingers'], [])
+            self.assertEqual(auto['tracks'][0]['grip']['wrist'], 'source (no hand keypoints or skin)')
 
     def test_grip_twist_is_continuous(self):
         root, _, q, report = solve([track(target='RightFoot', reciprocal='auto', grip='auto')])
         lo, hi = report['tracks'][0]['window']
         _, g = fk(REST, root.astype(float), q.astype(float))
         self.assertLess(sc.rotation_angle(g[lo:hi - 1, 21], g[lo + 1:hi, 21]).max(), 20.)
-
-    def test_wrist_rows_are_declared(self):
-        root, before, q, report = solve([track(grip='auto')])
-        changed = report['changed'][0]
-        self.assertEqual(report['wrist_changed'], [dict(joint=21, start=changed['start'], end=changed['end'])])
-        _, g0 = fk(REST, root.astype(float), before.astype(float)); _, g1 = fk(REST, root.astype(float), q.astype(float))
-        turn = np.rad2deg(Rotation.from_matrix(g0[:, 21].swapaxes(-1, -2) @ g1[:, 21]).magnitude())
-        outside = np.ones(N, bool); outside[changed['start']:changed['end']] = False
-        self.assertEqual(turn[outside].max(), 0.)
-        self.assertGreater(turn[~outside].max(), 1.)
-        self.assertLess(Rotation.from_matrix(g0[:, 20].swapaxes(-1, -2) @ g1[:, 20]).magnitude().max(), 1e-6)
 
     def test_audit_exemptions(self):
         preserved = (0, 3, 6, 9, 12, 15, 16, 17, 18, 19, 20, 21)

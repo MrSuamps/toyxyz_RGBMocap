@@ -12,6 +12,15 @@ from PySide6.QtWidgets import QCheckBox, QPushButton, QSpinBox
 
 from .tooltips import tooltip_text
 
+TIMELINE_HELP = (
+    "Self-contact rows (e.g. RH→RF: right hand holds right foot), one per pair: edit intervals like locks.\n"
+    "Hatched intervals are suggestions: double-click or right-click to accept them.\n"
+    "Right-click: add a pair (+ Pair row), pair settings (distance, reciprocal, grip), disable, reset, remove.\n\n"
+    "L/R pose: foot articulation per interval (Match 2D, Pointe, Flat, Flexed).\n"
+    "Drag to add an interval with the row's current mode; right-click to change mode, strength or limits (dancer allows full pointe).\n\n"
+    "Δ orig: largest joint change per frame against the original motion (Show Original in the 3D view).\n"
+    "Edits save at once and share Ctrl+Z / Ctrl+Y with the locks; Apply Correction applies them to the motion.")
+
 
 def snapshot(project, base, kind):
     from .foot_contacts import contact_revision
@@ -49,6 +58,7 @@ class SelfContactIO(QThread):
 
     def run(self):
         from . import self_contact_store as store
+        from .pose_rows import read_sections, write_section
         while True:
             with self.condition:
                 while not self.jobs and not self.stopping:
@@ -58,14 +68,16 @@ class SelfContactIO(QThread):
                 job = self.jobs.popleft()
             try:
                 project, base, context = job['project'], job['base'], job['context']
-                if job['action'] == 'save':
+                if job['action'] == 'save' and job.get('section'):
+                    write_section(project, base, job['section'], job['entries'], context)
+                elif job['action'] == 'save':
                     if job['tracks']:
                         store.save(project, base, job['tracks'], context)
                     else:
                         store.clear(project, base)
                 tracks, revision, warning = store.read(project, base, context)
                 self.done.emit(job['token'], dict(job, tracks=tracks, revision=revision, warning=warning,
-                                                  **snapshot(project, base, job['kind'])))
+                                                  sections=read_sections(project, base, context), **snapshot(project, base, job['kind'])))
             except Exception as error:
                 self.failed.emit(job['token'], str(error), job)
 
@@ -88,7 +100,11 @@ class SelfContactController(QObject):
         w.motion_view.compare_overlay = self.overlay
         slider = w.slider
         slider.sc_listener = self.save
+        slider.pose_listener = self.save_section
         slider.sc_actions = {'suggest': self.suggest}
+        help_dialog = getattr(w, 'timeline_help_dialog', None)
+        if help_dialog is not None:
+            help_dialog.setText(help_dialog.text() + '\n\n' + TIMELINE_HELP)
         slider.sc_status = w.status.setText
         slider.sc_resized = lambda: QTimer.singleShot(0, self.fit_timeline)
         self.suggest_button = QPushButton('Suggest Contacts')
@@ -100,7 +116,7 @@ class SelfContactController(QObject):
         actions.insertWidget(actions.indexOf(w.reset_footlocks_button) + 1, self.suggest_button)
         header = w.bone_overlay.parentWidget().layout()
         self.show_original = QCheckBox('Show Original')
-        self.show_original.setToolTip(tooltip_text('Draw the original motion in translucent grey with the corrected body: the pose before '
+        self.show_original.setToolTip(tooltip_text('Draw the original motion in translucent blue with the corrected body: the pose before '
                                                    'self-contacts, or the uncorrected motion when there are none. Display only.'))
         self.show_original.toggled.connect(self.original_changed)
         self.opacity = QSpinBox()
@@ -198,7 +214,7 @@ class SelfContactController(QObject):
         if saving and token == self.save_token:
             self.save_token = None
             w.contact_saving = False
-            w.status.setText('Self-contacts saved. Apply Correction to update the motion and FBX.')
+            w.status.setText(self.saved_noun(result).capitalize() + ' saved. Apply Correction to update the motion and FBX.')
         elif saving:
             return
         elif result['edit_seq'] != self.edit_seq or self.save_token is not None:
@@ -209,7 +225,9 @@ class SelfContactController(QObject):
         project, base, kind, info = self.context()
         self.warning = result['warning']
         self.overlay.applied = result['applied']
-        w.slider.set_self_contacts(result['tracks'], int(info['context']['frames']), (str(project), base), self.editable(), self.warning)
+        frames = int(info['context']['frames'])
+        w.slider.set_self_contacts(result['tracks'], frames, (str(project), base), self.editable(), self.warning)
+        w.slider.set_pose_sections(result.get('sections'), frames, (str(project), base))
         if info.get('revision') != result['contact_revision']:
             # The stale/pending notices compare this revision with the applied correction.
             w.contact_tracks[base] = {**info, 'revision': result['contact_revision']}
@@ -222,15 +240,29 @@ class SelfContactController(QObject):
         if job['action'] == 'save' and token == self.save_token:
             self.save_token = None
             w.contact_saving = False
-            w.status.setText('Cannot save self-contacts: ' + message)
+            w.status.setText(f'Cannot save {self.saved_noun(job)}: {message}')
             self.edit_seq += 1
             self.request_read()
         elif job['action'] == 'read' and self.matches(job):
             self.warning = 'Self-contacts cannot be read: ' + message
             w.slider.set_self_contacts([], 1, None, False, self.warning)
+            w.slider.set_pose_sections(None)
         w.update_readiness()
 
+    @staticmethod
+    def saved_noun(job):
+        from .pose_rows import SECTIONS
+        key = job.get('section')
+        return next((s.noun + 's' for s in SECTIONS if s.key == key), 'self-contacts')
+
     def save(self, tracks):
+        self.request_save(tracks=tracks)
+
+    def save_section(self, key, entries):
+        """Pose rows: one section of the same store payload, through the same save queue and pending state."""
+        self.request_save(section=key, entries=entries)
+
+    def request_save(self, **fields):
         w = self.w
         current = self.context()
         if current is None or w.busy or w.contact_saving or self.suggesting():
@@ -241,8 +273,8 @@ class SelfContactController(QObject):
         self.edit_seq += 1
         w.contact_saving = True
         self.save_token = self.io.request(dict(action='save', project=project, base=base, kind=kind, context=info['context'],
-                                               tracks=tracks, edit_seq=self.edit_seq))
-        w.status.setText('Saving self-contacts...')
+                                               edit_seq=self.edit_seq, **fields))
+        w.status.setText(f'Saving {self.saved_noun(fields)}...')
         w.update_readiness()
 
     # Suggestions --------------------------------------------------------------------------------------------------------

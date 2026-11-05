@@ -743,6 +743,7 @@ def anatomy_block(ctx, pose):
         return dict(checked=False)
     from . import anatomy
     return dict(checked=True, rotations=pose.source, fingers_checked=pose.fingers is not None, hand_keypoints=anatomy.hand_coverage(ctx, pose),
+                skin_contact=anatomy.skin_summary(pose, ctx.frames),
                 thresholds=dict(hyperextension_deg=anatomy.HYPEREXTENSION_DEG, locked_deg=anatomy.LOCK_DEG, locked_frames=anatomy.LOCK_FRAMES,
                                 wrist_deg=anatomy.WRIST_LIMITS, twist_deg=anatomy.TWIST_LIMITS, fold_deg=anatomy.FOLD_DEG,
                                 fold_seconds=anatomy.FOLD_SECONDS, hand_direction_deg=anatomy.HAND_DIRECTION_DEG))
@@ -1023,6 +1024,8 @@ def summary_markdown(report):
               '```json', json.dumps(fixes, indent=1), '```']
     if report.get('contact_sheet'):
         lines += ['', f"Contact sheet: `images/{report['contact_sheet']}`"]
+    from .placement_check import summary_lines as placement_lines
+    lines += placement_lines(stats.get('placement'))
     if report.get('compare'):
         from .compare import summary_lines
         lines += summary_lines(report['compare'])
@@ -1128,6 +1131,8 @@ def cmd_review(args, session):
     stats = statistics(ctx)
     from . import foot_orientation
     stats['foot_orientation'] = foot_orientation.statistics(ctx, pose)
+    from . import placement_check
+    stats['placement'] = placement_check.statistics(ctx, project, kind)
     per_frame = dict(frames=ctx.frames.tolist(), torso_px=ctx.torso, offset_px=ctx.offset,
                      limb_error_torso={limb: np.fmax.reduce(ctx.err[:, list(m)], axis=1) for limb, m in LIMBS.items()},
                      contacts=dict(left=contacts[:, 0].astype(int).tolist(), right=contacts[:, 1].astype(int).tolist()))

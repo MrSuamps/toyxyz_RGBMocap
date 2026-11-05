@@ -1,9 +1,12 @@
 """Self-contact timeline rows: K hand-to-body tracks edited below the foot/hand lock rows.
 
-Track index t addresses every timeline contact row: 0-3 are the foot/hand locks, FIRST_ROW + i is self-contact track i.
-Frames are zero-based and end-exclusive, as in the foot-lock editor and `self_contact_store`.
+Track index t addresses every timeline contact row: 0-3 are the foot/hand locks, FIRST_ROW + i is self-contact track i,
+then the '+ Pair' row and the pose rows (`pose_rows`). Frames are zero-based and end-exclusive, as in the foot-lock editor
+and `self_contact_store`.
 """
 import copy
+
+from .pose_rows import PoseRowEditor
 
 FIRST_ROW = 4
 SELF_UNDO = 'self-contact'
@@ -297,8 +300,9 @@ class PairDialog:
             reciprocal.addItem(text, name)
         reciprocal.setCurrentIndex(reciprocal.findData(track['reciprocal'] if track else 'auto'))
         grip = QComboBox()
-        for name in GRIP:
-            grip.addItem(name.capitalize(), name)
+        for name, text in (('off', 'Off: palm and fingers keep the captured pose'),
+                           ('auto', 'Auto: turn the palm onto the target and curl the fingers')):
+            grip.addItem(text, name)
         grip.setCurrentIndex(grip.findData(track['grip'] if track else 'off'))
         enabled = QCheckBox('Apply this pair')
         enabled.setChecked(track['enabled'] if track else True)
@@ -323,10 +327,16 @@ class PairDialog:
             dialog.deleteLater()
 
 
-class SelfContactEditor:
-    """Timeline mixin: self-contact rows share the foot-lock editor's drag, resize, delete and undo through track index t."""
+class SelfContactEditor(PoseRowEditor):
+    """Timeline mixin: self-contact and pose rows share the foot-lock editor's drag, resize, delete and undo through track
+    index t. Pose rows are visible and editable together with the self-contact rows (same result, same store)."""
 
     def init_self_contacts(self):
+        self.init_pose_rows()
+        # Model of each SELF_UNDO token in the shared undo/redo lists, oldest first; the last n owners belong to the last n
+        # tokens, since the foot-lock editor only trims tokens from the front or clears the redo list.
+        self._undo_owners = []
+        self._redo_owners = []
         self.sc_rows = SelfContactRows()
         self.sc_visible = False
         self.sc_editable = False
@@ -346,19 +356,28 @@ class SelfContactEditor:
     def _track(self, t):
         if t < FIRST_ROW:
             return self.contacts[t] if t < len(self.contacts) else []
+        pose = self.pose_row(t)
+        if pose is not None:
+            return pose[0].ranges(pose[1])
+        if t >= self.placeholder_row():
+            return []
         return self.sc_rows.tracks[t - FIRST_ROW]['ranges']
 
     def _all_tracks(self):
         if not self.sc_visible:
             return list(self.contacts)
-        return [self._track(t) for t in range(FIRST_ROW)] + [track['ranges'] for track in self.sc_rows.tracks]
+        return ([self._track(t) for t in range(FIRST_ROW)] + [track['ranges'] for track in self.sc_rows.tracks] + [[]]
+                + [model.ranges(r) for model, r in self.pose_row_models()])
 
     def _editable(self, t):
-        return self.contact_edit_enabled and (t < FIRST_ROW or self.sc_editable)
+        if not self.contact_edit_enabled:
+            return False
+        pose = self.pose_row(t) if t >= FIRST_ROW else None
+        return t < FIRST_ROW or (self.pose_writable(pose[0]) if pose is not None else self.sc_editable)
 
     def self_contact_row(self, row):
-        """Timeline row (0 = first contact row) of a self-contact track, or None."""
-        if self.sc_visible and FIRST_ROW <= row < FIRST_ROW + len(self.sc_rows.tracks):
+        """Timeline row (0 = first contact row) of a self-contact track or pose row, or None."""
+        if self.sc_visible and (FIRST_ROW <= row < FIRST_ROW + len(self.sc_rows.tracks) or self.pose_row(row) is not None):
             return row
         return None
 
@@ -366,10 +385,10 @@ class SelfContactEditor:
         return FIRST_ROW + len(self.sc_rows.tracks)
 
     def delta_row(self):
-        return self.placeholder_row() + 1 if self.compare_delta is not None else None
+        return self.pose_first_row() + self.pose_rows_total() if self.compare_delta is not None else None
 
     def self_contact_rows_total(self):
-        return (len(self.sc_rows.tracks) + 1 if self.sc_visible else 1) + (1 if self.compare_delta is not None else 0)
+        return (len(self.sc_rows.tracks) + 1 if self.sc_visible else 1) + self.pose_rows_total() + (1 if self.compare_delta is not None else 0)
 
     # Window-facing API ----------------------------------------------------------------------------------------------
 
@@ -379,6 +398,10 @@ class SelfContactEditor:
         if tracks is None:
             self.sc_visible = False
             self.sc_rows.clear()
+            self._drop_self_history()
+            for model in self.pose_models:
+                model.clear()
+                self._drop_owner_history(model)
         else:
             self.sc_visible = True
             if self.sc_rows.load(tracks, frames, identity):
@@ -416,40 +439,70 @@ class SelfContactEditor:
                 self.sc_resized()
 
     def _drop_self_history(self):
-        self._undo_contacts[:] = [c for c in self._undo_contacts if c != SELF_UNDO]
-        self._redo_contacts[:] = [c for c in self._redo_contacts if c != SELF_UNDO]
+        self._drop_owner_history(self.sc_rows)
+
+    def _drop_owner_history(self, model):
+        """Remove the SELF_UNDO steps of one model (its history was reset) and keep the others in order."""
+        for stack, owners in ((self._undo_contacts, self._undo_owners), (self._redo_contacts, self._redo_owners)):
+            count = stack.count(SELF_UNDO)
+            aligned = owners[len(owners) - count:] if count else []
+            kept, kept_owners, k = [], [], 0
+            for item in stack:
+                if item == SELF_UNDO:
+                    owner = aligned[k] if k < len(aligned) else self.sc_rows
+                    k += 1
+                    if owner is model:
+                        continue
+                    kept_owners.append(owner)
+                kept.append(item)
+            stack[:] = kept
+            owners[:] = kept_owners
 
     def _report(self, text):
         if self.sc_status is not None:
             self.sc_status(text)
 
-    def _self_changed(self):
+    def _self_changed(self, model=None):
+        model = model or self.sc_rows
         self._index_contacts()
         self._update_self_height()
-        if self.sc_listener is not None:
-            self.sc_listener(self.sc_rows.payload())
+        if model is self.sc_rows:
+            if self.sc_listener is not None:
+                self.sc_listener(self.sc_rows.payload())
+        elif self.pose_listener is not None:
+            self.pose_listener(model.section.key, model.payload())
 
     def _self_apply(self, action, *args, **kwargs):
-        """Run one model mutation as an undoable step; invalid edits are reported and leave the tracks unchanged."""
-        if not self.sc_editable or not self.contact_edit_enabled:
+        return self._model_apply(self.sc_rows, action, *args, **kwargs)
+
+    def _model_apply(self, model, action, *args, **kwargs):
+        """Run one model mutation as an undoable step; invalid edits are reported and leave the model unchanged."""
+        writable = self.sc_editable if model is self.sc_rows else self.pose_writable(model)
+        if not writable or not self.contact_edit_enabled:
             return None
         try:
             result = action(*args, **kwargs)
         except ValueError as error:
-            self._report('Self-contact not changed: ' + str(error))
+            noun = 'Self-contact' if model is self.sc_rows else model.section.noun.capitalize()
+            self._report(f'{noun} not changed: {error}')
             self.update()
             return None
+        if result == 0:
+            return result  # Nothing accepted: the model took no snapshot, so no undo step either.
         self._undo_contacts.append(SELF_UNDO)
         del self._undo_contacts[:-100]
+        self._undo_owners.append(model)
+        del self._undo_owners[:-100]
         self._redo_contacts.clear()
-        self._self_changed()
+        self._redo_owners.clear()
+        self._self_changed(model)
         return True if result is None else result
 
     # Interval editing hooks used by the foot-lock editor ------------------------------------------------------------
 
     def _clamp_bounds(self, t, low, high, frame, original):
         """Drag limits for track t; self rows also stop at frames another track holds with the same hand. None refuses."""
-        if t < FIRST_ROW:
+        if t < FIRST_ROW or self.pose_row(t) is not None:
             return low, high
         start, end = original if original is not None else (frame, frame + 1)
         for s, e in self.sc_rows.blockers(t - FIRST_ROW):
@@ -466,34 +519,46 @@ class SelfContactEditor:
         return None if bounds is None else bounds[1]
 
     def self_contact_command(self, t, index, before, after):
+        if self.pose_row(t) is not None:
+            self.pose_command(t, index, before, after)
+            return
         self._selected_contact = (t, index) if after is not None else None
         if self._self_apply(self.sc_rows.set_interval, t - FIRST_ROW, index, before, after) is None:
             self._selected_contact = None
             self._index_contacts()
 
-    def undo_self_contact(self):
-        if self.sc_rows.undo():
+    def _step(self, owners, other, method):
+        model = owners[-1] if owners else self.sc_rows
+        if model is not self.sc_rows and not self.pose_writable(model):
+            return False
+        if getattr(model, method)():
+            if owners:
+                other.append(owners.pop())
             self._selected_contact = None
-            self._self_changed()
+            self._self_changed(model)
             return True
         return False
+
+    def undo_self_contact(self):
+        return self._step(self._undo_owners, self._redo_owners, 'undo')
 
     def redo_self_contact(self):
-        if self.sc_rows.redo():
-            self._selected_contact = None
-            self._self_changed()
-            return True
-        return False
+        return self._step(self._redo_owners, self._undo_owners, 'redo')
 
     def suggestion_at(self, t, frame):
-        if t is None or t < FIRST_ROW:
+        if t is None or t < FIRST_ROW or t == self.placeholder_row():
             return None
+        if self.pose_row(t) is not None:
+            return self._pose_suggestion(t, frame)
         return next(((s, e) for s, e in self.sc_rows.suggestions(t - FIRST_ROW) if s <= frame < e), None)
 
     def accept_suggestion_at(self, t, frame):
         piece = self.suggestion_at(t, frame)
         if piece is None or any(s <= frame < e for s, e in self._track(t)):
             return False
+        if self.pose_row(t) is not None:
+            self._pose_accept(t, piece)
+            return True
         accepted = self._self_apply(self.sc_rows.accept, t - FIRST_ROW, piece)
         if accepted is not None and not accepted:
             self._report('Suggestion not accepted: another contact already holds this hand on those frames.')
@@ -510,8 +575,10 @@ class SelfContactEditor:
         from PySide6.QtWidgets import QMenu
         if not getattr(self, 'contacts_supported', True):
             return False
+        if self.pose_menu(event):
+            return True
         row = self._event_row(event)
-        track_row = self.self_contact_row(row)
+        track_row = self.self_contact_row(row) if self.pose_row(row) is None else None
         if track_row is None and row != self.placeholder_row():
             return False
         position = event.position() if hasattr(event, 'position') else event.pos()
@@ -525,7 +592,8 @@ class SelfContactEditor:
             self._selected_contact = (track_row, index) if index is not None else None
             self.update()
             piece = self.suggestion_at(track_row, frame) if frame is not None and index is None else None
-            title = menu.addAction(f'{row_label(track)}: {track["effector"]} holds {track["target"]}' + ('' if track['enabled'] else ' (off)'))
+            title = menu.addAction(f'{row_label(track)}: {track["effector"]} holds {track["target"]}' + (', grip' if track['grip'] == 'auto' else '')
+                                   + ('' if track['enabled'] else ' (off)'))
             title.setEnabled(False)
             add = menu.addAction('Add Contact Here', lambda: self.add_contact(track_row, frame))
             add.setEnabled(editable and frame is not None)
@@ -608,7 +676,8 @@ class SelfContactEditor:
                 p.restore()
                 if not track['enabled']:
                     color = QColor('#7d7d7d')
-                self._paint_track_intervals(p, t, color.name(), 'Hold' if track['enabled'] else 'Off')
+                label = 'Off' if not track['enabled'] else 'Hold + grip' if track.get('grip') == 'auto' else 'Hold'
+                self._paint_track_intervals(p, t, color.name(), label)
             y = 28 + (self.placeholder_row() + 2) * self.TRACK_HEIGHT
             p.setPen(QColor('#8c8c8c'))
             p.drawText(QRectF(8, y, 53, self.TRACK_HEIGHT), Qt.AlignVCenter, '+ Pair')
@@ -622,6 +691,7 @@ class SelfContactEditor:
             p.drawText(QRectF(8, y, 53, self.TRACK_HEIGHT), Qt.AlignVCenter, 'Self')
             p.setPen(QColor('#777777'))
             p.drawText(text_rect(y), Qt.AlignVCenter, 'Apply Correction to edit self-contacts')
+        self.paint_pose_rows(p)
         if self.compare_delta is not None:
             self._paint_delta(p, 28 + (self.delta_row() + 2) * self.TRACK_HEIGHT, width)
 

@@ -15,6 +15,7 @@ IDENTITY_TOLERANCE = 0.0
 # Arm joints per side, for deciding which hand-pose changes a `changed` entry allows.
 ARM_JOINTS = {'left_hand_pose': {13, 16, 18, 20}, 'right_hand_pose': {14, 17, 19, 21}}
 DELTA_EPSILON_DEG = 1e-3
+STALE_BEFORE = '{name} is outdated (the corrected result or its report changed since `correct` wrote it).'
 
 
 # Inputs -------------------------------------------------------------------------------------------------------------
@@ -31,10 +32,13 @@ def reference(project, kind, against):
         base = base_result(kind)
         filename, key = RESULTS[base]
         return project / filename, key, base, base
-    path = project / f'{kind}_before_selfcontact.pt'
+    from ..self_contact_store import before_current, before_path
+    path = before_path(project, kind)
     if not path.is_file():
         raise CliError(f'{path.name} does not exist: `correct` writes it only when self-contacts changed the motion. '
                        'Use --compare original, or add contacts and run `correct`.')
+    if not before_current(project, kind):
+        raise CliError(STALE_BEFORE.format(name=path.name) + ' Use --compare original, or run `correct` to refresh it.')
     return path, 'smpl_params_global', f'{kind} before self-contacts', None
 
 
@@ -232,7 +236,8 @@ def compare_params(project, kind, against):
         result['identity'] = dict(ok=None, note='not checked against the original: foot and hand locks change every corrected frame')
     tracks = contact.get('tracks') or []
     result['self_contact_tracks'] = [{k: t.get(k) for k in ('id', 'effector', 'target', 'interval', 'residual_max_m', 'residual_median_m',
-                                                            'palm_to_target_joint_median_m', 'elbows', 'reciprocal') if k in t} for t in tracks]
+                                                            'palm_to_target_joint_median_m', 'elbows', 'reciprocal', 'goal', 'skin') if k in t}
+                                      for t in tracks]
     result['delta_summary'] = dict(changed_runs=delta['changed'][:40], peak=delta['peak'],
                                    frames_changed=int((np.asarray(delta['max_deg']) > DELTA_EPSILON_DEG).sum()),
                                    transl_max_m=float(np.max(delta['transl_m'])) if len(delta['transl_m']) else 0.0,
@@ -242,12 +247,15 @@ def compare_params(project, kind, against):
 
 # Review integration ---------------------------------------------------------------------------------------------------
 
-def reference_motion(project, before_params, label, with_pose=True):
-    """(review.Motion, anatomy Pose or None) of the reference layer, both from FK of its params (= its joints file)."""
+def reference_motion(project, before_params, label, with_pose=True, kind=None):
+    """(review.Motion, anatomy Pose or None) of the reference layer, both from FK of its params (= its joints file).
+
+    kind names the reviewed result, whose self-contact tracks the reference's skin-gap check measures too."""
     from . import review
     from .anatomy import pose_from_state
     from .smplx_body import Body, model_path
-    pose = pose_from_state(Body(model_path(project)).pose(before_params))
+    body = Body(model_path(project))
+    pose = pose_from_state(body.pose(before_params), 0, 'smplx', body, project, kind)
     return review.Motion(pose.joints, 0, label, label), (pose if with_pose else None)
 
 
@@ -259,7 +267,7 @@ def review_against(obs, project, kind, against, first, last, issues_after, pose_
     from . import anatomy, review
     project = Path(project)
     result, after, before, ref_kind = compare_params(project, kind, against)
-    motion, pose_ref = reference_motion(project, before, result['reference'], pose_after is not None)
+    motion, pose_ref = reference_motion(project, before, result['reference'], pose_after is not None, kind)
     ctx = review.Context(obs, motion, first, last)
     floor_kind = ref_kind or kind
     if hasattr(review, 'collect_issues'):
@@ -304,9 +312,11 @@ def summary_lines(block):
     if block.get('strip_image'):
         lines.append(f"- Delta strip: `{Path(block['strip_image']).name}` (brightness = max joint rotation change, white ticks = changed ranges).")
     for track in block.get('self_contact_tracks', []):
-        residual = track.get('residual_max_m')
+        residual, skin = track.get('residual_max_m'), track.get('skin') or {}
         lines.append(f"- Self-contact {track.get('id')}: {track.get('effector')} -> {track.get('target')}, residual max "
-                     + (f'{residual * 100:.1f} cm' if isinstance(residual, (int, float)) else 'n/a'))
+                     + (f'{residual * 100:.1f} cm' if isinstance(residual, (int, float)) else 'n/a')
+                     + (f", hand inside the target up to {skin['penetration_max_m'] * 100:.1f} cm, skin gap median "
+                        f"{skin['skin_gap_median_m'] * 100:.1f} cm" if skin.get('skin_gap_median_m') is not None else ''))
     for title, items in (('New', issues['new']), ('Fixed', issues['fixed'])):
         for item in items[:12]:
             lines.append(f"  - {title}: {item.get('id')} [{item['severity']}] {item['check']} {item['frames'][0]}-{item['frames'][1]}: {item.get('message')}")

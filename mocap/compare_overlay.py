@@ -17,7 +17,10 @@ from PySide6.QtCore import QPointF, QRectF, QThread, Qt, Signal
 from PySide6.QtGui import QColor, QPen
 
 PARENTS = (-1, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 9, 9, 12, 13, 14, 16, 17, 18, 19)
-GHOST_COLOR = (.80, .83, .90)
+# Cool tint and silhouette rim: where the original nearly coincides with the grey corrected body it still reads apart.
+GHOST_COLOR = (.55, .72, .98)
+GHOST_RIM = (.82, .92, 1.)
+GHOST_LINES = (150, 192, 245)
 COCO_BODY = ((5, 7), (7, 9), (6, 8), (8, 10), (5, 6), (5, 11), (6, 12), (11, 12), (11, 13), (13, 15), (12, 14), (14, 16))
 WORKER_SECONDS = 300
 
@@ -26,6 +29,36 @@ def residual_color(value):
     if value is None:
         return QColor('#9a9a9a')
     return QColor('#6cc070') if value <= .02 else QColor('#e0b050') if value <= .04 else QColor('#e06a5a')
+
+
+def layout_labels(boxes, width):
+    """Shift label boxes (QRectF, in drawing order sorted by top) down until none overlap; keeps them inside width."""
+    placed = []
+    for box in boxes:
+        box = QRectF(box)
+        if box.right() > width - 4:
+            box.moveLeft(max(4., width - 4 - box.width()))
+        while any(box.intersects(other) for other in placed):
+            box.moveTop(max(other.bottom() for other in placed if box.intersects(other)) + 2)
+        placed.append(box)
+    return placed
+
+
+def paint_labels(painter, labels, width):
+    """(baseline anchor, text, colour) labels on a dark plate; displaced ones keep a leader line to their anchor."""
+    if not labels:
+        return
+    labels = sorted(labels, key=lambda item: item[0].y())
+    metrics = painter.fontMetrics()
+    boxes = [QRectF(anchor.x() - 4, anchor.y() - metrics.ascent() - 2, metrics.horizontalAdvance(text) + 8, metrics.height() + 4)
+             for anchor, text, _ in labels]
+    for (anchor, text, color), box, home in zip(labels, layout_labels(boxes, width), boxes):
+        if box.topLeft() != home.topLeft():
+            painter.setPen(QPen(color, 1))
+            painter.drawLine(QPointF(anchor.x(), anchor.y() - metrics.ascent() / 2), QPointF(box.left(), box.center().y()))
+        painter.fillRect(box, QColor(22, 22, 22, 175))
+        painter.setPen(color)
+        painter.drawText(box, Qt.AlignCenter, text)
 
 
 def cache_folder(project, kind):
@@ -94,7 +127,8 @@ def load(project, kind, cancelled=lambda: False):
     report = json.loads(report_path.read_text(encoding='utf-8')) if report_path.is_file() else {}
     contact = report.get('self_contact') or {}
     before = project / f'{kind}_before_selfcontact.pt'
-    has_before = before.is_file() and contact.get('before_stat') == file_stat(before)
+    from .self_contact_store import before_current
+    has_before = before_current(project, kind)
     folder = cache_folder(project, kind)
     record = None
     if has_before or (project / 'exmr_keypoints.pt').is_file():
@@ -185,11 +219,15 @@ class GhostRenderer:
 in vec3 surfaceNormal;
 out vec4 color;
 uniform vec3 bodyColor;
+uniform vec3 rimColor;
+uniform vec3 viewAxis;
 uniform float alpha;
 void main() {
     vec3 n=normalize(surfaceNormal);
     float key=max(0,dot(n,normalize(vec3(-.4,.8,-.6))));
-    color=vec4(bodyColor*(.45+.5*key),alpha);
+    // Surfaces seen edge-on (silhouettes) get brighter and more opaque: an outline without a second pass.
+    float rim=pow(1.-abs(dot(n,viewAxis)),2.);
+    color=vec4(mix(bodyColor*(.5+.5*key),rimColor,.75*rim),min(1.,alpha+(1.-alpha)*.8*rim));
 }
 """
 
@@ -212,6 +250,8 @@ void main() {
         self.program.setUniformValue('mvp', projection * QMatrix4x4(*view.reshape(-1).tolist()))
         self.program.setUniformValue('sceneTransform', QMatrix4x4(*np.eye(4).reshape(-1).tolist()))
         self.program.setUniformValue('bodyColor', QVector3D(*GHOST_COLOR))
+        self.program.setUniformValue('rimColor', QVector3D(*GHOST_RIM))
+        self.program.setUniformValue('viewAxis', QVector3D(*(float(v) for v in basis[2])))
         # PySide resolves setUniformValue(location, float) to the int overload: glUniform1i on a float is GL_INVALID_OPERATION.
         gl.glUniform1f(self.program.uniformLocation('alpha'), float(alpha))
         gl.glEnable(0x0B71)
@@ -376,10 +416,10 @@ class CompareOverlay:
         if self.show and self.available() and index < len(data['joints']):
             self.draw_ghost_mesh(view, painter, index)
             ghost = data['joints'][index]
-            color = QColor(205, 208, 214, int(90 + 140 * self.opacity))
+            color = QColor(*GHOST_LINES, int(110 + 130 * self.opacity))
             lines3d(np.stack([ghost[[p for p in PARENTS[1:]]], ghost[1:]], axis=1), color, 1.6)
-            painter.setPen(QColor('#c3c7cd'))
-            painter.drawText(QRectF(18, 81, view.width() - 36, 20), Qt.AlignLeft, 'Original (grey): ' + data['label'])
+            painter.setPen(QColor(*GHOST_LINES))
+            painter.drawText(QRectF(18, 81, view.width() - 36, 20), Qt.AlignLeft, 'Original (blue): ' + data['label'])
         elif self.show and self.message:
             painter.setPen(QColor('#e0b06c'))
             painter.drawText(QRectF(18, 81, view.width() - 36, 20), Qt.AlignLeft, self.message)
@@ -413,6 +453,7 @@ class CompareOverlay:
         slider = self.w.slider
         if not slider.sc_visible:
             return
+        labels = []
         for i, track in enumerate(slider.sc_rows.tracks):
             if not track['enabled'] or not any(s <= index < e for s, e in track['ranges']):
                 continue
@@ -438,15 +479,15 @@ class CompareOverlay:
                 text = row_label(track) + (f'  residual {value * 100:.1f} cm' if value is not None else
                                            '  pending: Apply Correction' if not self.applied else '') + f'  ({distance * 100:.0f} cm joint gap)'
                 middle = xy.mean(axis=0)
-                painter.setPen(color)
-                painter.drawText(QPointF(middle[0] + 8, middle[1] - 6), text)
+                labels.append((QPointF(middle[0] + 8, middle[1] - 6), text, color))
         painter.setBrush(Qt.NoBrush)
+        paint_labels(painter, labels, view.width())
 
     # Camera preview ---------------------------------------------------------------------------------------------------
 
     def camera_actors(self, view):
         if self.show and self.available() and view.single_actor_visible and 0 <= view.index < len(self.data['joints']):
-            yield np.asarray(self.data['joints'][view.index], float), np.array(PARENTS), '#b8bcc4'
+            yield np.asarray(self.data['joints'][view.index], float), np.array(PARENTS), QColor(*GHOST_LINES).name()
 
     def paint_keypoints(self, painter, rect, camera, index, canvas):
         """2D detections over the video: ExMR COCO-63 from the cache, or the saved COCO-17 on the camera canvas only."""

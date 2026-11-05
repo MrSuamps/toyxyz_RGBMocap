@@ -27,6 +27,8 @@ def lock_needed(argv):
     if words[:1] == ['contacts']:
         # Only listing and plain suggestions (review is read-only, `automatic` is advisory) run beside the GUI.
         action = words[1] if len(words) > 1 else None
+        if action == 'feet':
+            return (words[2] if len(words) > 2 else None) != 'list'
         return not (action == 'list' or (action == 'suggest' and '--accept' not in argv))
     return (words[0] if words else None) not in ('models', 'review', 'fix', 'render')
 

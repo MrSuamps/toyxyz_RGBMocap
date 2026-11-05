@@ -650,12 +650,19 @@ def run(project,emit,result):
                 report['contact_revision']=contact_revision
                 if shared:report['shared_floor']=shared
                 if contact_warning:report['warning']=' '.join(filter(None,(report['warning'],contact_warning)))
+                from .limb_placement import from_store as place,publish as publish_rows
+                from .pose_smoothing import from_store as smooth
+                # Limbs are placed before self-contacts (contacts are solved on the placed limb) and smoothed last, so
+                # smoothing also reaches jitter the contact ease adds.
+                placed=place(project,base,context,geometry.rest[:22],out_roots,out_quats,fps,report['segments'],transform,emit)
                 from .self_contact import from_store as self_contact,publish_smplx,publish_fingers_smplx
                 self_report,self_before=self_contact(project,base,context,geometry.rest[:22],out_roots,out_quats,geometry.palm_offsets,fps,
-                    report['segments'],emit)
-                if self_report is not None:
-                    report['self_contact']=self_report
-                    report['warning']=' '.join(filter(None,(report['warning'],self_report['warning'])))
+                    report['segments'],emit,body,transform)
+                smoothed=smooth(project,base,context,out_quats,fps,report['segments'],bool(report['hand_lock']['contacts']),emit)
+                for name,extra in (('placement',placed),('self_contact',self_report),('smoothing',smoothed)):
+                    if extra is not None:
+                        report[name]=extra
+                        report['warning']=' '.join(filter(None,(report['warning'],extra['warning'])))
                 pose=array('pose',(n,22,3));translation=array('translation',(n,3))
                 after=array('after-sole',(n,4,3))
                 for start in range(0,n,128):
@@ -697,8 +704,12 @@ def run(project,emit,result):
                 for joint in written:
                     output['body_pose'][:,3*(joint-1):3*joint]=torch.from_numpy(np.asarray(pose[:,joint]).copy())
                 if feet is not None:feet.publish(output,pose)
+                # The pre-self-contact layer takes placed rows from placed_pose; smoothing rows stay in both layers.
+                placed_pose=publish_rows(output,pose,(placed,),written)
+                publish_rows(output,pose,(smoothed,),written)
                 if self_before is not None:
-                    prior=publish_smplx(output,params,pose,self_before,self_report['changed'],written)
+                    prior=publish_smplx(output,params if placed_pose is None else {**params,'body_pose':placed_pose},pose,self_before,
+                                        self_report['changed'],written)
                     prior_hands=publish_fingers_smplx(output,params,self_report,geometry.rest,geometry.mean)
                 output['transl']=torch.from_numpy(np.asarray(translation).copy())
                 begin_update(project,kind,'correct')

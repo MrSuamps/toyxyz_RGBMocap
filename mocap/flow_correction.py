@@ -12,11 +12,14 @@ from .storage import atomic_json,sha256
 VERSION=1
 
 
-def code_identity():
+def code_identity(project):
     from .paths import ROOT
-    return {name:sha256(ROOT/'mocap'/name) for name in
-        ('flow_correction.py','flow_floor.py','correction.py','multilevel_contacts.py','hand_lock.py','contact_trajectory.py','contact_arm_plan.py','palm_contact.py','contact_pose_plan.py','contact_temporal_root.py','anatomical_ik.py','correction_settings.py','foot_contacts.py','scene_floor.py',
-         'self_contact.py','self_contact_store.py')}
+    from .self_contact_store import state_path
+    names=('flow_correction.py','flow_floor.py','correction.py','multilevel_contacts.py','hand_lock.py','contact_trajectory.py','contact_arm_plan.py',
+           'palm_contact.py','contact_pose_plan.py','contact_temporal_root.py','anatomical_ik.py','correction_settings.py','foot_contacts.py','scene_floor.py')
+    # Self-contact modules count only for a project with a self-contact file, so solver edits leave other projects cached.
+    if state_path(project,'initial').exists():names+=('self_contact.py','self_contact_store.py')
+    return {name:sha256(ROOT/'mocap'/name) for name in names}
 
 
 def contact_probabilities(params,n):
@@ -166,7 +169,7 @@ def run(project,emit=lambda *a,**k:None,result='corrected_initial'):
         raise ValueError('Correction inputs changed while processing. Apply Correction again.')
     report.update(source='initial',model_key='smplh',model_stat=model_stamp,options=options,contact_revision=revision,
         output_stat=file_stat(project/(kind+'.pt')),contacts_stat=file_stat(archive),segment_count=len(segments),
-        adapter_version=VERSION,code=code_identity(),backend_sha256=sha256(Path(backend().__file__)),elapsed=time.monotonic()-started,
+        adapter_version=VERSION,code=code_identity(project),backend_sha256=sha256(Path(backend().__file__)),elapsed=time.monotonic()-started,
         contact_input='FlowHMR regressed L ankle/toe, R ankle/toe values clipped to [0,1]; not sigmoid logits')
     if shared:report['shared_floor']=shared
     atomic_json(project/(kind+'_sources.json'),sources);atomic_json(project/(kind+'_correction.json'),report)

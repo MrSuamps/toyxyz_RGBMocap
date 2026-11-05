@@ -21,11 +21,11 @@ def sources(project, kind):
     """Files the comparison depends on, with their stats; absent optional inputs are omitted."""
     from .result_artifacts import file_stat
     from .motion_tools import RESULTS
+    from .self_contact_store import before_current, before_path
     project = Path(project)
     names = [f'{kind}_joints.npz', f'{kind}_mesh.json', RESULTS[kind][0]]
-    before = f'{kind}_before_selfcontact.pt'
-    if (project / before).is_file():
-        names.append(before)
+    if before_current(project, kind):
+        names.append(before_path(project, kind).name)
         mesh = project / f'{kind}_mesh.json'
         if mesh.is_file():
             names.append(json.loads(mesh.read_text(encoding='utf-8'))['frames_file'])
@@ -61,8 +61,9 @@ def build(project, kind, out):
     record = dict(schema=SCHEMA, project=str(project), kind=kind, sources=stamps)
     tag = uuid.uuid4().hex[:12]
     written = []
-    before = project / f'{kind}_before_selfcontact.pt'
-    if before.is_file():
+    from .self_contact_store import before_path
+    before = before_path(project, kind)
+    if before.name in stamps:
         mesh = json.loads((project / f'{kind}_mesh.json').read_text(encoding='utf-8'))
         if mesh.get('representation') == 'smplh':
             raise ValueError('The original-layer mesh is available for SMPL-X results only.')

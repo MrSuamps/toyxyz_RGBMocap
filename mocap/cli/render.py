@@ -50,11 +50,16 @@ def register(commands, common):
     p.add_argument('--step', type=int, default=1, metavar='N', help='render every Nth frame (default 1)')
     p.add_argument('--views', default='camera,front,side,orbit', metavar='LIST', help=f'comma list of {", ".join(VIEWS)} (default: all)')
     p.add_argument('--compare', nargs='?', const='auto', choices=('auto', 'original', 'before-selfcontact'),
-                   help='also draw the reference layer: original, before-selfcontact, or auto (before-selfcontact when present)')
+                   help='also draw the reference layer: original, before-selfcontact, or auto (before-selfcontact when current)')
     p.add_argument('--focus', metavar='BONE,BONE', help='orbit around these two bones instead of the self-contact tracks, and measure their distance')
     p.add_argument('--out', metavar='DIR', help='output folder (default: <model project>/render/<result>-<time>)')
     p.add_argument('--mp4', action='store_true', help='also write one MP4 per view (FFmpeg)')
     p.add_argument('--size', type=int, default=LONG_SIDE, metavar='PX', help=f'long side of the camera view in pixels (default {LONG_SIDE})')
+    p.add_argument('--sheet', action='store_true',
+                   help='one comparison sheet per self-contact instead: per frame the video crop, then every layer over the same crop and '
+                        'in a close 3D view, with penetration depth and skin gap (--frames A-B or A,B,C; --compare defaults to original)')
+    p.add_argument('--add', action='append', default=[], metavar='LABEL=FILE',
+                   help='--sheet: another result file (same params format, e.g. a saved grip-off result) as a column; repeatable')
     p.set_defaults(handler=cmd_render)
 
 
@@ -443,18 +448,22 @@ def load_layers(project, kind, compare, body):
     from ..motion_tools import RESULTS
     from .smplx_body import load_params
     from . import compare as comparing
-    layers = []
+    from ..self_contact_store import before_current, before_path
+    layers, note = [], ''
     if compare:
         against = compare
         if compare == 'auto':
-            against = 'before-selfcontact' if (project / f'{kind}_before_selfcontact.pt').is_file() else 'original'
+            fresh = before_current(project, kind)
+            against = 'before-selfcontact' if fresh else 'original'
+            if not fresh and before_path(project, kind).is_file():
+                note = comparing.STALE_BEFORE.format(name=before_path(project, kind).name) + ' Comparing against the original instead.'
         path, key, label, ref_kind = comparing.reference(project, kind, against)
         layers.append(Layer(f'{label} (reference)', 'reference', body.pose(load_params(path, key)), ref_kind))
     filename, key = RESULTS[kind]
     if not (project / filename).is_file():
         raise CliError(f'{project} has no {kind} result ({filename}).')
     layers.append(Layer(kind, 'result', body.pose(load_params(project / filename, key)), kind))
-    return layers
+    return layers, note
 
 
 def cmd_render(args, session):
@@ -464,6 +473,8 @@ def cmd_render(args, session):
         raise CliError(f'This workspace has no {target.model} motion yet. Reconstruct it first.')
     project, model = target.project, target.model
     kind = args.result or current_kind(project, model)
+    if args.sheet:
+        return cmd_sheet(args, session, project, model, kind, started)
     views = [v.strip() for v in args.views.split(',') if v.strip()]
     unknown = [v for v in views if v not in VIEWS]
     if unknown or not views:
@@ -486,9 +497,12 @@ def cmd_render(args, session):
     from .smplx_body import Body, gui_vertices, model_path
     session.info('Loading the SMPL-X body ...')
     body = Body(model_path(project))
-    layers = load_layers(project, kind, args.compare, body)
+    layers, compare_note = load_layers(project, kind, args.compare, body)
+    if compare_note:
+        session.info('Note: ' + compare_note)
     count = len(layers[-1].state['joints'])
     tracks, note = contact_tracks(project, kind, count, fps)
+    note = ' '.join(filter(None, (compare_note, note)))
     frames = parse_frames(args.frames, count)
     if frames is None:
         spans = [r for t in tracks for r in t['ranges']]
@@ -573,4 +587,209 @@ def cmd_render(args, session):
     session.say(f'Render: {len(written)} image(s){", " + str(len(report["movies"])) + " movie(s)" if report["movies"] else ""} in {out}')
     summary.update(report_path=str(out / 'render.json'), images=len(written), movies=report['movies'], gui_mesh_max_error_m=checks,
                    frames=report['frames'])
+    return 0, summary
+
+
+# Comparison sheet ---------------------------------------------------------------------------------------------------
+
+SHEET_TILE = 340
+SHEET_FRAMES = 4
+SHEET_SIDE_DEG = 90.0            # close 3D view: the camera direction turned about the vertical
+SHEET_DISTANCE = 0.75
+SHEET_COLORS = ((205, 185, 165), (120, 175, 235), (140, 210, 140), (200, 150, 220))
+GREEN, MAGENTA = (60, 220, 60), (230, 60, 230)
+
+
+def sheet_frames(value, ranges, count):
+    """Frames of a sheet: --frames A,B,C as given, A-B (or a contact range) as SHEET_FRAMES evenly spaced frames."""
+    import numpy as np
+    if value and ',' in value:
+        try:
+            frames = sorted({int(part) for part in value.split(',')})
+        except ValueError:
+            raise CliError('--frames expects A-B or A,B,C video frame numbers', EXIT_USAGE) from None
+        if frames[0] < 0 or frames[-1] >= count:
+            raise CliError(f'--frames {value}: frames must lie in 0-{count - 1}', EXIT_USAGE)
+        return frames
+    first, last = parse_frames(value, count) if value else (ranges[0][0], ranges[-1][1] - 1)
+    return sorted({int(round(x)) for x in np.linspace(first, last, SHEET_FRAMES)})
+
+
+def crop_camera(obs, frame, box, tile):
+    """The project camera of a frame looking at the square video crop box (x0, y0, side) at tile pixels."""
+    import numpy as np
+    x0, y0, side = box
+    K = np.asarray(obs.K, np.float64).copy()
+    K[0, 2] -= x0
+    K[1, 2] -= y0
+    K[:2] *= tile / side
+    return Camera(obs.rotation[frame], obs.translation[frame], K, tile, tile)
+
+
+def crop_video(image, box, tile):
+    import cv2
+    x0, y0, side = (int(round(v)) for v in box)
+    padded = cv2.copyMakeBorder(image, side, side, side, side, cv2.BORDER_CONSTANT, value=BACKGROUND)
+    return cv2.resize(padded[y0 + side:y0 + 2 * side, x0 + side:x0 + 2 * side], (tile, tile), interpolation=cv2.INTER_AREA)
+
+
+def skin_numbers(groups, segments, vertices, effector, arm, targets):
+    """(hand depth m, skin gap m or nan, arm depth m) of the effector hand and its arm segments against the target segments."""
+    from ..self_contact import penetrations, signed_gap
+    posed = {name: vertices[groups[name]] for name in targets}
+    hand = penetrations(vertices[groups[effector]], posed, segments, list(targets))
+    arm_depth = max([penetrations(vertices[groups[name]], posed, segments, list(targets))['depth'] for name in arm] or [0.0])
+    return hand['depth'], signed_gap(hand), arm_depth
+
+
+def hand_arrow(image, camera, start, end, color):
+    import cv2
+    import numpy as np
+    (a, b), _ = project(camera, np.stack([start, end]))
+    if np.isfinite(a).all() and np.isfinite(b).all():
+        cv2.arrowedLine(image, tuple(int(round(v)) for v in a), tuple(int(round(v)) for v in b), color, 2, cv2.LINE_AA, tipLength=0.25)
+        return b - a
+    return None
+
+
+def sheet_columns(layers):
+    return ['Video'] + [layer.label for layer in layers] + [f'{layer.label} - 3D' for layer in layers]
+
+
+def contact_sheet_image(body, layers, track, frames, obs, videos, tile):
+    """Rows = frames; columns = video crop, every layer over the crop, every layer in a close 3D view; numbers per tile."""
+    import cv2
+    import numpy as np
+    from ..self_contact import Segments, arm_groups, parse_target, segment_names, segment_vertices
+    _, side, part = parse_target(track['target'])
+    h = 0 if track['effector'] == 'LeftHand' else 1
+    groups = segment_vertices(body.weights)
+    segments = Segments(body.faces, groups)
+    targets = segment_names(part, side)
+    effector, *arm = arm_groups(h, part, side)
+    wrist, knuckle = HAND_JOINTS[track['effector']]
+    # The close view shows only the touching limbs, so the trunk or head never hides the contact.
+    shown = np.zeros(len(body.weights), bool)
+    for name in [effector] + arm + targets + [n for n in (targets[0].rsplit('_', 1)[0] + '_thigh',) if n in groups]:
+        shown[groups[name]] = True
+    limb_faces = body.faces[shown[body.faces].all(1)]
+    base = 23 + 20 * h
+    rows = []
+    for frame in frames:
+        result = layers[-1].state
+        ends = np.stack([contact_point(result, frame, track['effector']), contact_point(result, frame, track['target'])])
+        others = np.stack([contact_point(layer.state, frame, track['effector']) for layer in layers])
+        uv = project(Camera(obs.rotation[frame], obs.translation[frame], obs.K, 1, 1), np.concatenate([ends, others]))[0]
+        uv = uv[np.isfinite(uv).all(1)]
+        torso = float(np.linalg.norm(obs.keypoints[frame, 5, :2] - obs.keypoints[frame, 12, :2]))
+        side_px = max(float(np.ptp(uv, 0).max()) * 1.6, 0.9 * torso, 160.0) if len(uv) else 400.0
+        centre = uv.mean(0) if len(uv) else np.array(videos[frame].shape[1::-1]) / 2
+        box = (centre[0] - side_px / 2, centre[1] - side_px / 2, side_px)
+        camera = crop_camera(obs, frame, box, tile)
+        kp = obs.keypoints[frame]
+        video = crop_video(videos[frame], box, tile)
+        point = lambda xy: tuple(int(round(v)) for v in (np.asarray(xy) - box[:2]) * tile / side_px)
+        kp_dir = None
+        if kp[9 + h, 2] > 0.3 and kp[base + 8, 2] > 0.3:
+            cv2.arrowedLine(video, point(kp[9 + h, :2]), point(kp[base + 8, :2]), GREEN, 2, cv2.LINE_AA, tipLength=0.25)
+            kp_dir = kp[base + 8, :2] - kp[9 + h, :2]
+        labels(video, [f'frame {frame}', 'green: video wrist->knuckle', f'score {min(kp[9 + h, 2], kp[base + 8, 2]):.2f}'], scale=0.45)
+        overlays, views = [], []
+        centre3 = ends.mean(0)
+        forward = np.asarray(obs.rotation[frame]).T @ np.array([0.0, 0.0, 1.0])
+        forward[1] = 0
+        forward = forward / max(np.linalg.norm(forward), 1e-9)
+        eye = centre3 - rotate_y(forward, SHEET_SIDE_DEG) * SHEET_DISTANCE + np.array([0.0, 0.2, 0.0])
+        close = look_at(eye, centre3, tile, tile, 40.0)
+        for k, layer in enumerate(layers):
+            vertices = body.vertices(layer.state, frame)
+            normals = vertex_normals(vertices, body.faces)
+            color = SHEET_COLORS[k % len(SHEET_COLORS)]
+            depth, gap, arm_depth = skin_numbers(groups, segments, vertices, effector, arm, targets)
+            numbers = [f'hand inside {targets[0].split("_")[-1]}: {depth * 100:.1f} cm' if depth > 0.002 else
+                       'skin gap: ' + ('> 5 cm' if not np.isfinite(gap) else f'{max(gap, 0) * 100:.1f} cm')]
+            if arm_depth > 0.005:
+                numbers.append(f'arm inside target: {arm_depth * 100:.1f} cm')
+            image, _ = draw_body(camera, vertices, body.faces, normals, color, crop_video(videos[frame], box, tile), ALPHA)
+            model_dir = hand_arrow(image, camera, layer.state['joints'][frame, wrist], layer.state['joints'][frame, knuckle], MAGENTA)
+            if kp_dir is not None and model_dir is not None:
+                error = np.degrees(abs(np.arctan2(model_dir[0] * kp_dir[1] - model_dir[1] * kp_dir[0], model_dir @ kp_dir)))
+                numbers.append(f'hand direction vs video: {error:.0f} deg')
+            labels(image, numbers, scale=0.45)
+            overlays.append(image)
+            view, _ = draw_body(close, vertices, limb_faces, vertex_normals(vertices, limb_faces), color)
+            labels(view, numbers[:2] + [f'3D, {SHEET_SIDE_DEG:.0f} deg from the camera, touching limbs only'], scale=0.45)
+            views.append(view)
+        rows.append(side_by_side([video] + overlays + views))
+    header = np.full((34, rows[0].shape[1], 3), 255, np.uint8)
+    for k, title in enumerate(sheet_columns(layers)):
+        cv2.putText(header, title, (k * (tile + 4) + 8, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA)
+    legend = np.full((30, rows[0].shape[1], 3), 255, np.uint8)
+    cv2.putText(legend, f"{track.get('id')}: {track['effector']} -> {track['target']}. Magenta arrow: model wrist->middle knuckle; green: video "
+                f"keypoints. Depth/gap: SMPL-X skin of the hand vs the {' + '.join(targets)}.", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                (20, 20, 20), 1, cv2.LINE_AA)
+    gap = np.full((4, rows[0].shape[1], 3), 255, np.uint8)
+    out = [header]
+    for row in rows:
+        out += [row, gap]
+    return np.concatenate(out + [legend], 0)
+
+
+def cmd_sheet(args, session, project, model, kind, started):
+    from ..motion_tools import RESULTS
+    if model != 'exmr':
+        raise CliError(f'--sheet needs the ExMR saved cameras and keypoints; {model} is not supported yet.')
+    state = read_json(project / 'project.json')
+    fps = float(state.get('fps', 30))
+    out = Path(args.out).expanduser().resolve() if args.out else project / 'render' / f'{kind}-sheet-{time.strftime("%Y%m%d-%H%M%S")}'
+    extra = []
+    for item in args.add:
+        label, sep, path = item.partition('=')
+        if not sep or not Path(path).expanduser().is_file():
+            raise CliError(f'--add expects LABEL=FILE with an existing file: {item}', EXIT_USAGE)
+        extra.append((label, Path(path).expanduser().resolve()))
+    summary = dict(command='render', sheet=True, project=str(project), model=model, result=kind, out=str(out))
+    if session.dry_run:
+        summary.update(dry_run=True)
+        if not session.json:
+            print(f'Would write one comparison sheet per self-contact of {kind} into {out}')
+        return 0, summary
+    import cv2
+    from .review import load_exmr, read_frames
+    from .smplx_body import Body, load_params, model_path
+    session.info('Loading the SMPL-X body, cameras and keypoints ...')
+    body = Body(model_path(project))
+    from . import compare as comparing
+    path, key, label, ref_kind = comparing.reference(project, kind, args.compare or 'original')
+    layers = [Layer('Before (original)' if (args.compare or 'original') == 'original' else 'Before (' + label + ')', 'reference',
+                    body.pose(load_params(path, key)), ref_kind)]
+    for name, file in extra:
+        layers.append(Layer(name, 'result', body.pose(load_params(file)), None))
+    filename, key = RESULTS[kind]
+    count = len(layers[0].state['joints'])
+    tracks, note = contact_tracks(project, kind, count, fps)
+    if not tracks:
+        raise CliError('No enabled self-contact tracks to make a sheet for.', EXIT_USAGE)
+    grip = {t.get('grip', 'off') for t in tracks}
+    layers.append(Layer('After' + (f' (grip {grip.pop()})' if len(grip) == 1 else ''), 'result', body.pose(load_params(project / filename, key)), kind))
+    obs = load_exmr(project)
+    plans = [(track, sheet_frames(args.frames, track['ranges'], count)) for track in tracks]
+    videos = read_frames(obs.video, {f for _, frames in plans for f in frames})
+    out.mkdir(parents=True, exist_ok=True)
+    written = []
+    for track, frames in plans:
+        missing = [f for f in frames if f not in videos]
+        if missing:
+            raise CliError(f'The video has no frame {missing[0]}.')
+        image = contact_sheet_image(body, layers, track, frames, obs, videos, SHEET_TILE)
+        path = out / f"sheet_{track.get('id') or 'contact'}_f{frames[0]:04d}-{frames[-1]:04d}.png"
+        cv2.imwrite(str(path), image)
+        written.append(str(path))
+        session.info(f'  {path.name}')
+    report = dict(version=1, command='render', sheet=True, project=str(project), result=kind, layers=[l.label for l in layers],
+                  frames={t.get('id'): f for t, f in plans}, images=written, note=note or None,
+                  geometry='SMPL-X neutral LBS with shape and pose correctives (GUI Mesh view)', seconds=round(time.monotonic() - started, 2))
+    (out / 'sheet.json').write_text(json.dumps(report, indent=1), encoding='utf-8')
+    session.say(f'Sheet: {len(written)} image(s) in {out}')
+    summary.update(images=written, report_path=str(out / 'sheet.json'))
     return 0, summary

@@ -323,6 +323,8 @@ def prepare(project, result, emit=lambda *a, **k: None, body=None):
                 # Declared self-contact arm rows are exempt; wrists only on rows a grip declares.
                 from .self_contact import audit_exemptions
                 exempt=audit_exemptions(saved.get('self_contact'),preserved_joints)
+                from .limb_placement import audit_exemptions as declared_rows
+                exempt+=declared_rows(saved,preserved_joints)
                 for start in range(0,n,128):
                     stop=min(n,start+128)
                     pair=[]

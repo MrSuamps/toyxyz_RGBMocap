@@ -41,7 +41,14 @@ HAND_DIRECTION_DEG = 50.0
 HAND_EDGE_ON = 0.35             # |sin| of the wrist->knuckle vs knuckle-row angle below which the palm order is unreliable
 HAND_MIN_TORSO = 0.06
 PREFIX = dict(hyperextension='HX', locked_limb='LL', wrist_limit='WL', joint_twist='TW', sudden_fold='SF', finger_pose='FG',
-              hand_orientation='HO')
+              hand_orientation='HO', self_penetration='SP', contact_gap='CG')
+# Skin interpenetration (posed SMPL-X mesh, segments by skinning weight): depth of one segment's vertices inside another.
+PENETRATION_M = 0.01
+PENETRATION_HIGH_M = 0.025
+# A declared self-contact whose hand skin stays this far from the target skin floats.
+CONTACT_GAP_M = 0.015
+CONTACT_GAP_HIGH_M = 0.04
+SEGMENT_JOINT = dict(hand=(20, 21), forearm=(18, 19), upperarm=(16, 17), thigh=(1, 2), shin=(4, 5), foot=(7, 8))
 REVIEW_PREFIX = dict(missed_contact='MC', pose_error='PE', foot_slide='FS', floor_penetration='FP', jitter='JT', placement_drift='PD')
 SEVERITY = {'high': 0, 'medium': 1, 'low': 2, 'info': 3}
 
@@ -58,6 +65,7 @@ class Pose:
     finger_rest: np.ndarray | None  # (2, 5, 4, 3) rest finger joints 1-3 plus the tip direction end
     first: int
     source: str
+    mesh: object = None           # Mesh of the same rows (SMPL-X results only)
 
     def rows(self, frames):
         index = np.asarray(frames) - self.first
@@ -65,7 +73,51 @@ class Pose:
             raise ValueError(f'pose covers video frames {self.first}-{self.first + len(self.joints) - 1}, not {frames[0]}-{frames[-1]}')
         pick = lambda value: None if value is None else value[index]
         return Pose(self.joints[index], self.world[index], self.local[index], self.rest, pick(self.knuckles), pick(self.fingers),
-                    self.finger_rest, int(frames[0]), self.source)
+                    self.finger_rest, int(frames[0]), self.source, None if self.mesh is None else self.mesh.rows(index))
+
+
+class Mesh:
+    """Posed SMPL-X vertices of a Body state on demand (rows index the state), with skin-contact measurements cached."""
+
+    def __init__(self, body, state, index=None, project=None, kind=None, cache=None):
+        from ..self_contact import Segments, segment_vertices
+        self.body, self.state, self.project, self.kind = body, state, project, kind
+        self.index = np.arange(len(state['joints'])) if index is None else np.asarray(index)
+        self.groups = segment_vertices(body.weights)
+        self.segments = Segments(body.faces, self.groups)
+        self.cache = {} if cache is None else cache
+
+    def rows(self, index):
+        out = Mesh.__new__(Mesh)
+        out.__dict__.update(self.__dict__, index=self.index[np.asarray(index)])
+        return out
+
+    def vertices(self, i):
+        return self.body.vertices(self.state, int(self.index[i]))
+
+    def measure(self, pairs):
+        """{pair: (depth (n,), inside count (n,), signed skin gap (n,))} for (effector segment, target segment names) pairs."""
+        from ..self_contact import penetrations, signed_gap
+        key = (tuple(self.index.tolist()), tuple(pairs))
+        if key in self.cache:return self.cache[key]
+        n = len(self.index)
+        out = {pair: (np.zeros(n), np.zeros(n, int), np.full(n, np.nan)) for pair in pairs}
+        for i in range(n):
+            v = self.vertices(i)
+            boxes = {}
+            for effector, targets in pairs:
+                for name in (effector,) + tuple(targets):
+                    if name not in boxes:
+                        part = v[self.groups[name]]; boxes[name] = (part, part.min(0) - .05, part.max(0) + .05)
+                points, low, high = boxes[effector]
+                near = [t for t in targets if (boxes[t][2] >= low).all() and (boxes[t][1] <= high).all()]
+                if not near:continue
+                r = penetrations(points, {t: boxes[t][0] for t in near}, self.segments, list(near))
+                depth, inside, gap = out[(effector, targets)]
+                depth[i], inside[i] = r['depth'], r['inside']
+                gap[i] = signed_gap(r) if near[0] == targets[0] else -r['depth'] if r['depth'] > 0 else np.nan
+        self.cache[key] = out
+        return out
 
 
 # Maths ---------------------------------------------------------------------------------------------------------------
@@ -425,6 +477,122 @@ def check_hand_orientation(ctx, pose):
     return issues
 
 
+# Skin contact (mesh) ------------------------------------------------------------------------------------------------
+
+def penetration_pairs():
+    """(effector segment, (target segment,)) pairs checked on every frame: hands against legs, head, torso and the other
+    arm, forearms against legs and head, and the legs against each other. Segments that share a joint are skipped."""
+    legs = [f'{side}_{part}' for side in SIDES for part in ('foot', 'shin', 'thigh')]
+    pairs = []
+    for side, other in zip(SIDES, SIDES[::-1]):
+        pairs += [(f'{side}_hand', (t,)) for t in legs + ['head', 'torso', f'{other}_forearm', f'{other}_upperarm']]
+        pairs += [(f'{side}_forearm', (t,)) for t in legs + ['head']]
+    pairs += [('left_hand', ('right_hand',)), ('left_shin', ('right_shin',)), ('left_foot', ('right_shin',)), ('right_foot', ('left_shin',)),
+              ('left_foot', ('right_foot',))]
+    return pairs
+
+
+def segment_joint(name):
+    side, _, part = name.partition('_')
+    return {'head': 15, 'torso': 3}[name] if not part else SEGMENT_JOINT[part][SIDES.index(side)]
+
+
+def contact_tracks(mesh):
+    """Enabled self-contact tracks of the mesh's project result: [(track, (hand, target segments))]."""
+    if mesh is None or mesh.project is None or mesh.kind is None:
+        return []
+    from ..motion_tools import base_result
+    from .. import self_contact_store as store
+    from ..self_contact import parse_target, segment_names
+    try:
+        tracks, _, _ = store.read(mesh.project, base_result(mesh.kind), {'frames': len(mesh.state['joints']), 'fps': 30.0})
+    except (OSError, ValueError, KeyError):
+        return []
+    out = []
+    for track in tracks:
+        if not track.get('enabled', True):
+            continue
+        _, side, part = parse_target(track['target'])
+        hand = ('left' if track['effector'] == 'LeftHand' else 'right') + '_hand'
+        out.append((track, (hand, tuple(segment_names(part, side)))))
+    return out
+
+
+def check_self_penetration(pose, frames):
+    if pose.mesh is None:
+        return []
+    issues = []
+    for (effector, (target,)), (depth, inside, _) in pose.mesh.measure(penetration_pairs()).items():
+        flag = depth > PENETRATION_M
+        for a, b in runs(flag, 2, 2):
+            span = slice(a, b + 1)
+            worst = a + int(np.argmax(depth[span]))
+            peak, count = float(depth[worst]), int(flag[span].sum())
+            median = float(np.median(depth[span][flag[span]]))
+            severity = 'high' if peak >= PENETRATION_HIGH_M else 'medium'
+            what, into = effector.replace('_', ' '), target.replace('_', ' ')
+            issues.append(make_issue('self_penetration', severity, count * peak * 100, frames, a, b, worst, [effector, target],
+                                     dict(frames_flagged=count, depth_max_m=peak, depth_median_m=median, inside_vertices_max=int(inside[span].max())),
+                                     f'{what} is {peak * 100:.1f} cm inside the {into} (median {median * 100:.1f} cm) on {count} frames',
+                                     'push the contact out of the target skin (self-contact solver) or fix the limb placement',
+                                     dict(smpl=(segment_joint(effector), segment_joint(target)), series={f'{what} in {into} cm': depth * 100})))
+    return issues
+
+
+def check_contact_gap(pose, frames):
+    """Declared self-contacts whose hand skin floats away from the target skin (the real surface gap, not a palm point)."""
+    tracks = contact_tracks(pose.mesh)
+    if not tracks:
+        return []
+    measured = pose.mesh.measure([pair for _, pair in tracks])
+    issues = []
+    for track, pair in tracks:
+        _, _, gap = measured[pair]
+        active = np.zeros(len(frames), bool)
+        for a, b in track['ranges']:
+            active[max(a - frames[0], 0):max(b - frames[0], 0)] = True
+        far = np.nan_to_num(gap, nan=1.0)
+        flag = active & (far > CONTACT_GAP_M)
+        for a, b in runs(flag, 2, 3):
+            span = slice(a, b + 1)
+            worst = a + int(np.argmax(far[span]))
+            count, median = int(flag[span].sum()), float(np.median(far[span][flag[span]]))
+            severity = 'high' if median >= CONTACT_GAP_HIGH_M else 'medium'
+            measured_gap = np.isfinite(gap[span][flag[span]]).all()
+            label = f"{median * 100:.1f} cm" if measured_gap else 'more than 5 cm'
+            issues.append(make_issue('contact_gap', severity, count * min(median, .1) * 100, frames, a, b, worst, [pair[0], pair[1][0]],
+                                     dict(frames_flagged=count, skin_gap_median_m=median if measured_gap else None,
+                                          skin_gap_max_m=float(gap[span][flag[span]].max()) if measured_gap else None, track=track.get('id')),
+                                     f"{track['effector']} -> {track['target']} ({track.get('id')}): the hand skin floats {label} from the "
+                                     f"{pair[1][0].replace('_', ' ')} on {count} contact frames", 'run `correct` with the track enabled',
+                                     dict(smpl=(segment_joint(pair[0]), segment_joint(pair[1][0])), series={'skin gap cm': gap * 100})))
+    return issues
+
+
+def skin_summary(pose, frames):
+    """Per declared self-contact: skin gap (negative = penetration) and penetration over its contact frames; None without a mesh."""
+    if pose is None or pose.mesh is None:
+        return None
+    sliced = pose.rows(frames)
+    tracks = contact_tracks(sliced.mesh)
+    measured = sliced.mesh.measure([pair for _, pair in tracks]) if tracks else {}
+    out = dict(geometry='SMPL-X mesh, segments by dominant skinning weight', penetration_m=PENETRATION_M, high_m=PENETRATION_HIGH_M, contacts=[])
+    for track, pair in tracks:
+        depth, _, gap = measured[pair]
+        active = np.zeros(len(frames), bool)
+        for a, b in track['ranges']:
+            active[max(a - frames[0], 0):max(b - frames[0], 0)] = True
+        if not active.any():
+            continue
+        g = gap[active]
+        out['contacts'].append(dict(id=track.get('id'), effector=pair[0], target=list(pair[1]), frames=int(active.sum()),
+                                    penetration_max_m=float(depth[active].max()), penetration_median_m=float(np.median(depth[active])),
+                                    penetrating_frames=int((depth[active] > PENETRATION_M).sum()),
+                                    skin_gap_median_m=float(np.nanmedian(g)) if np.isfinite(g).any() else None,
+                                    skin_gap_max_m=float(np.nanmax(g)) if np.isfinite(g).any() else None, far_frames=int(np.isnan(g).sum())))
+    return out
+
+
 def rank(issues):
     """review.rank with the anatomy prefixes: sort by severity then score, assign ids such as WL1."""
     issues.sort(key=lambda item: (SEVERITY[item['severity']], -item['score']))
@@ -439,7 +607,8 @@ def rank(issues):
 def checks(ctx, pose):
     """Every anatomy check for review's Context (`ctx.frames` video frames) and a Pose covering them."""
     sliced = pose.rows(ctx.frames)
-    return check_anatomy(sliced, ctx.frames, ctx.fps) + check_hand_orientation(ctx, sliced)
+    return (check_anatomy(sliced, ctx.frames, ctx.fps) + check_hand_orientation(ctx, sliced) + check_self_penetration(sliced, ctx.frames) +
+            check_contact_gap(sliced, ctx.frames))
 
 
 def hand_coverage(ctx, pose):
@@ -451,8 +620,9 @@ def hand_coverage(ctx, pose):
 
 # Loaders ------------------------------------------------------------------------------------------------------------
 
-def pose_from_state(state, first=0, source='smplx'):
-    """Pose from `smplx_body.Body.pose` output (55 SMPL-X joints)."""
+def pose_from_state(state, first=0, source='smplx', body=None, project=None, kind=None):
+    """Pose from `smplx_body.Body.pose` output (55 SMPL-X joints); with the Body it carries the mesh for skin checks
+    (project and kind name the result whose self-contact tracks the gap check reads)."""
     n = len(state['joints'])
     knuckles = np.empty((n, 2, 5, 3, 3))
     fingers = np.empty((n, 2, 5, 3, 3, 3))
@@ -466,8 +636,9 @@ def pose_from_state(state, first=0, source='smplx'):
             fingers[:, s, f] = state['local'][:, ids]
             finger_rest[s, f, :3] = rest[ids]
             finger_rest[s, f, 3] = 2 * rest[ids[2]] - rest[ids[1]]
+    mesh = None if body is None else Mesh(body, state, project=None if project is None else Path(project), kind=kind)
     return Pose(state['joints'][:, :22], state['world'][:, :22], state['local'][:, :22], rest[:22], knuckles, fingers, finger_rest,
-                int(first), source)
+                int(first), source, mesh)
 
 
 def load_project_pose(project, kind, body=None, path=None):
@@ -481,7 +652,7 @@ def load_project_pose(project, kind, body=None, path=None):
     else:
         key = 'smpl_params_global'
     body = body or Body(model_path(project))
-    return pose_from_state(body.pose(load_params(path, key)), 0, 'smplx'), body
+    return pose_from_state(body.pose(load_params(path, key)), 0, 'smplx', body, project, kind), body
 
 
 def pose_from_dump(data, frame_base=1):
