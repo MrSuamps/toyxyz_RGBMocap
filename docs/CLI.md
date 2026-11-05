@@ -122,6 +122,12 @@ the shared floor (`scene_floor.json`) is updated and every take with an availabl
 are written to the takes of `--people` (default: all corrected takes). Characters retargeted from a corrected take are marked as
 needing retargeting and re-retargeted afterwards, as in the app; `--no-character-refresh` only marks them.
 
+The flat floor model shifts the root so each support frame lands on one floor height. When that grounding shift spans
+more than 0.15 m (the source world's floor drifts or tilts), `<kind>_correction.json` `warning` says so: the body may
+move off the video person (review `body_offset`); Multi Level keeps the source elevation. For a moving ExMR camera, the
+GUI camera gizmos and the Blender export camera follow the root change correction made, so the body keeps its place in
+view.
+
 ## Export
 
 ```
@@ -268,9 +274,14 @@ bone is an error). `--result` picks the project result (default: the project sel
 that result's correction files when present. Report frames and `--frames` are video frames (0-based); Blender frames
 and fix frames are video frame + 1. Only ExMR projects are supported for now.
 
-Method: each frame is projected with a per-frame camera paired from the original reconstruction (the in-camera and
-world roots), so camera drift does not count as error. For pose checks, the per-frame 2D offset (median of the
-confident shoulder keypoints, hips weighted low) is removed first and reported separately as placement drift. Errors
+Method: the camera follows the project's ExMR camera mode (`exmr_camera.json`; `report.json` `camera` names the one
+used). A static camera is one fixed camera, the GUI camera view's: the frame-0 pairing of the original in-camera and
+world roots. So ExMR's world drift (up to 0.25 m) shows as placement offset in the original result, and Motion Correction
+removing it does not. A moving camera is paired per frame with the original roots, and for a corrected result its
+centres move by the root change correction made (as the Blender export camera), so a corrected result keeps the
+original's place in view. Projects without a saved camera mode keep the per-frame pairing. For pose checks, the
+per-frame 2D offset (median of the confident shoulder keypoints, hips weighted low) is removed first and reported
+separately as placement drift (aligned pose errors therefore barely depend on the camera mode). Errors
 are divided by the torso length in pixels (shoulder middle to hip middle), so thresholds do not depend on resolution.
 Keypoints count when their score is at least 0.5. Frames where the 2D detector swapped left and right legs or arms
 are relabelled and listed under `keypoint_swaps`.
@@ -283,6 +294,7 @@ are relabelled and listed under `keypoint_swaps`.
 | `floor_penetration` | The ankle or toe joint is more than 1 cm below its resting height above the floor during contact. | None (`correct --pelvis-offset` / `--floor`). |
 | `jitter` | A joint's acceleration (pelvis-relative; the pelvis absolute) exceeds 8 times its median and 20 m/s^2, and 3 times its local median. | `smooth` on the limb's bones. |
 | `placement_drift` | The whole body sits more than 0.25 torso off the person in the video (informational). | None. |
+| `body_offset` | Corrected results: for at least 1 s the body sits more than 0.2 torso farther off the person than the uncorrected base result does, each through its own camera (medium from 0.3, high from 0.4 median excess). Metrics give both offsets, the direction (below / above / sideways) and `mode`, `max_root_y_offset_m` and `warning` from `<kind>_correction.json`. | None (check the GUI camera view; `correct --floor-mode multi_level` or `--floor`). |
 | `hyperextension` | An elbow or knee bends more than 5 deg the wrong way about its anatomical hinge (high from 25 deg). | None. |
 | `locked_limb` | An elbow is held at 170 deg interior or straighter for 6+ frames (knee 178); high when locked at 177+ for 10+ frames, the typical IK reach failure. | None (move the target limb / reciprocal). |
 | `sudden_fold` | An elbow or knee dips more than 35 deg below the angles around it within 0.35 s (an easing fold; knees one level lower). | None. |
@@ -327,8 +339,9 @@ rgbmocap-cli.cmd render --project P --sheet [--frames A-B|A,B,C] [--compare orig
 ```
 
 Draws the model's own SMPL-X mesh (the GUI Mesh view geometry: shape and pose correctives, never the bound display
-skin) with a software rasteriser, so it needs no GPU. Views: `camera` over the video frame with the project's per-frame
-camera (ExMR), `front` and `side` from the body's mean heading, and `orbit`, four close views around each self-contact
+skin) with a software rasteriser, so it needs no GPU. Views: `camera` over the video frame with review's camera (ExMR:
+one fixed camera for a static camera; per frame for a moving one, following each layer's own correction), `front` and
+`side` from the body's mean heading, and `orbit`, four close views around each self-contact
 (or `--focus`). `--compare` puts the reference layer (grey) beside the result (orange); without a value it picks
 `before-selfcontact` when that file is current (its stat matches `<kind>_correction.json` and the result is not stale),
 else `original`, with a note when an outdated file was skipped. A red line marks each self-contact with its palm-to-target

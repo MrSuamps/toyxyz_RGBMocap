@@ -62,16 +62,18 @@ def geometry(camera,matrix,depth=.35):
     edges=np.array([(0,i) for i in range(1,5)]+[(1,2),(2,3),(3,4),(4,1),(5,6),(6,7),(7,5)])
     return world[edges],world[0]
 
-def paired_reference(project,cancelled,cache):
-    """Keep tensor deserialization outside the editor, including its loader thread."""
+def paired_reference(project,cancelled,cache,kind=None):
+    """Keep tensor deserialization outside the editor, including its loader thread. `kind`: see camera_reference.reference."""
     import os,subprocess,time
     from .paths import worker_command
     from .result_artifacts import file_stat,artifacts_current
     if not artifacts_current(project,'initial'):raise ValueError('Original motion preview is stale. Use Prepare Preview.')
-    prior=cache.get(str(project)) if cache is not None else None
+    key=str(project)+('|'+kind if kind else '')
+    prior=cache.get(key) if cache is not None else None
     if prior and prior.get('schema')==2 and all(file_stat(project/name)==stamp for name,stamp in prior['sources'].items()):return prior
     environment=dict(os.environ,CUDA_VISIBLE_DEVICES='',OMP_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1',MKL_NUM_THREADS='1')
-    process=subprocess.Popen(worker_command('camera_reference','--project',str(project)),stdout=subprocess.PIPE,stderr=subprocess.PIPE,
+    command=worker_command('camera_reference','--project',str(project),*(('--kind',kind) if kind else ()))
+    process=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
         env=environment,creationflags=getattr(subprocess,'CREATE_NO_WINDOW',0))
     deadline=time.monotonic()+60
     try:
@@ -89,7 +91,7 @@ def paired_reference(project,cancelled,cache):
                 raise ValueError('Invalid estimated camera centers.')
         if cache is not None:
             if len(cache)>=8:cache.pop(next(iter(cache)))
-            cache[str(project)]=value
+            cache[key]=value
         return value
     finally:
         if process.poll() is None:
@@ -98,13 +100,16 @@ def paired_reference(project,cancelled,cache):
             except subprocess.TimeoutExpired:process.kill();process.communicate()
 
 
-def load(project,group=None,cancelled=lambda:False,reference_cache=None):
+def load(project,group=None,cancelled=lambda:False,reference_cache=None,kind=None):
+    """`kind`: the displayed/exported result; a single take's moving ExMR camera centres follow its correction."""
     from .result_artifacts import file_stat
     project=Path(project).resolve();state=read(project/'project.json');dependencies={}
     def tracked(p):
         p=Path(p);dependencies[p]=file_stat(p);return p
     tracked(project/'project.json')
     model=state.get('pipeline',{}).get('model');group=Path(group).resolve() if group else None
+    # A shared scene camera must not follow one person's correction.
+    kind=kind if group is None and model=='exmr' else None
     had_scene=(project/'scene_camera.json').exists()
     camera=read_camera(project)
     if camera is None and group is None and model=='flowhmr' and not had_scene:
@@ -118,7 +123,7 @@ def load(project,group=None,cancelled=lambda:False,reference_cache=None):
         matrix[:3,3]=-matrix[:3,:3]@np.array([0.,world['camera_height'],0.])
         camera=dict(world_to_camera=validate_transform(matrix),K=world['intrinsics'])
     if camera is None and group is None and model in ('exmr','gvhmr') and not had_scene:
-        camera=paired_reference(project,cancelled,reference_cache)
+        camera=paired_reference(project,cancelled,reference_cache,kind)
         for name,stamp in camera['sources'].items():dependencies[project/name]=stamp
     if camera is None:raise ValueError('Saved camera is unavailable or stale. Use Prepare Preview.')
     if had_scene:tracked(project/'scene_camera.json')
@@ -180,14 +185,17 @@ def load(project,group=None,cancelled=lambda:False,reference_cache=None):
             if not policy['identity']['static']:
                 anchor=project if group is None else (group/read(group/'people_scene.json')['anchor']).resolve()
                 if group is not None and not anchor.is_relative_to(group):raise ValueError('Invalid camera reference take.')
-                try:path=paired_reference(anchor,cancelled,reference_cache)
+                try:path=paired_reference(anchor,cancelled,reference_cache,kind)
                 except (OSError,ValueError,RuntimeError):path=None
                 if path is not None:
                     for name,stamp in path['sources'].items():dependencies[anchor/name]=stamp
                 points=path.get('centers') if path is not None else None
                 if (points is not None and len(points)==len(r) and abs(path['start']-meta['start'])<1e-6 and path['fps']==meta['fps']):
-                    displacement=points-points[0]
-                    note='Estimated ExMR camera movement from original paired world/camera roots. Approximate, not measured motion. Gizmos only; video overlays keep the calibrated reference.'
+                    # Relative to the original frame-0 centre, so a followed correction also moves frame 0.
+                    displacement=points-np.asarray(path.get('origin') or points[0],float)
+                    note=('Estimated ExMR camera movement from original paired world/camera roots'
+                          +(', following the root change of Motion Correction' if path.get('follows') else '')
+                          +'. Approximate, not measured motion. Gizmos only; video overlays keep the calibrated reference.')
                 else:warning='Camera movement reference is unavailable or incomplete; showing rotation only.'
         m=np.tile(np.eye(4),(len(rotations),1,1));m[:,:3,:3]=rotations
         center=-base[:3,:3].T@base[:3,3];m[:,:3,3]=-np.einsum('tij,j->ti',rotations,center)

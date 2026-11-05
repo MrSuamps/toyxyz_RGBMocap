@@ -16,9 +16,9 @@ class CameraLoader(QThread):
     activity=Signal(int,str)
     def __init__(self,parent):
         super().__init__(parent);self.condition=Condition();self.generation=0;self.pending=None;self.stopping=False;self.references={};self.backgrounds={}
-    def request(self,project,group,background=False):
+    def request(self,project,group,background=False,kind=None):
         with self.condition:
-            self.generation+=1;self.pending=(self.generation,project,group,background);self.condition.notify();return self.generation
+            self.generation+=1;self.pending=(self.generation,project,group,background,kind);self.condition.notify();return self.generation
     def cancel(self):
         with self.condition:self.generation+=1;self.pending=None
     def close(self):
@@ -29,10 +29,10 @@ class CameraLoader(QThread):
             with self.condition:
                 while self.pending is None and not self.stopping:self.condition.wait()
                 if self.stopping:return
-                token,project,group,background=self.pending;self.pending=None
+                token,project,group,background,kind=self.pending;self.pending=None
             cancelled=lambda:self.stopping or token!=self.generation
             try:
-                result=load(project,group,cancelled,self.references)
+                result=load(project,group,cancelled,self.references,kind)
                 if background and result is not None and result['model'] in ('exmr','flowhmr') and not cancelled():
                     from .camera_background_worker import refined
                     self.ready.emit(token,dict(result,background_pending=True));started=time.monotonic()
@@ -140,7 +140,8 @@ class CameraTools:
         left=w.video_view.show_observations and w.project is not None and w.preview_data is not None
         wanted=(view.show_cameras or self.preview() or left) and not pear
         background=self.background_options().get(w.model_choice.currentData(),False)
-        key=(str(w.project),str(w.people_root),id(w.preview_data),bool(w.busy),pear,wanted,background)
+        kind=getattr(w,'active_result',None)
+        key=(str(w.project),str(w.people_root),id(w.preview_data),bool(w.busy),pear,wanted,background,kind)
         if key==self.key:
             self.canvas.mirror();return
         self.key=key;self.loader.cancel();self.token=self.loader.generation;self.data=None;self.scale.hide()
@@ -149,7 +150,7 @@ class CameraTools:
         if wanted:
             self.message='Camera data is paused during processing.' if w.busy else 'Loading saved cameras...'
             if w.project is None:self.message='Open a reconstructed project to show saved cameras.'
-            elif not w.busy:self.token=self.loader.request(w.project,w.people_root,background)
+            elif not w.busy:self.token=self.loader.request(w.project,w.people_root,background,kind)
             view.camera_message=self.message
         self.canvas.update();w.video_view.update();view.update()
     def loaded(self,token,data):

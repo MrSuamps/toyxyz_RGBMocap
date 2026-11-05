@@ -4,7 +4,21 @@ import json,zipfile
 import numpy as np
 
 
-def reference(project):
+def root_change(project,kind,count):
+    """(T,3) pelvis change Motion Correction made to `kind` over its source result, or None."""
+    from .motion_tools import base_result
+    roots=[]
+    for name in (kind,base_result(kind)):
+        with zipfile.ZipFile(project/(name+'_joints.npz')) as archive:
+            if archive.getinfo('joints.npy').file_size>32*1024**2:raise ValueError('Corrected joints exceed the preview memory limit.')
+        with np.load(project/(name+'_joints.npz'),allow_pickle=False) as data:roots.append(np.asarray(data['joints'][:,0],float))
+    if not len(roots[0])==len(roots[1])==count:return None
+    delta=roots[0]-roots[1]
+    return delta if np.isfinite(delta).all() else None
+
+
+def reference(project,kind=None):
+    """`kind`: a moving camera's centres follow the root change Motion Correction made to this displayed/exported result."""
     from .result_artifacts import artifacts_current,file_stat
     from .scene_camera import paired_camera,validate_transform
     project=Path(project).resolve()
@@ -14,6 +28,11 @@ def reference(project):
     if not artifacts_current(project,'initial'):raise ValueError('Original motion preview is stale. Use Prepare Preview.')
     names=['hmr4d_results.pt','initial_joints.npz','initial_mesh.json','tracking.npz']
     if (project/'initial_artifacts.json').exists():names.append('initial_artifacts.json')
+    follow=model=='exmr' and bool(kind) and kind.startswith('corrected_') and artifacts_current(project,kind)
+    if follow:
+        from .motion_tools import base_result
+        for name in (kind+'_joints.npz',kind+'_artifacts.json',base_result(kind)+'_joints.npz'):
+            if name not in names and (project/name).exists():names.append(name)
     saved=cam_root=None
     if model=='exmr':
         names.append('exmr_camera_sources.json')
@@ -43,7 +62,7 @@ def reference(project):
     if pelvis.shape!=(3,) or not np.isfinite(pelvis).all():raise ValueError('Invalid original pelvis pivot.')
     rotation=lambda params:Rotation.from_rotvec(params['global_orient'][0].numpy()).as_matrix()
     matrix=paired_camera(rotation(world),rotation(incam),world['transl'][0].numpy(),incam['transl'][0].numpy(),pelvis)
-    centers=None
+    centers=origin=follows=None
     if model=='exmr':
         align=np.asarray(saved['reference_rotation'])@np.asarray(saved['first_rotation']).T
         matrix[:3,:3]=align@matrix[:3,:3];matrix[:3,3]=align@matrix[:3,3]
@@ -59,12 +78,17 @@ def reference(project):
                 # Body/inference errors remain visible; no pose refitting occurs.
                 centers=world['transl'].numpy()+pelvis-np.einsum('tji,tj->ti',r,incam['transl'].numpy()+pelvis)
                 if not np.isfinite(centers).all():raise ValueError('Invalid estimated camera path.')
+                origin=centers[0].copy()
+                # SimpleVO observes rotation only, so the camera may follow the corrected root: the body keeps its place in view.
+                delta=root_change(project,kind,count) if follow else None
+                if delta is not None:centers=centers+delta;follows=kind
             finally:rotations._mmap.close()
     with np.load(project/'tracking.npz',allow_pickle=False) as data:k=data['K'].tolist()
     if not artifacts_current(project,'initial') or any(file_stat(project/name)!=stamp for name,stamp in sources.items()):
         raise ValueError('Original camera inputs changed while loading.')
     return dict(schema=2,world_to_camera=validate_transform(matrix).tolist(),K=k,sources=sources,
-        centers=None if centers is None else centers.tolist(),start=state['start'],fps=state['fps'])
+        centers=None if centers is None else centers.tolist(),origin=None if origin is None else origin.tolist(),follows=follows,
+        start=state['start'],fps=state['fps'])
 
 
 def main():
@@ -72,7 +96,8 @@ def main():
     from .compute_policy import configure_worker_cpu
     configure_worker_cpu('camera_reference')
     try:
-        print(json.dumps(reference(Path(sys.argv[sys.argv.index('--project')+1]))),flush=True)
+        kind=sys.argv[sys.argv.index('--kind')+1] if '--kind' in sys.argv else None
+        print(json.dumps(reference(Path(sys.argv[sys.argv.index('--project')+1]),kind)),flush=True)
         return 0
     except Exception as error:
         print('Saved original camera could not be read: '+str(error),file=sys.stderr,flush=True)

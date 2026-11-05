@@ -31,7 +31,7 @@ def run(request,emit=lambda *a,**k:None):
             inputs.track(source);scene=row.get('scene')
             if scene is not None and context(scene['root'],project)!=scene:raise ValueError('Shared scene placement changed')
             group=scene['root'] if scene is not None else None
-            cameras=load(project,group)
+            cameras=load(project,group,kind=kind)
             if row.get('background_refine',False) and row.get('animate_camera',True):
                 cameras=refined(cameras,project,lambda:False,
                     lambda done,total:emit('progress',stage='save_blend',current=done,total=total,message='Refining camera rotation'),cache)

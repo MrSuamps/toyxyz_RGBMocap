@@ -56,6 +56,7 @@ SLIDE_SPEED = 0.15             # m/s
 PENETRATION = 0.01             # m
 JITTER_FACTOR, JITTER_MIN, JITTER_LOCAL = 8.0, 20.0, 3.0   # x median, m/s^2, x local median
 DRIFT = 0.25                   # torso lengths
+BODY_OFFSET, BODY_OFFSET_SECONDS = 0.2, 1.0   # torso lengths beyond the uncorrected result's offset, for at least this long
 JITTER_GROUPS = {'torso': ((0, 3, 6, 9, 12, 15), ('Hips', 'Spine', 'Spine1', 'Spine2', 'Neck', 'Head')),
                  'left_arm': ((16, 18, 20), ('LeftShoulder', 'LeftArm', 'LeftForeArm', 'LeftHand')),
                  'right_arm': ((17, 19, 21), ('RightShoulder', 'RightArm', 'RightForeArm', 'RightHand')),
@@ -64,11 +65,13 @@ JITTER_GROUPS = {'torso': ((0, 3, 6, 9, 12, 15), ('Hips', 'Spine', 'Spine1', 'Sp
 NOT_YET = {'gvhmr': 'its 2D keypoints are COCO-17 (keypoints.npz)', 'flowhmr': 'it has no saved 2D keypoints'}
 
 DESCRIPTION = '''Compare a motion with the source video's 2D keypoints and flag fixable problems: missed hand contacts,
-limb pose errors, foot sliding, floor penetration, jitter and placement drift, plus anatomy (locked or hyperextended
-elbows/knees, sudden folds, wrist limits, joint twist, finger pose, hand orientation vs the video). Writes report.json
-(with a ready `fix` spec), summary.md and overlay images (green: 2D keypoints, magenta: 3D motion projected per frame).'''
+limb pose errors, foot sliding, floor penetration, jitter, placement drift and a body moved off the person by correction,
+plus anatomy (locked or hyperextended elbows/knees, sudden folds, wrist limits, joint twist, finger pose, hand orientation
+vs the video). Writes report.json (with a ready `fix` spec), summary.md and overlay images (green: 2D keypoints, magenta:
+3D motion projected).'''
 EPILOG = '''frames: report and --frames use video frame numbers (0-based); fix suggestions use Blender numbering
-(video frame + 1), as the `fix` command expects. Supports ExMR projects.'''
+(video frame + 1), as the `fix` command expects. Supports ExMR projects. Projection: a static camera is one fixed camera
+(the GUI camera view); a moving camera is per frame and follows the root change correction made.'''
 
 
 def register(commands, common):
@@ -100,6 +103,25 @@ class Observation:
     K: object
     video: Path
     fps: float
+    camera: str = 'per-frame'   # 'fixed' (static camera), 'moving' or 'per-frame' (no camera policy saved)
+    follows: str = None         # moving camera: the corrected result whose root change the camera centres follow
+    paired: object = None       # (F, 3) moving camera: translations paired with the original root
+
+    def follow(self, project, kind):
+        """This take seen through the camera of `kind`; a moving camera moves with the root change correction made (as the GUI export)."""
+        import dataclasses
+        import numpy as np
+        if self.camera != 'moving' or kind == self.follows:
+            return self
+        delta = correction_root_delta(project, kind, len(self.paired)) if kind else None
+        if delta is None:
+            return dataclasses.replace(self, translation=self.paired, follows=None)
+        return dataclasses.replace(self, translation=self.paired - np.einsum('fij,fj->fi', self.rotation, delta), follows=kind)
+
+    def describe(self):
+        return dict(fixed='one fixed camera (static camera, as the GUI camera view)',
+                    moving='per-frame camera' + (f' following the root change of {self.follows}' if self.follows else ' paired with the original root'),
+                    ).get(self.camera, 'per-frame camera paired with the original root')
 
 
 @dataclass
@@ -114,7 +136,8 @@ def exmr_inputs(project):
     return [project / name for name in ('exmr_keypoints.pt', 'hmr4d_results.pt', 'initial_joints.npz', 'tracking.npz')]
 
 
-def load_exmr(project):
+def load_exmr(project, kind=None):
+    """Keypoints and cameras; a moving camera follows the root change correction made to `kind` (see Observation.follow)."""
     import numpy as np
     import torch
     from scipy.spatial.transform import Rotation
@@ -142,7 +165,55 @@ def load_exmr(project):
         from ..project_storage import source_video
         video = Path(source_video(project))
     fps = float(read_json(project / 'project.json').get('fps', 30))
+    policy = exmr_camera_policy(project, rotation[0], translation[0])
+    if policy == 'moving':
+        return Observation(keypoints, rotation, translation, K, video, fps, 'moving', None, translation).follow(project, kind)
+    if policy is not None:
+        fixed_rotation, fixed_translation = policy
+        rotation = np.broadcast_to(fixed_rotation, rotation.shape).copy()
+        translation = np.broadcast_to(fixed_translation, translation.shape).copy()
+        return Observation(keypoints, rotation, translation, K, video, fps, 'fixed')
     return Observation(keypoints, rotation, translation, K, video, fps)
+
+
+def exmr_camera_policy(project, rotation0, translation0):
+    """'moving', the static camera (R, t) the GUI camera view projects with, or None without a saved camera policy.
+
+    As camera_tracks.load: the take's frame-0 pairing turned into the scene camera frame, at a fixed centre, with the ExMR
+    camera rotation (constant for a static camera)."""
+    import numpy as np
+    try:
+        sources = read_json(project / 'exmr_camera_sources.json')
+        root = (project / sources['root']).resolve()
+        if not read_json(root / 'exmr_camera.json')['identity']['static']:
+            return 'moving'
+        r = np.asarray(np.load(root / 'exmr_camera.npy', allow_pickle=False)[int(sources['first'])], np.float64)
+        reference = np.asarray(sources['reference_rotation'], np.float64)
+        align = reference @ np.asarray(sources['first_rotation'], np.float64).T
+    except (OSError, ValueError, KeyError, IndexError, TypeError):
+        return None
+    base_rotation, base_translation = align @ rotation0, align @ translation0
+    centre = -base_rotation.T @ base_translation
+    rotation = r @ reference.T @ base_rotation
+    return rotation, -rotation @ centre
+
+
+def correction_root_delta(project, kind, count):
+    """(F, 3) pelvis change `correct` made to `kind` over its source result, or None for an uncorrected / mismatched result."""
+    import numpy as np
+    from ..motion_tools import base_result
+    if not kind.startswith('corrected_'):
+        return None
+    roots = []
+    for name in (kind, base_result(kind)):
+        path = project / f'{name}_joints.npz'
+        if not path.is_file():
+            return None
+        with np.load(path, allow_pickle=False) as data:
+            roots.append(np.asarray(data['joints'][:, 0], np.float64))
+    if not len(roots[0]) == len(roots[1]) == count:
+        return None
+    return roots[0] - roots[1]
 
 
 SOURCES = {'exmr': (exmr_inputs, load_exmr)}
@@ -267,6 +338,7 @@ class Context:
         from scipy.ndimage import median_filter
         self.frames = np.arange(first, last + 1)
         self.fps = obs.fps
+        self.obs = obs if isinstance(obs, Observation) else None
         local = self.frames - motion.first
         self.raw_keypoints = obs.keypoints[self.frames].copy()
         self.joints = motion.joints[local]
@@ -280,18 +352,7 @@ class Context:
             if ref_local.min() >= 0 and ref_local.max() < len(reference.joints):
                 anchor = self.project(reference.joints[ref_local])
         kp = self.raw_keypoints
-        n = len(self.frames)
-        # Global 2D offset per frame: weighted median of confident torso keypoint - projection, so root shifts do not dominate pose error.
-        offset = np.full((n, 2), np.nan)
-        for f in range(n):
-            rows = [(POSE[p][1], POSE[p][2], w) for p, w in ALIGN.items() if kp[f, POSE[p][1], 2] >= VISIBLE]
-            rows = [(c, s, w) for c, s, w in rows if np.isfinite(anchor[f, s]).all()]
-            if rows:
-                delta = np.array([kp[f, c, :2] - anchor[f, s] for c, s, _ in rows])
-                weights = np.array([w for _, _, w in rows])
-                offset[f] = [weighted_median(delta[:, 0], weights), weighted_median(delta[:, 1], weights)]
-        self.aligned = np.isfinite(offset[:, 0])
-        self.offset = np.stack([fill(offset[:, 0]), fill(offset[:, 1])], 1) if self.aligned.any() else np.zeros((n, 2))
+        self.offset, self.aligned = self.placement_offset(anchor)
         ok = (kp[:, [5, 6, 11, 12], 2] >= VISIBLE).all(1)
         torso = np.where(ok, np.linalg.norm((kp[:, 5, :2] + kp[:, 6, :2]) / 2 - (kp[:, 11, :2] + kp[:, 12, :2]) / 2, axis=1), np.nan)
         if np.isfinite(torso).any():
@@ -301,6 +362,23 @@ class Context:
         self.torso = np.maximum(fill(torso), 1.0)
         self.keypoints, self.swaps = self.unswap(kp)
         self.err, self.raw = self.pose_errors(self.keypoints)
+
+    def placement_offset(self, uv):
+        """((N, 2) px, (N,) aligned) global 2D offset of projected joints `uv`: weighted median of confident torso keypoint - projection,
+        so root shifts do not dominate pose error."""
+        import numpy as np
+        kp = self.raw_keypoints
+        n = len(self.frames)
+        offset = np.full((n, 2), np.nan)
+        for f in range(n):
+            rows = [(POSE[p][1], POSE[p][2], w) for p, w in ALIGN.items() if kp[f, POSE[p][1], 2] >= VISIBLE]
+            rows = [(c, s, w) for c, s, w in rows if np.isfinite(uv[f, s]).all()]
+            if rows:
+                delta = np.array([kp[f, c, :2] - uv[f, s] for c, s, _ in rows])
+                weights = np.array([w for _, _, w in rows])
+                offset[f] = [weighted_median(delta[:, 0], weights), weighted_median(delta[:, 1], weights)]
+        aligned = np.isfinite(offset[:, 0])
+        return (np.stack([fill(offset[:, 0]), fill(offset[:, 1])], 1) if aligned.any() else np.zeros((n, 2))), aligned
 
     def project(self, points):
         return project_points(points, self.rotation, self.translation, self.K)
@@ -681,6 +759,51 @@ def check_drift(ctx):
     return issues
 
 
+def check_body_offset(ctx, project, kind):
+    """The corrected body sits farther off the video person than its uncorrected source, each seen through its own camera."""
+    import numpy as np
+    from ..motion_tools import base_result
+    source = base_result(kind)
+    if source == kind or ctx.obs is None or not (project / f'{source}_joints.npz').is_file():
+        return []
+    joints = load_project_motion(project, source).joints
+    if len(joints) <= ctx.frames[-1]:
+        return []
+    obs = ctx.obs.follow(project, source)
+    uv = project_points(joints[ctx.frames], obs.rotation[ctx.frames], obs.translation[ctx.frames], obs.K)
+    before_px = ctx.placement_offset(uv)[0]
+    before = np.linalg.norm(before_px, axis=1) / ctx.torso
+    after = np.linalg.norm(ctx.offset, axis=1) / ctx.torso
+    excess = after - before
+    flag = excess > BODY_OFFSET
+    try:
+        report = read_json(project / f'{kind}_correction.json')
+    except (OSError, ValueError):
+        report = {}
+    issues = []
+    for a, b in runs(flag, GAP, max(int(round(BODY_OFFSET_SECONDS * ctx.fps)), 1)):
+        span = slice(a, b + 1)
+        worst = a + int(np.argmax(excess[span]))
+        median = float(np.median(excess[span][flag[span]]))
+        # Image y points down: the person moving up relative to the projection means the body dropped below them.
+        dx, dy = np.median((ctx.offset - before_px)[span], axis=0)
+        direction = 'sideways' if abs(dx) > abs(dy) else 'below' if dy < 0 else 'above'
+        issues.append(dict(
+            check='body_offset', severity=grade(median, 0.4, 0.3), score=median * int(flag[span].sum()), **interval(ctx, a, b),
+            worst_frame=ctx.video(worst), joints=['pelvis'],
+            metrics=dict(frames_flagged=int(flag[span].sum()), excess_torso_median=median, excess_torso_peak=float(excess[worst]),
+                         offset_torso_median=float(np.median(after[span])), source_offset_torso_median=float(np.median(before[span])),
+                         peak_px=float(excess[worst] * ctx.torso[worst]), direction=direction, source=source, camera=ctx.obs.describe(),
+                         **{key: report[key] for key in ('mode', 'max_root_y_offset_m', 'max_root_xz_offset_m', 'warning') if key in report}),
+            message=f'correction moved the body {median:.2f} torso farther off the video person than {source} '
+                    f'({np.median(after[span]):.2f} vs {np.median(before[span]):.2f}), mostly {direction}',
+            fix=None, hint=('the camera does not follow the correction (moving camera); compare in the GUI or try `correct --floor-mode multi_level`'
+                            if ctx.obs.camera == 'moving' else 'the flat floor removed a source height drift or tilt (see the correction warning); '
+                            'check in the GUI camera view, try `correct --floor-mode multi_level` or a manual `--floor`'),
+            _draw=dict(unaligned=True, series={'offset torso': after, f'{source} offset torso': before})))
+    return issues
+
+
 class Floor(float):
     def __new__(cls, value, source):
         item = super().__new__(cls, value)
@@ -704,7 +827,7 @@ def collect_issues(ctx, project, kind, pose=None):
     floor = floor_level(ctx, project, kind)
     contacts, contacts_source = contact_mask(ctx, project, kind, floor)
     issues = (check_missed_contacts(ctx) + check_pose(ctx) + check_foot_slide(ctx, contacts) + check_penetration(ctx, contacts, floor) +
-              check_jitter(ctx) + check_drift(ctx))
+              check_jitter(ctx) + check_drift(ctx) + check_body_offset(ctx, project, kind))
     if pose is not None:
         from . import anatomy
         issues += anatomy.checks(ctx, pose)
@@ -804,8 +927,8 @@ def rank(issues):
     from .foot_orientation import PREFIX as FOOT_PREFIX
     issues.sort(key=lambda item: (SEVERITY[item['severity']], -item['score']))
     counters = {}
-    prefix = dict(missed_contact='MC', pose_error='PE', foot_slide='FS', floor_penetration='FP', jitter='JT', placement_drift='PD', **PREFIX,
-                  **FOOT_PREFIX)
+    prefix = dict(missed_contact='MC', pose_error='PE', foot_slide='FS', floor_penetration='FP', jitter='JT', placement_drift='PD', body_offset='BO',
+                  **PREFIX, **FOOT_PREFIX)
     for issue in issues:
         code = prefix[issue['check']]
         counters[code] = counters.get(code, 0) + 1
@@ -984,6 +1107,7 @@ def summary_markdown(report):
              f"{report['stats']['frames_evaluated']} evaluated; floor y = {report['floor']['y']:.3f} m ({report['floor']['source']}); "
              f"contacts: {report['contacts_source']}",
              f"- Errors are in torso lengths (median torso {report['stats']['torso_px_median']:.0f} px), after removing the per-frame 2D offset.",
+             f"- Projection: {report['camera']}.",
              '']
     issues = report['issues']
     counts = {level: sum(issue['severity'] == level for issue in issues) for level in SEVERITY}
@@ -1088,7 +1212,7 @@ def cmd_review(args, session):
         return 0, summary
     import numpy as np
     session.info(f'Loading {model} keypoints and cameras ...')
-    obs = loader(project)
+    obs = loader(project, kind)
     blender_seconds = None
     if fbx:
         clock = time.monotonic()
@@ -1140,12 +1264,13 @@ def cmd_review(args, session):
         version=1, command='review', project=str(project), model=model, result=kind,
         motion=dict(label=motion.label, source=motion.source, kind='fbx' if fbx else 'project', first_video_frame=motion.first,
                     frames=len(motion.joints)),
-        video=str(obs.video), fps=obs.fps, frames=[first, last], blender_frames=[first + FRAME_BASE, last + FRAME_BASE],
+        video=str(obs.video), fps=obs.fps, camera=obs.describe(), frames=[first, last], blender_frames=[first + FRAME_BASE, last + FRAME_BASE],
         frame_numbering='frames = video frames (0-based); blender_frames and fix frames = video frame + 1',
         floor=dict(y=float(floor), source=floor.source), contacts_source=contacts_source,
         thresholds=dict(visible_score=VISIBLE, pose_torso=POSE_THRESHOLD, contact_2d_torso=CONTACT_2D, contact_3d_m=CONTACT_3D,
                         slide_mps=SLIDE_SPEED, penetration_m=PENETRATION, jitter=dict(factor=JITTER_FACTOR, min_mps2=JITTER_MIN,
-                        local_factor=JITTER_LOCAL), drift_torso=DRIFT, merge_gap=GAP, min_frames=MIN_RUN),
+                        local_factor=JITTER_LOCAL), drift_torso=DRIFT, body_offset=dict(torso=BODY_OFFSET, seconds=BODY_OFFSET_SECONDS),
+                        merge_gap=GAP, min_frames=MIN_RUN),
         issues=[{key: value for key, value in issue.items() if not key.startswith('_')} for issue in issues],
         keypoint_swaps=swap_report(ctx), stats=stats, suggested_fixes=spec, suggested_fixes_status=status,
         fix_input=str(fbx) if fbx else '<exported FBX of this result>', images=written, contact_sheet=sheet, per_frame=per_frame,

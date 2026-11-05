@@ -486,6 +486,9 @@ def correct_arrays(rest, root, quat, probes, probabilities, fps=30., floor=None,
         report['terrain_collision_evaluated']=False
         report['warning']=' '.join(filter(None,(report['warning'],
             'Multi Level estimates contacts from motion. Terrain and object collisions are not solved.')))
+    span=float(np.ptp(target_shift[:,1]))
+    if span>.15:report['warning']=' '.join(filter(None,(report['warning'],
+        'The grounding shift spans %.2f m: the source floor drifts or tilts. Check the body in the camera view or use Multi Level.' % span)))
     report.update(temporal_report)
     plans = ([temporal_report['contact_chain_plan']] if 'contact_chain_plan' in temporal_report else
              [tile['report']['contact_chain_plan'] for tile in

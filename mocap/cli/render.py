@@ -1,6 +1,7 @@
 """`render` command: PNG / MP4 of the model's own SMPL-X mesh (the GUI Mesh view geometry), original vs corrected.
 
-Views: `camera` (composited over the video frame with the project's per-frame camera, as `review` projects joints),
+Views: `camera` (composited over the video frame with the camera `review` projects joints with: one fixed camera for a static
+camera, per frame following each layer's correction for a moving one),
 `front` / `side` (virtual cameras from the body's heading) and `orbit` (close views around each self-contact).
 A small numpy z-buffer rasteriser draws the mesh, so it runs headless without a GPU. numpy/torch/cv2 load lazily.
 """
@@ -354,8 +355,14 @@ class Movie:
 
 # Views --------------------------------------------------------------------------------------------------------------
 
+def layer_cameras(obs, project, layers, kind):
+    """The review Observation per layer: a moving camera follows each layer's own corrected root (extra layers use `kind`'s)."""
+    return [obs.follow(project, layer.kind or kind) for layer in layers]
+
+
 class Renderer:
     def __init__(self, body, layers, frames, tracks, obs, size, focus):
+        """`obs`: one review Observation per layer (camera view only)."""
         import numpy as np
         self.body, self.layers, self.frames, self.tracks, self.obs = body, layers, frames, tracks, obs
         self.faces = body.faces
@@ -390,11 +397,11 @@ class Renderer:
         scale = self.size / max(video.shape[:2])
         width, height = int(round(video.shape[1] * scale)), int(round(video.shape[0] * scale))
         background = cv2.resize(video, (width, height), interpolation=cv2.INTER_AREA)
-        K = np.asarray(self.obs.K, np.float64).copy()
-        K[:2] *= scale
-        camera = Camera(self.obs.rotation[frame], self.obs.translation[frame], K, width, height)
         panels = []
-        for layer in self.layers:
+        for layer, obs in zip(self.layers, self.obs):
+            K = np.asarray(obs.K, np.float64).copy()
+            K[:2] *= scale
+            camera = Camera(obs.rotation[frame], obs.translation[frame], K, width, height)
             vertices, normals = self.mesh(layer, frame)
             image, _ = draw_body(camera, vertices, self.faces, normals, COLORS[layer.role], background, ALPHA)
             mark_contacts(image, camera, self.info(layer, frame), frame, self.tracks)
@@ -529,12 +536,14 @@ def cmd_render(args, session):
             note = ' '.join(filter(None, (note, 'no self-contact tracks: the orbit centres on the hips (use --focus)')))
     if 'orbit' not in views:
         focus = []
-    obs = videos = None
+    obs = videos = camera_note = None
     if 'camera' in views:
         from .review import load_exmr, read_frames
         session.info('Loading cameras and video frames ...')
-        obs = load_exmr(project)
+        obs = load_exmr(project, kind)
         videos = read_frames(obs.video, set(wanted))
+        camera_note = obs.describe()
+        obs = layer_cameras(obs, project, layers, kind)
     checks = {}
     for layer in layers:
         if layer.kind is None:
@@ -576,7 +585,7 @@ def cmd_render(args, session):
     videos_written = [movie.close() for movie in movies.values()]
     seconds = round(time.monotonic() - clock, 2)
     report = dict(version=1, command='render', project=str(project), model=model, result=kind, frames=[frames[0], frames[1]], step=args.step,
-                  views=views, layers=[dict(label=l.label, role=l.role, kind=l.kind) for l in layers],
+                  views=views, camera=camera_note, layers=[dict(label=l.label, role=l.role, kind=l.kind) for l in layers],
                   geometry='SMPL-X neutral LBS with shape and pose correctives (GUI Mesh view); not the bound display skin',
                   gui_mesh_max_error_m=checks, tracks=[dict(id=t.get('id'), effector=t['effector'], target=t['target'], ranges=t['ranges'])
                                                        for t in tracks], orbit_focus=[dict(id=i, ends=list(e)) for i, e in focus],
@@ -660,10 +669,13 @@ def sheet_columns(layers):
     return ['Video'] + [layer.label for layer in layers] + [f'{layer.label} - 3D' for layer in layers]
 
 
-def contact_sheet_image(body, layers, track, frames, obs, videos, tile):
-    """Rows = frames; columns = video crop, every layer over the crop, every layer in a close 3D view; numbers per tile."""
+def contact_sheet_image(body, layers, track, frames, cameras, videos, tile):
+    """Rows = frames; columns = video crop, every layer over the crop, every layer in a close 3D view; numbers per tile.
+
+    `cameras`: one review Observation per layer; the crop follows the result (last) layer."""
     import cv2
     import numpy as np
+    obs = cameras[-1]
     from ..self_contact import Segments, arm_groups, parse_target, segment_names, segment_vertices
     _, side, part = parse_target(track['target'])
     h = 0 if track['effector'] == 'LeftHand' else 1
@@ -689,7 +701,6 @@ def contact_sheet_image(body, layers, track, frames, obs, videos, tile):
         side_px = max(float(np.ptp(uv, 0).max()) * 1.6, 0.9 * torso, 160.0) if len(uv) else 400.0
         centre = uv.mean(0) if len(uv) else np.array(videos[frame].shape[1::-1]) / 2
         box = (centre[0] - side_px / 2, centre[1] - side_px / 2, side_px)
-        camera = crop_camera(obs, frame, box, tile)
         kp = obs.keypoints[frame]
         video = crop_video(videos[frame], box, tile)
         point = lambda xy: tuple(int(round(v)) for v in (np.asarray(xy) - box[:2]) * tile / side_px)
@@ -706,6 +717,7 @@ def contact_sheet_image(body, layers, track, frames, obs, videos, tile):
         eye = centre3 - rotate_y(forward, SHEET_SIDE_DEG) * SHEET_DISTANCE + np.array([0.0, 0.2, 0.0])
         close = look_at(eye, centre3, tile, tile, 40.0)
         for k, layer in enumerate(layers):
+            camera = crop_camera(cameras[k], frame, box, tile)
             vertices = body.vertices(layer.state, frame)
             normals = vertex_normals(vertices, body.faces)
             color = SHEET_COLORS[k % len(SHEET_COLORS)]
@@ -776,7 +788,7 @@ def cmd_sheet(args, session, project, model, kind, started):
         raise CliError('No enabled self-contact tracks to make a sheet for.', EXIT_USAGE)
     grip = {t.get('grip', 'off') for t in tracks}
     layers.append(Layer('After' + (f' (grip {grip.pop()})' if len(grip) == 1 else ''), 'result', body.pose(load_params(project / filename, key)), kind))
-    obs = load_exmr(project)
+    obs = layer_cameras(load_exmr(project, kind), project, layers, kind)
     plans = [(track, sheet_frames(args.frames, track['ranges'], count, track.get('automatic', ()))) for track in tracks]
     skipped = [track.get('id') or f"{track['effector']}-{track['target']}" for track, frames in plans if frames is None]
     plans = [(track, frames) for track, frames in plans if frames is not None]
@@ -785,7 +797,7 @@ def cmd_sheet(args, session, project, model, kind, started):
         session.info('Note: ' + note)
     if not plans:
         raise CliError('No self-contact frame ranges to make a sheet for; pass --frames A-B.', EXIT_USAGE)
-    videos = read_frames(obs.video, {f for _, frames in plans for f in frames})
+    videos = read_frames(obs[0].video, {f for _, frames in plans for f in frames})
     out.mkdir(parents=True, exist_ok=True)
     written = []
     for track, frames in plans:
@@ -798,7 +810,7 @@ def cmd_sheet(args, session, project, model, kind, started):
         written.append(str(path))
         session.info(f'  {path.name}')
     report = dict(version=1, command='render', sheet=True, project=str(project), result=kind, layers=[l.label for l in layers],
-                  frames={t.get('id'): f for t, f in plans}, images=written, note=note or None,
+                  frames={t.get('id'): f for t, f in plans}, images=written, note=note or None, camera=obs[-1].describe(),
                   geometry='SMPL-X neutral LBS with shape and pose correctives (GUI Mesh view)', seconds=round(time.monotonic() - started, 2))
     (out / 'sheet.json').write_text(json.dumps(report, indent=1), encoding='utf-8')
     session.say(f'Sheet: {len(written)} image(s) in {out}')

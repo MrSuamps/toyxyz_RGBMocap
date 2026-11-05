@@ -268,8 +268,10 @@ def review_against(obs, project, kind, against, first, last, issues_after, pose_
     project = Path(project)
     result, after, before, ref_kind = compare_params(project, kind, against)
     motion, pose_ref = reference_motion(project, before, result['reference'], pose_after is not None, kind)
-    ctx = review.Context(obs, motion, first, last)
     floor_kind = ref_kind or kind
+    if hasattr(obs, 'follow'):
+        obs = obs.follow(project, floor_kind)
+    ctx = review.Context(obs, motion, first, last)
     if hasattr(review, 'collect_issues'):
         issues_before = review.collect_issues(ctx, project, floor_kind, pose_ref)[0]
     else:

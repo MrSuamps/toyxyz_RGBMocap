@@ -610,7 +610,7 @@ def review_issues(store, kind, session):
     if not (store.project / f'{kind}_joints.npz').is_file():
         raise CliError(f'The {kind} motion has no {kind}_joints.npz; run `reconstruct` or `correct` first.')
     session.info(f'Reviewing {kind} for missed hand contacts ...')
-    obs = loader(store.project)
+    obs = loader(store.project, kind)
     motion = review.load_project_motion(store.project, kind)
     if len(motion.joints) != store.frames:
         raise CliError(f'{kind} has {len(motion.joints)} frames but the corrected result has {store.frames}; run `correct` first.')

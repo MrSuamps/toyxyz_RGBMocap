@@ -38,9 +38,10 @@ COMPATIBLE_CODE = {
     # Self-contact, foot articulation, placement and smoothing passes run only when a project has those rows; without them the
     # corrected tensors are byte-identical.
     'correction.py': {
-        '7b25e1eb57ed810bdf995a918d7b7633e7e558c25f982ba273f7d64783105ec3': '013d4078998fa572c66eb8f648bed4d9a56d3da35e1b598d5d823af6229af0bc',
-        '12f1b1bde44627ecd0df187a28454c9db05f80693f679aa0de9932e4c353c469': '013d4078998fa572c66eb8f648bed4d9a56d3da35e1b598d5d823af6229af0bc',
-        '3819776b36321c8b8b7a6bd382d9fdf62f6364e15e1d55ec46010df3bb42e024': '013d4078998fa572c66eb8f648bed4d9a56d3da35e1b598d5d823af6229af0bc',
+        '7b25e1eb57ed810bdf995a918d7b7633e7e558c25f982ba273f7d64783105ec3': '5a4ebe5d6b5c5bc808374ccc58508248b25b4f97af9f5fb25ee957b76e3e8c1b',
+        '12f1b1bde44627ecd0df187a28454c9db05f80693f679aa0de9932e4c353c469': '5a4ebe5d6b5c5bc808374ccc58508248b25b4f97af9f5fb25ee957b76e3e8c1b',
+        '3819776b36321c8b8b7a6bd382d9fdf62f6364e15e1d55ec46010df3bb42e024': '5a4ebe5d6b5c5bc808374ccc58508248b25b4f97af9f5fb25ee957b76e3e8c1b',
+        '013d4078998fa572c66eb8f648bed4d9a56d3da35e1b598d5d823af6229af0bc': '5a4ebe5d6b5c5bc808374ccc58508248b25b4f97af9f5fb25ee957b76e3e8c1b',
     },
 }
 

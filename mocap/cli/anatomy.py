@@ -49,7 +49,7 @@ PENETRATION_HIGH_M = 0.025
 CONTACT_GAP_M = 0.015
 CONTACT_GAP_HIGH_M = 0.04
 SEGMENT_JOINT = dict(hand=(20, 21), forearm=(18, 19), upperarm=(16, 17), thigh=(1, 2), shin=(4, 5), foot=(7, 8))
-REVIEW_PREFIX = dict(missed_contact='MC', pose_error='PE', foot_slide='FS', floor_penetration='FP', jitter='JT', placement_drift='PD')
+REVIEW_PREFIX = dict(missed_contact='MC', pose_error='PE', foot_slide='FS', floor_penetration='FP', jitter='JT', placement_drift='PD', body_offset='BO')
 SEVERITY = {'high': 0, 'medium': 1, 'low': 2, 'info': 3}
 
 
