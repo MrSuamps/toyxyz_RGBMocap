@@ -1,7 +1,7 @@
-"""`render` command: PNG / MP4 of the model's own SMPL-X mesh (the GUI Mesh view geometry), original vs corrected.
+"""`render` command: PNG / MP4 of the model's own mesh (the GUI Mesh view geometry: SMPL-X, or SMPL-H for FlowHMR), original vs corrected.
 
-Views: `camera` (composited over the video frame with the camera `review` projects joints with: one fixed camera for a static
-camera, per frame following each layer's correction for a moving one),
+Views: `camera` (composited over the video frame; ExMR with the camera `review` projects joints with: one fixed camera for a static
+camera, per frame following each layer's correction for a moving one; FlowHMR / GVHMR with the GUI camera view's saved camera),
 `front` / `side` (virtual cameras from the body's heading) and `orbit` (close views around each self-contact).
 A small numpy z-buffer rasteriser draws the mesh, so it runs headless without a GPU. numpy/torch/cv2 load lazily.
 """
@@ -32,12 +32,13 @@ COLORS = {'reference': (205, 185, 165), 'result': (120, 175, 235)}
 BACKGROUND = (38, 38, 42)
 HAND_JOINTS = {'LeftHand': (20, 28), 'RightHand': (21, 43)}   # wrist, middle knuckle 1 (SMPL-X 55-joint index)
 
-DESCRIPTION = '''Render the motion on the model's own SMPL-X mesh (identical to the GUI Mesh view, including pose
-correctives) as PNG images and optionally MP4: over the video with the project's camera, from the front and side, and
-in a close orbit around each self-contact. --compare puts the reference layer (original or pre-self-contact) beside the
-result.'''
+DESCRIPTION = '''Render the motion on the model's own mesh (identical to the GUI Mesh view: SMPL-X with pose correctives,
+or FlowHMR's native SMPL-H) as PNG images and optionally MP4: over the video with the project's camera, from the front and
+side, and in a close orbit around each self-contact. --compare puts the reference layer (original or pre-self-contact)
+beside the result.'''
 EPILOG = '''frames are video / result frames (0-based, inclusive), the numbers `review` reports. Without --frames the
-self-contact intervals (plus 10 frames) are rendered. The camera view needs an ExMR project (its saved cameras).'''
+self-contact intervals (plus 10 frames) are rendered. ExMR, FlowHMR and GVHMR projects are supported; --sheet draws the
+video hand direction only for ExMR (the other models save no hand keypoints).'''
 
 
 def register(commands, common):
@@ -360,6 +361,72 @@ def layer_cameras(obs, project, layers, kind):
     return [obs.follow(project, layer.kind or kind) for layer in layers]
 
 
+@dataclass
+class SavedCamera:
+    """A FlowHMR / GVHMR take's camera as the GUI camera view projects with (`camera_tracks.load`), shaped like review's Observation."""
+    rotation: object        # (F, 3, 3) world -> camera, OpenCV axes
+    translation: object     # (F, 3)
+    K: object               # (3, 3) pixels of `video`
+    video: Path
+    note: str
+    keypoints: object = None   # no COCO-63 keypoints: the sheet leaves out the video hand direction
+
+    def follow(self, project, kind):
+        return self
+
+    def describe(self):
+        return self.note
+
+
+def video_size(path):
+    import cv2
+    capture = cv2.VideoCapture(str(path))
+    try:
+        return int(capture.get(cv2.CAP_PROP_FRAME_WIDTH)), int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    finally:
+        capture.release()
+
+
+def saved_camera(project, model, count):
+    """SavedCamera of a FlowHMR / GVHMR take: the GUI's own camera track, read without inference or refitting to the body."""
+    import numpy as np
+    from .. import camera_tracks
+    project = Path(project).resolve()
+    cache = {}
+    try:
+        if model == 'gvhmr':
+            # The GUI reads this paired camera in a worker process; the CLI already runs in the shared runtime, so read it here.
+            from ..camera_reference import reference
+            cache[str(project)] = reference(project)
+        camera = camera_tracks.load(project, reference_cache=cache)['cameras'][0]
+    except (OSError, ValueError, KeyError, RuntimeError, MemoryError) as error:
+        raise CliError(f'The camera view needs the saved {model} camera, which could not be read: {error}') from None
+    matrices = camera['matrices']
+    if len(matrices) not in (1, count):
+        raise CliError(f'The saved {model} camera covers {len(matrices)} frames; the result has {count}.')
+    matrices = np.broadcast_to(matrices, (count, 4, 4))
+    video = project / 'input.mp4'
+    if not video.is_file():
+        from ..project_storage import source_video
+        video = Path(source_video(project))
+    K = np.asarray(camera['K'], np.float64).copy()
+    width, height = video_size(video)
+    if width and height and (width, height) != tuple(camera['size']):
+        K[0] *= width / camera['size'][0]
+        K[1] *= height / camera['size'][1]
+    fixed = len(camera['matrices']) == 1 or np.allclose(matrices, matrices[:1])
+    note = f'{model} saved camera (the GUI camera view): ' + ('one fixed camera' if fixed else 'per-frame rotation about a fixed centre')
+    return SavedCamera(np.array(matrices[:, :3, :3]), np.array(matrices[:, :3, 3]), K, video, note)
+
+
+def load_cameras(project, model, kind, count):
+    """The camera of the camera view and sheet: ExMR's review Observation, else the SavedCamera."""
+    if model == 'exmr':
+        from .review import load_exmr
+        return load_exmr(project, kind)
+    return saved_camera(project, model, count)
+
+
 class Renderer:
     def __init__(self, body, layers, frames, tracks, obs, size, focus):
         """`obs`: one review Observation per layer (camera view only)."""
@@ -451,6 +518,25 @@ class Renderer:
 
 # Command ------------------------------------------------------------------------------------------------------------
 
+def body_name(body):
+    return 'SMPL-H' if getattr(body, 'representation', 'smplx') == 'smplh' else 'SMPL-X'
+
+
+def geometry(body):
+    if body_name(body) == 'SMPL-H':
+        return 'SMPL-H neutral LBS with shape blend shapes, no pose correctives (FlowHMR SMPLMesh, the GUI Mesh view surface)'
+    return 'SMPL-X neutral LBS with shape and pose correctives (GUI Mesh view)'
+
+
+def load_body(session, project, model, extra=''):
+    from .smplx_body import body_for
+    session.info(f"Loading the {'SMPL-H' if model == 'flowhmr' else 'SMPL-X'} body{extra} ...")
+    try:
+        return body_for(project, model)
+    except FileNotFoundError as error:
+        raise CliError(str(error), 3) from None
+
+
 def load_layers(project, kind, compare, body):
     from ..motion_tools import RESULTS
     from .smplx_body import load_params
@@ -488,8 +574,6 @@ def cmd_render(args, session):
         raise CliError(f'--views: unknown {", ".join(unknown) or "(empty)"}; choose from {", ".join(VIEWS)}', EXIT_USAGE)
     if args.step < 1 or args.size < 64:
         raise CliError('--step must be >= 1 and --size >= 64', EXIT_USAGE)
-    if 'camera' in views and model != 'exmr':
-        raise CliError(f'The camera view needs the ExMR saved cameras; {model} is not supported yet. Use --views front,side,orbit.')
     state = read_json(project / 'project.json')
     fps = float(state.get('fps', 30))
     out = Path(args.out).expanduser().resolve() if args.out else project / 'render' / f'{kind}-{time.strftime("%Y%m%d-%H%M%S")}'
@@ -501,9 +585,8 @@ def cmd_render(args, session):
         return 0, summary
     import cv2
     import numpy as np
-    from .smplx_body import Body, gui_vertices, model_path
-    session.info('Loading the SMPL-X body ...')
-    body = Body(model_path(project))
+    from .smplx_body import gui_vertices
+    body = load_body(session, project, model)
     layers, compare_note = load_layers(project, kind, args.compare, body)
     if compare_note:
         session.info('Note: ' + compare_note)
@@ -538,9 +621,9 @@ def cmd_render(args, session):
         focus = []
     obs = videos = camera_note = None
     if 'camera' in views:
-        from .review import load_exmr, read_frames
+        from .review import read_frames
         session.info('Loading cameras and video frames ...')
-        obs = load_exmr(project, kind)
+        obs = load_cameras(project, model, kind, count)
         videos = read_frames(obs.video, set(wanted))
         camera_note = obs.describe()
         obs = layer_cameras(obs, project, layers, kind)
@@ -586,7 +669,7 @@ def cmd_render(args, session):
     seconds = round(time.monotonic() - clock, 2)
     report = dict(version=1, command='render', project=str(project), model=model, result=kind, frames=[frames[0], frames[1]], step=args.step,
                   views=views, camera=camera_note, layers=[dict(label=l.label, role=l.role, kind=l.kind) for l in layers],
-                  geometry='SMPL-X neutral LBS with shape and pose correctives (GUI Mesh view); not the bound display skin',
+                  geometry=geometry(body) + '; not the bound display skin',
                   gui_mesh_max_error_m=checks, tracks=[dict(id=t.get('id'), effector=t['effector'], target=t['target'], ranges=t['ranges'])
                                                        for t in tracks], orbit_focus=[dict(id=i, ends=list(e)) for i, e in focus],
                   contact_distance_m=distances, contact_point='palm = midpoint of wrist and middle knuckle; other bones = their joint',
@@ -695,20 +778,29 @@ def contact_sheet_image(body, layers, track, frames, cameras, videos, tile):
         result = layers[-1].state
         ends = np.stack([contact_point(result, frame, track['effector']), contact_point(result, frame, track['target'])])
         others = np.stack([contact_point(layer.state, frame, track['effector']) for layer in layers])
-        uv = project(Camera(obs.rotation[frame], obs.translation[frame], obs.K, 1, 1), np.concatenate([ends, others]))[0]
+        frame_camera = Camera(obs.rotation[frame], obs.translation[frame], obs.K, 1, 1)
+        uv = project(frame_camera, np.concatenate([ends, others]))[0]
         uv = uv[np.isfinite(uv).all(1)]
-        torso = float(np.linalg.norm(obs.keypoints[frame, 5, :2] - obs.keypoints[frame, 12, :2]))
+        kp = obs.keypoints[frame] if obs.keypoints is not None else None
+        if kp is not None:
+            torso = float(np.linalg.norm(obs.keypoints[frame, 5, :2] - obs.keypoints[frame, 12, :2]))
+        else:
+            # No 2D keypoints: the projected model's left shoulder to right hip (COCO 5 / 12) sizes the crop instead.
+            shoulder, hip = project(frame_camera, result['joints'][frame, [16, 2]])[0]
+            torso = float(np.linalg.norm(shoulder - hip)) if np.isfinite([shoulder, hip]).all() else 0.0
         side_px = max(float(np.ptp(uv, 0).max()) * 1.6, 0.9 * torso, 160.0) if len(uv) else 400.0
         centre = uv.mean(0) if len(uv) else np.array(videos[frame].shape[1::-1]) / 2
         box = (centre[0] - side_px / 2, centre[1] - side_px / 2, side_px)
-        kp = obs.keypoints[frame]
         video = crop_video(videos[frame], box, tile)
         point = lambda xy: tuple(int(round(v)) for v in (np.asarray(xy) - box[:2]) * tile / side_px)
         kp_dir = None
-        if kp[9 + h, 2] > 0.3 and kp[base + 8, 2] > 0.3:
-            cv2.arrowedLine(video, point(kp[9 + h, :2]), point(kp[base + 8, :2]), GREEN, 2, cv2.LINE_AA, tipLength=0.25)
-            kp_dir = kp[base + 8, :2] - kp[9 + h, :2]
-        labels(video, [f'frame {frame}', 'green: video wrist->knuckle', f'score {min(kp[9 + h, 2], kp[base + 8, 2]):.2f}'], scale=0.45)
+        if kp is None:
+            labels(video, [f'frame {frame}', 'no saved 2D hand keypoints'], scale=0.45)
+        else:
+            if kp[9 + h, 2] > 0.3 and kp[base + 8, 2] > 0.3:
+                cv2.arrowedLine(video, point(kp[9 + h, :2]), point(kp[base + 8, :2]), GREEN, 2, cv2.LINE_AA, tipLength=0.25)
+                kp_dir = kp[base + 8, :2] - kp[9 + h, :2]
+            labels(video, [f'frame {frame}', 'green: video wrist->knuckle', f'score {min(kp[9 + h, 2], kp[base + 8, 2]):.2f}'], scale=0.45)
         overlays, views = [], []
         centre3 = ends.mean(0)
         forward = np.asarray(obs.rotation[frame]).T @ np.array([0.0, 0.0, 1.0])
@@ -741,8 +833,9 @@ def contact_sheet_image(body, layers, track, frames, cameras, videos, tile):
     for k, title in enumerate(sheet_columns(layers)):
         cv2.putText(header, title, (k * (tile + 4) + 8, 23), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (20, 20, 20), 1, cv2.LINE_AA)
     legend = np.full((30, rows[0].shape[1], 3), 255, np.uint8)
-    cv2.putText(legend, f"{track.get('id')}: {track['effector']} -> {track['target']}. Magenta arrow: model wrist->middle knuckle; green: video "
-                f"keypoints. Depth/gap: SMPL-X skin of the hand vs the {' + '.join(targets)}.", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+    video_key = 'green: video keypoints' if obs.keypoints is not None else 'no video keypoints saved'
+    cv2.putText(legend, f"{track.get('id')}: {track['effector']} -> {track['target']}. Magenta arrow: model wrist->middle knuckle; {video_key}"
+                f". Depth/gap: {body_name(body)} skin of the hand vs the {' + '.join(targets)}.", (8, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                 (20, 20, 20), 1, cv2.LINE_AA)
     gap = np.full((4, rows[0].shape[1], 3), 255, np.uint8)
     out = [header]
@@ -753,8 +846,6 @@ def contact_sheet_image(body, layers, track, frames, cameras, videos, tile):
 
 def cmd_sheet(args, session, project, model, kind, started):
     from ..motion_tools import RESULTS
-    if model != 'exmr':
-        raise CliError(f'--sheet needs the ExMR saved cameras and keypoints; {model} is not supported yet.')
     state = read_json(project / 'project.json')
     fps = float(state.get('fps', 30))
     out = Path(args.out).expanduser().resolve() if args.out else project / 'render' / f'{kind}-sheet-{time.strftime("%Y%m%d-%H%M%S")}'
@@ -771,16 +862,18 @@ def cmd_sheet(args, session, project, model, kind, started):
             print(f'Would write one comparison sheet per self-contact of {kind} into {out}')
         return 0, summary
     import cv2
-    from .review import load_exmr, read_frames
-    from .smplx_body import Body, load_params, model_path
-    session.info('Loading the SMPL-X body, cameras and keypoints ...')
-    body = Body(model_path(project))
+    from .review import read_frames
+    from .smplx_body import load_params
+    body = load_body(session, project, model, ', cameras and keypoints')
     from . import compare as comparing
     path, key, label, ref_kind = comparing.reference(project, kind, args.compare or 'original')
     layers = [Layer('Before (original)' if (args.compare or 'original') == 'original' else 'Before (' + label + ')', 'reference',
                     body.pose(load_params(path, key)), ref_kind)]
     for name, file in extra:
-        layers.append(Layer(name, 'result', body.pose(load_params(file)), None))
+        try:
+            layers.append(Layer(name, 'result', body.pose(load_params(file)), None))
+        except KeyError as error:
+            raise CliError(f'--add {file.name}: not a {body_name(body)} result like {kind} (no {error}).', EXIT_USAGE) from None
     filename, key = RESULTS[kind]
     count = len(layers[0].state['joints'])
     tracks, note = contact_tracks(project, kind, count, fps)
@@ -788,7 +881,11 @@ def cmd_sheet(args, session, project, model, kind, started):
         raise CliError('No enabled self-contact tracks to make a sheet for.', EXIT_USAGE)
     grip = {t.get('grip', 'off') for t in tracks}
     layers.append(Layer('After' + (f' (grip {grip.pop()})' if len(grip) == 1 else ''), 'result', body.pose(load_params(project / filename, key)), kind))
-    obs = layer_cameras(load_exmr(project, kind), project, layers, kind)
+    obs = layer_cameras(load_cameras(project, model, kind, count), project, layers, kind)
+    if obs[-1].keypoints is None:
+        note = ' '.join(filter(None, (note, f'{model} saves no COCO-63 hand keypoints, so the sheet leaves out the video hand direction '
+                                            '(green arrow and angle) and sizes each crop from the model.')))
+        session.info('Note: ' + note)
     plans = [(track, sheet_frames(args.frames, track['ranges'], count, track.get('automatic', ()))) for track in tracks]
     skipped = [track.get('id') or f"{track['effector']}-{track['target']}" for track, frames in plans if frames is None]
     plans = [(track, frames) for track, frames in plans if frames is not None]
@@ -811,7 +908,7 @@ def cmd_sheet(args, session, project, model, kind, started):
         session.info(f'  {path.name}')
     report = dict(version=1, command='render', sheet=True, project=str(project), result=kind, layers=[l.label for l in layers],
                   frames={t.get('id'): f for t, f in plans}, images=written, note=note or None, camera=obs[-1].describe(),
-                  geometry='SMPL-X neutral LBS with shape and pose correctives (GUI Mesh view)', seconds=round(time.monotonic() - started, 2))
+                  geometry=geometry(body), seconds=round(time.monotonic() - started, 2))
     (out / 'sheet.json').write_text(json.dumps(report, indent=1), encoding='utf-8')
     session.say(f'Sheet: {len(written)} image(s) in {out}')
     summary.update(images=written, report_path=str(out / 'sheet.json'))

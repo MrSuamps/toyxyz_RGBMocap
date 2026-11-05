@@ -344,25 +344,33 @@ rgbmocap-cli.cmd render --project P [--model M] [--result KIND] [--frames A-B] [
 rgbmocap-cli.cmd render --project P --sheet [--frames A-B|A,B,C] [--compare original|before-selfcontact] [--add LABEL=FILE] [--out DIR]
 ```
 
-Draws the model's own SMPL-X mesh (the GUI Mesh view geometry: shape and pose correctives, never the bound display
-skin) with a software rasteriser, so it needs no GPU. Views: `camera` over the video frame with review's camera (ExMR:
-one fixed camera for a static camera; per frame for a moving one, following each layer's own correction), `front` and
-`side` from the body's mean heading, and `orbit`, four close views around each self-contact
+Draws the model's own mesh (the GUI Mesh view geometry, never the bound display skin) with a software rasteriser, so it
+needs no GPU. ExMR and GVHMR use SMPL-X with shape and pose correctives; FlowHMR uses its native AMASS SMPL-H neutral body
+(`models\body_models\smplh\neutral\model.npz`, FlowHMR Model Manager) as FlowHMR's own SMPLMesh poses it: shape blend
+shapes, no pose correctives, 16 betas. Views: `camera` over the video frame (ExMR: review's camera, one fixed camera for a
+static camera, per frame for a moving one following each layer's own correction; FlowHMR and GVHMR: the GUI camera view's
+saved camera, `flow_camera.npz` rotation about the placement's fixed centre or GVHMR's frame-0 paired camera, the same for
+every layer), `front` and `side` from the body's mean heading, and `orbit`, four close views around each self-contact
 (or `--focus`). `--compare` puts the reference layer (grey) beside the result (orange); without a value it picks
 `before-selfcontact` when that file is current (its stat matches `<kind>_correction.json` and the result is not stale),
 else `original`, with a note when an outdated file was skipped. A red line marks each self-contact with its palm-to-target
 distance. Without `--frames` the self-contact intervals plus 10 frames are rendered. Writes `<view>_f<frame>.png`,
 `<view>.mp4` with `--mp4` (FFmpeg) and `render.json` (frames, layers, distances per track and frame, and the largest
-vertex difference to the project's GUI mesh preview). Default folder: `<model project>\render\<result>-<time>\`.
+vertex difference to the project's GUI mesh preview, for FlowHMR its native SMPL-H surface). Default folder:
+`<model project>\render\<result>-<time>\`. FlowHMR places the body once, by one constant horizontal offset fitted to the
+SAM pelvis of the first 30 frames, so where its trajectory drifts the camera view shows the body beside the person (the
+GUI camera view projects with the same camera and skeleton); `front` / `side` are unaffected.
 
-`--sheet` writes one comparison image per enabled self-contact track instead (ExMR): one row per frame, columns
+`--sheet` writes one comparison image per enabled self-contact track instead: one row per frame, columns
 **Video** (a crop around the contact), **Before** and **After** drawn over the same crop, then each layer in a close 3D
 view of the touching limbs only (90 deg from the camera). Each tile states the hand's depth inside the target or the skin
 gap, the arm's depth inside the target, and the angle between the model's wrist-to-knuckle direction (magenta arrow)
 and the video's (green). `--frames A-B` (default: the track's ranges) gives four evenly spaced frames, `A,B,C` exactly
 those frames. Before is `--compare` (default `original`); `--add LABEL=FILE` adds another result file in the same params
 format (for example a saved grip-off result) as a column, repeatable. Writes `sheet_<id>_f<first>-<last>.png` and
-`sheet.json` into `--out` (default `<model project>\render\<result>-sheet-<time>\`).
+`sheet.json` into `--out` (default `<model project>\render\<result>-sheet-<time>\`). The video hand direction needs
+ExMR's COCO-63 keypoints: FlowHMR saves no 2D keypoints and GVHMR's are COCO-17 without hands, so for them the green
+arrow and the angle are left out (noted in `sheet.json`) and the crop is sized from the model's projected torso.
 
 ## Self-contacts
 

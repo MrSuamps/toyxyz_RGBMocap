@@ -2,6 +2,7 @@
 
 Mirrors `mesh_data.prepare_mesh_preview`: full pose = model pose_mean (hand_mean on the finger joints) + result params.
 Never use the bound `*-display-mesh.npy` skin for judging motion: it carries an unrelated shin roll (candy-wrap report).
+FlowHMR results are SMPL-H: `SmplhBody` poses them as FlowHMR's own SMPLMesh does (the GUI's native SMPL-H surface).
 """
 from __future__ import annotations
 
@@ -16,6 +17,12 @@ FINGERS = ('thumb', 'index', 'middle', 'ring', 'pinky')
 HAND_START = {'left': 25, 'right': 40}
 HAND_FIELDS = (('left_hand_pose', 25), ('right_hand_pose', 40))
 EYE_FIELDS = (('jaw_pose', 22), ('leye_pose', 23), ('reye_pose', 24))
+# SMPL-H joint j is SMPL-X joint SMPLH_TO_SMPLX[j] (same body prefix and finger order); SMPL-X joint i takes SMPL-H joint
+# SMPLX_FROM_SMPLH[i], so the jaw and eyes (22-24, absent in SMPL-H) sit on the head.
+SMPLH_TO_SMPLX = np.r_[np.arange(22), np.arange(25, 55)]
+SMPLX_FROM_SMPLH = np.r_[np.arange(22), [15, 15, 15], np.arange(22, 52)]
+# Fields of a FlowHMR result (one flat record; the rest is metadata such as `source_representation`).
+SMPLH_FIELDS = ('rot6d', 'shapes', 'trans')
 
 
 def rodrigues(rotvec):
@@ -30,6 +37,17 @@ def rodrigues(rotvec):
     return np.eye(3) + s * skew + (1 - c) * skew @ skew
 
 
+def rot6d_matrix(rot6d):
+    """(..., 6) FlowHMR 6D rotation -> (..., 3, 3): both columns Gram-Schmidt orthonormalised, as flowhmr rot6d_to_rotation_matrix."""
+    x = np.asarray(rot6d, np.float64)
+    x = x.reshape(x.shape[:-1] + (3, 2))
+    a, b = x[..., 0], x[..., 1]
+    b1 = a / np.maximum(np.linalg.norm(a, axis=-1, keepdims=True), 1e-12)
+    b2 = b - np.sum(b1 * b, -1, keepdims=True) * b1
+    b2 = b2 / np.maximum(np.linalg.norm(b2, axis=-1, keepdims=True), 1e-12)
+    return np.stack([b1, b2, np.cross(b1, b2)], -1)
+
+
 def model_path(project=None):
     from ..paths import MODELS
     if project is not None:
@@ -41,12 +59,34 @@ def model_path(project=None):
     return Path(MODELS) / 'body_models' / 'smplx' / 'SMPLX_NEUTRAL.npz'
 
 
+def smplh_path():
+    """The AMASS SMPL-H neutral body FlowHMR is registered with (Model Manager row `smplh`)."""
+    from ..models import BY_KEY
+    return Path(BY_KEY['smplh'].path)
+
+
+def body_for(project, model):
+    """The body a model's results are posed on: SMPL-H for FlowHMR, else SMPL-X (MAMMA's own body when the project has one)."""
+    if model == 'flowhmr':
+        path = smplh_path()
+        if not path.is_file():
+            raise FileNotFoundError(f'FlowHMR results need the SMPL-H neutral body ({path}); import it in FlowHMR Model Manager.')
+        return SmplhBody(path)
+    return Body(model_path(project))
+
+
+def _array(value):
+    return np.asarray(value.detach().cpu().numpy() if hasattr(value, 'detach') else value, np.float64)
+
+
 def load_params(path, key='smpl_params_global'):
-    """Result params as float64 numpy arrays."""
+    """Result params as float64 numpy arrays; a FlowHMR record (no `key`, SMPL-H rot6d) gives its SMPLH_FIELDS."""
     import torch
     record = torch.load(Path(path), map_location='cpu', weights_only=False)
+    if key not in record and 'rot6d' in record:
+        return {name: _array(record[name]) for name in SMPLH_FIELDS if name in record}
     params = record[key] if key in record else record
-    return {name: np.asarray(value.detach().cpu().numpy() if hasattr(value, 'detach') else value, np.float64) for name, value in params.items()}
+    return {name: _array(value) for name, value in params.items()}
 
 
 class Body:
@@ -131,6 +171,63 @@ class Body:
         return np.einsum('vab,vb->va', rotation, posed) + self.weights @ offset + state['transl'][i]
 
 
+class SmplhBody:
+    """Neutral AMASS SMPL-H as FlowHMR's SMPLMesh poses it (`flow_export` writes the GUI surface with it): shape blend shapes, no pose
+    correctives. Weights and pose state use Body's 55-joint SMPL-X layout (SMPLH_TO_SMPLX), so joint indices mean the same."""
+    representation = 'smplh'
+
+    def __init__(self, path):
+        with np.load(Path(path), allow_pickle=False) as data:
+            self.template = data['v_template'].astype(np.float64)
+            self.shapedirs = data['shapedirs'].astype(np.float64)
+            self.regressor = data['J_regressor'].astype(np.float64)
+            weights = data['weights'].astype(np.float64)
+            parents = data['kintree_table'][0].astype(np.int64)
+            self.faces = data['f'].astype(np.int64)
+        self.path = Path(path)
+        if self.regressor.shape[0] != 52 or weights.shape[1] != 52:
+            raise ValueError(f'{self.path.name} is not a 52-joint SMPL-H model.')
+        parents[0] = -1
+        self.weights = np.zeros((len(weights), 55))
+        self.weights[:, SMPLH_TO_SMPLX] = weights
+        self.parents = np.full(55, 15, np.int64)
+        self.parents[SMPLH_TO_SMPLX] = np.where(parents < 0, -1, SMPLH_TO_SMPLX[np.maximum(parents, 0)])
+
+    def shapes(self, params, n):
+        betas = np.asarray(params['shapes'], np.float64).reshape(-1)
+        count = min(len(betas), self.shapedirs.shape[-1])
+        return np.repeat(betas[None, :count], n, 0)
+
+    def pose(self, params):
+        """Per-frame state like Body.pose (55 SMPL-X-layout joints, with transl) from FlowHMR rot6d / shapes / trans."""
+        rotations = rot6d_matrix(params['rot6d']).reshape(-1, 52, 3, 3)
+        n = len(rotations)
+        shapes = self.shapes(params, n)
+        shaped = self.template + self.shapedirs[..., :shapes.shape[1]] @ shapes[0]
+        rest = np.repeat((self.regressor @ shaped)[SMPLX_FROM_SMPLH][None], n, 0)
+        local = np.repeat(np.eye(3)[None, None], n, 0).repeat(55, 1)
+        local[:, SMPLH_TO_SMPLX] = rotations
+        world = np.empty_like(local)
+        joints = np.empty((n, 55, 3))
+        for j, p in enumerate(self.parents):
+            if p < 0:
+                world[:, j] = local[:, j]
+                joints[:, j] = rest[:, j]
+            else:
+                world[:, j] = world[:, p] @ local[:, j]
+                joints[:, j] = joints[:, p] + np.einsum('nij,nj->ni', world[:, p], rest[:, j] - rest[:, p])
+        transl = np.asarray(params['trans'], np.float64).reshape(n, 3)
+        return dict(local=local, world=world, rest=rest, joints=joints + transl[:, None], shapes=shapes, transl=transl)
+
+    def vertices(self, state, i):
+        """(V, 3) posed vertices of frame i: linear blend skinning of the shaped template, as SMPLMesh(use_pose_blending=False)."""
+        shaped = self.template + self.shapedirs[..., :state['shapes'].shape[1]] @ state['shapes'][i]
+        world = state['world'][i]
+        offset = state['joints'][i] - state['transl'][i] - np.einsum('jab,jb->ja', world, state['rest'][i])
+        rotation = np.einsum('vj,jab->vab', self.weights, world)
+        return np.einsum('vab,vb->va', rotation, shaped) + self.weights @ offset + state['transl'][i]
+
+
 def gui_vertices(project, kind, frame):
     """Vertices from the project's own `<kind>_mesh` preview frames (the GUI Mesh view input), or None when absent."""
     import json
@@ -141,6 +238,9 @@ def gui_vertices(project, kind, frame):
         return None
     info = json.loads(meta.read_text(encoding='utf-8'))
     frames_file = project / info['frames_file']
+    if info.get('representation') == 'smplh':
+        # FlowHMR's preview frames are the native SMPL-H surface itself, (frames, 6890, 3).
+        return np.asarray(np.load(frames_file, mmap_mode='r')[frame], np.float64) if frames_file.is_file() else None
     asset = Path(info['asset'])
     if not frames_file.is_file() or not asset.is_file():
         return None
