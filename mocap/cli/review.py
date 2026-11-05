@@ -64,8 +64,9 @@ JITTER_GROUPS = {'torso': ((0, 3, 6, 9, 12, 15), ('Hips', 'Spine', 'Spine1', 'Sp
 NOT_YET = {'gvhmr': 'its 2D keypoints are COCO-17 (keypoints.npz)', 'flowhmr': 'it has no saved 2D keypoints'}
 
 DESCRIPTION = '''Compare a motion with the source video's 2D keypoints and flag fixable problems: missed hand contacts,
-limb pose errors, foot sliding, floor penetration, jitter and placement drift. Writes report.json (with a ready
-`fix` spec), summary.md and overlay images (green: 2D keypoints, magenta: 3D motion projected per frame).'''
+limb pose errors, foot sliding, floor penetration, jitter and placement drift, plus anatomy (locked or hyperextended
+elbows/knees, sudden folds, wrist limits, joint twist, finger pose, hand orientation vs the video). Writes report.json
+(with a ready `fix` spec), summary.md and overlay images (green: 2D keypoints, magenta: 3D motion projected per frame).'''
 EPILOG = '''frames: report and --frames use video frame numbers (0-based); fix suggestions use Blender numbering
 (video frame + 1), as the `fix` command expects. Supports ExMR projects.'''
 
@@ -82,6 +83,9 @@ def register(commands, common):
     p.add_argument('--frames', metavar='A-B', help='video frames to evaluate, inclusive (default: all)')
     p.add_argument('--max-images', dest='max_images', type=int, default=24, metavar='N',
                    help='overlay images to write including the contact sheet (default 24, 0 = none)')
+    p.add_argument('--compare', choices=('original', 'before-selfcontact'),
+                   help='also review the reference layer and report fixed / new issues, untouched-frame identity and rotation deltas')
+    p.add_argument('--no-anatomy', dest='anatomy', action='store_false', help='skip the anatomy checks (no SMPL-X / bone rotations needed)')
     p.set_defaults(handler=cmd_review)
 
 
@@ -695,6 +699,18 @@ def floor_level(ctx, project, kind):
     return Floor(float(np.percentile(ctx.joints[:, [10, 11], 1].min(1), 2)), 'estimated')
 
 
+def collect_issues(ctx, project, kind, pose=None):
+    """All checks on one Context, ranked: (issues, floor, contacts, contacts_source). `pose` adds the anatomy checks."""
+    floor = floor_level(ctx, project, kind)
+    contacts, contacts_source = contact_mask(ctx, project, kind, floor)
+    issues = (check_missed_contacts(ctx) + check_pose(ctx) + check_foot_slide(ctx, contacts) + check_penetration(ctx, contacts, floor) +
+              check_jitter(ctx) + check_drift(ctx))
+    if pose is not None:
+        from . import anatomy
+        issues += anatomy.checks(ctx, pose)
+    return rank(issues), floor, contacts, contacts_source
+
+
 # Report -------------------------------------------------------------------------------------------------------------
 
 def statistics(ctx):
@@ -718,6 +734,16 @@ def statistics(ctx):
                                right_hand=float(visible[:, 43:63].mean())),
         placement_offset_torso=dict(median=float(np.median(offset)), max=float(offset.max()),
                                     per_second=[float(offset[i]) for i in range(0, len(offset), max(int(round(ctx.fps)), 1))]))
+
+
+def anatomy_block(ctx, pose):
+    if pose is None:
+        return dict(checked=False)
+    from . import anatomy
+    return dict(checked=True, rotations=pose.source, fingers_checked=pose.fingers is not None, hand_keypoints=anatomy.hand_coverage(ctx, pose),
+                thresholds=dict(hyperextension_deg=anatomy.HYPEREXTENSION_DEG, locked_deg=anatomy.LOCK_DEG, locked_frames=anatomy.LOCK_FRAMES,
+                                wrist_deg=anatomy.WRIST_LIMITS, twist_deg=anatomy.TWIST_LIMITS, fold_deg=anatomy.FOLD_DEG,
+                                fold_seconds=anatomy.FOLD_SECONDS, hand_direction_deg=anatomy.HAND_DIRECTION_DEG))
 
 
 def swap_report(ctx):
@@ -771,9 +797,10 @@ def suggested_fixes(issues):
 
 
 def rank(issues):
+    from .anatomy import PREFIX
     issues.sort(key=lambda item: (SEVERITY[item['severity']], -item['score']))
     counters = {}
-    prefix = dict(missed_contact='MC', pose_error='PE', foot_slide='FS', floor_penetration='FP', jitter='JT', placement_drift='PD')
+    prefix = dict(missed_contact='MC', pose_error='PE', foot_slide='FS', floor_penetration='FP', jitter='JT', placement_drift='PD', **PREFIX)
     for issue in issues:
         code = prefix[issue['check']]
         counters[code] = counters.get(code, 0) + 1
@@ -992,6 +1019,9 @@ def summary_markdown(report):
               '```json', json.dumps(fixes, indent=1), '```']
     if report.get('contact_sheet'):
         lines += ['', f"Contact sheet: `images/{report['contact_sheet']}`"]
+    if report.get('compare'):
+        from .compare import summary_lines
+        lines += summary_lines(report['compare'])
     return '\n'.join(lines) + '\n'
 
 
@@ -1025,6 +1055,11 @@ def cmd_review(args, session):
             raise CliError(f'Motion file not found: {fbx}')
     elif not (project / f'{kind}_joints.npz').is_file():
         raise CliError(f'The {kind} motion has no {kind}_joints.npz in {project}; run `reconstruct` or `correct` first.')
+    if args.compare and fbx:
+        raise CliError('--compare reviews project results; it cannot be combined with --motion.', EXIT_USAGE)
+    if args.compare:
+        from .compare import reference
+        reference(project, kind, args.compare)
     stem = fbx.stem if fbx else kind
     out = Path(args.out).expanduser().resolve() if args.out else project / 'review' / f'{stem}-{time.strftime("%Y%m%d-%H%M%S")}'
     if out.exists() and not out.is_dir():
@@ -1033,11 +1068,14 @@ def cmd_review(args, session):
                    out=str(out))
     if session.dry_run:
         summary.update(dry_run=True, frames=list(frames) if frames else 'all', writes=[str(out / name) for name in
-                       ('report.json', 'summary.md', 'suggested_fix.json', 'images/')], blender=bool(fbx))
+                       ('report.json', 'summary.md', 'suggested_fix.json', 'images/')], blender=bool(fbx), anatomy=args.anatomy,
+                       compare=args.compare)
         if not session.json:
             print(f'Would review {summary["motion"]} against {project / "input.mp4"} ({model}, result {kind})')
             if fbx:
-                print('  reads the FBX bone positions with the bundled Blender first')
+                print('  reads the FBX bone positions' + (' and rotations' if args.anatomy else '') + ' with the bundled Blender first')
+            if args.compare:
+                print(f'  also reviews the {args.compare} layer and diffs the issues')
             print(f'  frames: {args.frames or "all"}; up to {args.max_images} images')
             print(f'  writes: {out}\\report.json, summary.md, suggested_fix.json, images\\*.jpg')
         return 0, summary
@@ -1063,14 +1101,21 @@ def cmd_review(args, session):
         first, last = frames
     if last - first + 1 < 3:
         raise CliError('Review needs at least 3 frames.', EXIT_USAGE)
+    pose = None
+    if args.anatomy:
+        from . import anatomy
+        clock = time.monotonic()
+        pose = anatomy.load_pose(project, kind, fbx, session)
+        blender_seconds = round((blender_seconds or 0) + time.monotonic() - clock, 2) if fbx else blender_seconds
     clock = time.monotonic()
     reference = load_project_motion(project, kind) if fbx and (project / f'{kind}_joints.npz').is_file() else None
     ctx = Context(obs, motion, first, last, reference)
-    floor = floor_level(ctx, project, kind)
-    contacts, contacts_source = contact_mask(ctx, project, kind, floor)
-    issues = (check_missed_contacts(ctx) + check_pose(ctx) + check_foot_slide(ctx, contacts) + check_penetration(ctx, contacts, floor) +
-              check_jitter(ctx) + check_drift(ctx))
-    rank(issues)
+    issues, floor, contacts, contacts_source = collect_issues(ctx, project, kind, pose)
+    comparison = None
+    if args.compare:
+        from .compare import review_against
+        session.info(f'Reviewing the {args.compare} layer for the comparison ...')
+        comparison = review_against(obs, project, kind, args.compare, first, last, issues, pose, out)
     spec, status = suggested_fixes(issues)
     analysis_seconds = round(time.monotonic() - clock, 2)
     clock = time.monotonic()
@@ -1093,6 +1138,7 @@ def cmd_review(args, session):
         issues=[{key: value for key, value in issue.items() if not key.startswith('_')} for issue in issues],
         keypoint_swaps=swap_report(ctx), stats=stats, suggested_fixes=spec, suggested_fixes_status=status,
         fix_input=str(fbx) if fbx else '<exported FBX of this result>', images=written, contact_sheet=sheet, per_frame=per_frame,
+        anatomy=anatomy_block(ctx, pose), compare=comparison,
         seconds=dict(blender=blender_seconds, analysis=analysis_seconds, images=image_seconds, total=round(time.monotonic() - started, 2)))
     report = rounded(report)
     out.mkdir(parents=True, exist_ok=True)
@@ -1102,5 +1148,9 @@ def cmd_review(args, session):
     for issue in report['issues'][:5]:
         session.info(f"  {issue['id']} [{issue['severity']}] video {issue['frames'][0]}-{issue['frames'][1]}: {issue['message']}")
     session.say(f"Review: {len(report['issues'])} issue(s); summary: {out / 'summary.md'}")
+    if comparison:
+        counts, identity = report['compare']['issues']['counts'], report['compare']['identity'].get('ok')
+        session.say(f"Compare with {report['compare']['reference']}: {counts['fixed']} fixed, {counts['new']} new, {counts['unchanged']} unchanged"
+                    + ('' if identity is None else f"; untouched frames {'identical' if identity else 'CHANGED'}"))
     summary.update(summary=str(out / 'summary.md'), report_path=str(out / 'report.json'), report=report)
     return 0, summary

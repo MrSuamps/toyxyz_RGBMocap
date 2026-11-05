@@ -692,6 +692,9 @@ def build_parser():
     from . import contacts
     contacts.register(commands, common)
 
+    from . import render
+    render.register(commands, common)
+
     characters, error = characters_module()
     if characters is not None:
         try:

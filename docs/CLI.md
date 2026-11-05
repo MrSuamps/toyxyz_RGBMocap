@@ -248,6 +248,7 @@ changed, never bone translations or the root motion.
 
 ```
 rgbmocap-cli.cmd review --project P [--model exmr] [--result KIND] [--motion EDITED.fbx] [--out DIR] [--frames A-B] [--max-images N]
+                        [--compare original|before-selfcontact] [--no-anatomy]
 ```
 
 Measures how well a motion matches the source video and flags problems, many with a ready `fix` pin or smoothing
@@ -282,11 +283,47 @@ are relabelled and listed under `keypoint_swaps`.
 | `floor_penetration` | The ankle or toe joint is more than 1 cm below its resting height above the floor during contact. | None (`correct --pelvis-offset` / `--floor`). |
 | `jitter` | A joint's acceleration (pelvis-relative; the pelvis absolute) exceeds 8 times its median and 20 m/s^2, and 3 times its local median. | `smooth` on the limb's bones. |
 | `placement_drift` | The whole body sits more than 0.25 torso off the person in the video (informational). | None. |
+| `hyperextension` | An elbow or knee bends more than 5 deg the wrong way about its anatomical hinge (high from 25 deg). | None. |
+| `locked_limb` | An elbow is held at 170 deg interior or straighter for 6+ frames (knee 178); high when locked at 177+ for 10+ frames, the typical IK reach failure. | None (move the target limb / reciprocal). |
+| `sudden_fold` | An elbow or knee dips more than 35 deg below the angles around it within 0.35 s (an easing fold; knees one level lower). | None. |
+| `wrist_limit` | The wrist leaves its range relative to the forearm (flexion 80, extension 70, radial 25, ulnar 40 deg). | None (grip). |
+| `joint_twist` | A knee (40 deg), elbow (80) or wrist (80) twists about its own bone: candy-wrap risk. | None. |
+| `finger_pose` | A finger joint is more than 10 deg past its flexion / spread / twist range (SMPL-X hand pose relative to the flat hand). | None. |
+| `hand_orientation` | On frames with confident hand keypoints, the 2D wrist-to-middle-knuckle direction differs by more than 50 deg from the motion, or the thumb and pinky sides are swapped. | None. |
 
 `suggested_fixes` contains the high and medium issues in rank order. A pin whose limb and ease window would overlap an
 earlier pin is left out (noted on the issue), because `fix` rejects overlapping pins. Typical loop: `review`, run `fix`
 on the exported FBX with `suggested_fix.json`, then `review --motion fixed.fbx` to confirm the contact is resolved and
 no new jitter appeared at the eased frames.
+
+Anatomy checks read joint rotations: for a project result the model's SMPL-X pose (including the 45-D hand pose, relative
+to the hand mean), for `--motion` the FBX bone rotations relative to its bind pose (a second Blender read; finger checks
+are skipped there because the bind bakes the relaxed hand). Interior angles are 180 deg when straight; the hinge sign
+follows the export's knee/elbow axes. `--no-anatomy` skips them. `report.json` lists their thresholds and the confident
+hand-keypoint frames under `anatomy`.
+
+`--compare original|before-selfcontact` (corrected results only) also reviews the reference layer over the same frames:
+the uncorrected base result, or `<kind>_before_selfcontact.pt` written by `correct` when self-contacts changed the motion.
+`report.json` then has a `compare` block: the issue diff (`fixed`, `new`, `unchanged` matched by check, joints and
+overlapping frames), untouched-frame identity (against `before-selfcontact`, frames and joints outside the
+`self_contact.changed` rows of `<kind>_correction.json` must be bit-identical), the per-frame maximum joint-rotation
+change, and `images\compare_delta_<layer>.png` (one column per frame, white ticks = changed ranges).
+
+## Render bodies
+
+```
+rgbmocap-cli.cmd render --project P [--model M] [--result KIND] [--frames A-B] [--step N] [--views camera,front,side,orbit]
+                        [--compare [original|before-selfcontact]] [--focus BONE,BONE] [--out DIR] [--mp4] [--size PX]
+```
+
+Draws the model's own SMPL-X mesh (the GUI Mesh view geometry: shape and pose correctives, never the bound display
+skin) with a software rasteriser, so it needs no GPU. Views: `camera` over the video frame with the project's per-frame
+camera (ExMR), `front` and `side` from the body's mean heading, and `orbit`, four close views around each self-contact
+(or `--focus`). `--compare` puts the reference layer (grey) beside the result (orange); without a value it picks
+`before-selfcontact` when that file exists, else `original`. A red line marks each self-contact with its palm-to-target
+distance. Without `--frames` the self-contact intervals plus 10 frames are rendered. Writes `<view>_f<frame>.png`,
+`<view>.mp4` with `--mp4` (FFmpeg) and `render.json` (frames, layers, distances per track and frame, and the largest
+vertex difference to the project's GUI mesh preview). Default folder: `<model project>\render\<result>-<time>\`.
 
 ## Self-contacts
 
