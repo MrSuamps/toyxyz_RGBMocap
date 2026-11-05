@@ -112,7 +112,7 @@ def run(project,emit=lambda *a,**k:None,result='corrected_initial'):
     from .hand_lock import apply as apply_hands
     report['hand_lock']=apply_hands(geometry.rest[:22],roots,quats,out_root,out_quat,geometry.palm_offsets,fps,options['mode'],report['floor'],options['preset'],hand_ranges,options['hand_lock'],emit)
     report['warning']=' '.join(filter(None,(report['warning'],report['hand_lock']['warning'])))
-    from .self_contact import from_store as self_contact,publish_rot6d
+    from .self_contact import from_store as self_contact,publish_rot6d,publish_fingers_rot6d
     self_report,self_before=self_contact(project,'initial',context,geometry.rest[:22],out_root,out_quat,geometry.palm_offsets,fps,report['segments'],emit)
     if self_report is not None:report['self_contact']=self_report;report['warning']=' '.join(filter(None,(report['warning'],self_report['warning'])))
     after=np.empty_like(probes)
@@ -134,7 +134,9 @@ def run(project,emit=lambda *a,**k:None,result='corrected_initial'):
         written=((1,2,4,5,7,8) if report['contacts'] else ()) + ((13,14,16,17,18,19,20,21) if report['hand_lock']['contacts'] else ())
         for joint in written:
             output['rot6d'][0,:,joint]=torch.from_numpy(matrices[:,joint,:,:2].reshape(n,6).astype(np.float32))
-        if self_before is not None:prior=publish_rot6d(output,params,matrices,self_before,self_report['changed'],written)
+        if self_before is not None:
+            prior=publish_rot6d(output,params,matrices,self_before,self_report['changed'],written)
+            publish_fingers_rot6d(output,self_report,geometry.rest)
         if report['contacts']:output['trans'][0]=torch.from_numpy((out_root-geometry.rest[0]).astype(np.float32))
     output['body_rot6d']=output['rot6d'][:,:,1:];output['root_rot6d']=output['rot6d'][:,:,0]
     # Derived upstream diagnostic fields are not valid after contact IK.

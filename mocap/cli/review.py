@@ -708,6 +708,8 @@ def collect_issues(ctx, project, kind, pose=None):
     if pose is not None:
         from . import anatomy
         issues += anatomy.checks(ctx, pose)
+    from . import foot_orientation
+    issues += foot_orientation.check(ctx, pose)
     return rank(issues), floor, contacts, contacts_source
 
 
@@ -798,9 +800,11 @@ def suggested_fixes(issues):
 
 def rank(issues):
     from .anatomy import PREFIX
+    from .foot_orientation import PREFIX as FOOT_PREFIX
     issues.sort(key=lambda item: (SEVERITY[item['severity']], -item['score']))
     counters = {}
-    prefix = dict(missed_contact='MC', pose_error='PE', foot_slide='FS', floor_penetration='FP', jitter='JT', placement_drift='PD', **PREFIX)
+    prefix = dict(missed_contact='MC', pose_error='PE', foot_slide='FS', floor_penetration='FP', jitter='JT', placement_drift='PD', **PREFIX,
+                  **FOOT_PREFIX)
     for issue in issues:
         code = prefix[issue['check']]
         counters[code] = counters.get(code, 0) + 1
@@ -1122,6 +1126,8 @@ def cmd_review(args, session):
     written, sheet = render(ctx, obs, issues, out / 'images', args.max_images)
     image_seconds = round(time.monotonic() - clock, 2)
     stats = statistics(ctx)
+    from . import foot_orientation
+    stats['foot_orientation'] = foot_orientation.statistics(ctx, pose)
     per_frame = dict(frames=ctx.frames.tolist(), torso_px=ctx.torso, offset_px=ctx.offset,
                      limb_error_torso={limb: np.fmax.reduce(ctx.err[:, list(m)], axis=1) for limb, m in LIMBS.items()},
                      contacts=dict(left=contacts[:, 0].astype(int).tolist(), right=contacts[:, 1].astype(int).tolist()))

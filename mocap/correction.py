@@ -632,16 +632,25 @@ def run(project,emit,result):
                     else:quats[start:end]=Rotation.from_rotvec(rv.reshape(-1,3)).as_quat().reshape(-1,22,4)[...,[3,0,1,2]]
                     roots[start:end]=(params['transl'][start:end].numpy()+geometry.rest[0])@shared_rotation.T+shared_translation
                     probes[start:end]=geometry.sample(roots[start:end],quats[start:end])[0]
-                _,_,report=correct_arrays(geometry.rest[:22],roots,quats,probes,probabilities,fps,floor,
-                    output=(out_roots,out_quats),emit=emit,preset=preset,contact_ranges=contact_ranges,
-                    pelvis_offset=options['pelvis_offset'],mode=options['mode'],foot_enabled=options['foot_lock'])
+                # Articulated feet (pointe/flat/match) are source pose: the foot plan, grounding and leg IK all see them.
+                from .foot_articulation import from_store as articulate
+                feet=articulate(project,base,context,geometry,roots,quats,probes,fps,transform,emit)
+                for attempt in range(1 if feet is None else 1+feet.passes):
+                    # Shin-relative feet (pointe) re-aim at the corrected shins between passes; the leg IK keeps ankle world rotations.
+                    if attempt and not feet.follow_shins(geometry,roots,quats,probes,out_roots,out_quats):break
+                    _,_,report=correct_arrays(geometry.rest[:22],roots,quats,probes,probabilities,fps,floor,
+                        output=(out_roots,out_quats),emit=emit,preset=preset,contact_ranges=contact_ranges,
+                        pelvis_offset=options['pelvis_offset'],mode=options['mode'],foot_enabled=options['foot_lock'])
+                if feet is not None:
+                    report['foot_articulation']=feet.report
+                    report['warning']=' '.join(filter(None,(report['warning'],feet.report['warning'])))
                 from .hand_lock import apply as apply_hands
                 report['hand_lock']=apply_hands(geometry.rest[:22],roots,quats,out_roots,out_quats,geometry.palm_offsets,fps,options['mode'],report['floor'],preset,hand_ranges,options['hand_lock'],emit)
                 report['warning']=' '.join(filter(None,(report['warning'],report['hand_lock']['warning'])))
                 report['contact_revision']=contact_revision
                 if shared:report['shared_floor']=shared
                 if contact_warning:report['warning']=' '.join(filter(None,(report['warning'],contact_warning)))
-                from .self_contact import from_store as self_contact,publish_smplx
+                from .self_contact import from_store as self_contact,publish_smplx,publish_fingers_smplx
                 self_report,self_before=self_contact(project,base,context,geometry.rest[:22],out_roots,out_quats,geometry.palm_offsets,fps,
                     report['segments'],emit)
                 if self_report is not None:
@@ -654,6 +663,7 @@ def run(project,emit,result):
                     pose[start:end]=Rotation.from_quat(out_quats[start:end,...,[1,2,3,0]].reshape(-1,4)).as_rotvec().reshape(-1,22,3)
                     translation[start:end]=(out_roots[start:end]-shared_translation)@shared_rotation-geometry.rest[0]
                     after[start:end]=geometry.sample(out_roots[start:end],out_quats[start:end])[0]
+                if feet is not None:feet.finish(geometry,out_roots,out_quats,after)
                 before=probes
                 contact_plan=prepare_contacts(probes,probabilities,fps,floor,preset,contact_ranges,options['mode'])
                 active,anchors=contact_plan[:2]
@@ -686,14 +696,17 @@ def run(project,emit,result):
                 written=(1,2,4,5,7,8) + ((13,14,16,17,18,19,20,21) if report['hand_lock']['contacts'] else ())
                 for joint in written:
                     output['body_pose'][:,3*(joint-1):3*joint]=torch.from_numpy(np.asarray(pose[:,joint]).copy())
-                if self_before is not None:prior=publish_smplx(output,params,pose,self_before,self_report['changed'],written)
+                if feet is not None:feet.publish(output,pose)
+                if self_before is not None:
+                    prior=publish_smplx(output,params,pose,self_before,self_report['changed'],written)
+                    prior_hands=publish_fingers_smplx(output,params,self_report,geometry.rest,geometry.mean)
                 output['transl']=torch.from_numpy(np.asarray(translation).copy())
                 begin_update(project,kind,'correct')
                 save_tensor({'smpl_params_global':output,'source':base,'method':report['method']},project/RESULTS[kind][0])
                 report['output_stat']=file_stat(project/RESULTS[kind][0])
                 prior_file=project/f'{kind}_before_selfcontact.pt'
                 if self_before is not None:
-                    save_tensor({'smpl_params_global':{**output,'body_pose':prior},'source':base,'method':report['method']},prior_file)
+                    save_tensor({'smpl_params_global':{**output,'body_pose':prior,**prior_hands},'source':base,'method':report['method']},prior_file)
                     self_report['before_stat']=file_stat(prior_file)
                 else:prior_file.unlink(missing_ok=True)
                 del output

@@ -1,6 +1,7 @@
 """Self-contact tracks (a hand held on another body part). Frames are zero-based, end-exclusive.
 
 Stored like foot-lock edits: two alternating payload slots plus an atomic state file that commits the current one.
+The same payload optionally holds foot `articulation` entries (pointe/flat/flexed/match per foot interval).
 """
 import json
 import math
@@ -14,6 +15,10 @@ GRIP = ('off', 'auto')
 KEYS = ('id', 'effector', 'target', 'offset', 'distance', 'reciprocal', 'grip', 'enabled', 'ranges', 'automatic', 'source')
 ID_PATTERN = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}')
 UNSIDED = ('Hips', 'Spine', 'Spine1', 'Spine2', 'Neck', 'Head')
+FEET = ('LeftFoot', 'RightFoot')
+MODES = ('match', 'pointe', 'flat', 'flexed')
+PROFILES = ('default', 'dancer')
+ARTICULATION_KEYS = ('id', 'foot', 'mode', 'strength', 'profile', 'enabled', 'ranges', 'automatic', 'source')
 
 
 def _bases():
@@ -163,48 +168,176 @@ def normalize_tracks(tracks, frames):
     return result
 
 
-def read(project, base, context):
-    """(tracks, revision, warning). No file: ([], None, ''). A different time base keeps the revision but no tracks."""
+def _articulation(raw, frames, index):
+    if not isinstance(raw, dict):
+        raise ValueError(f'Foot articulation {index + 1} must be an object')
+    unknown = sorted(set(raw) - set(ARTICULATION_KEYS))
+    if unknown:
+        raise ValueError(f'Foot articulation {index + 1}: unknown field(s) {", ".join(unknown)}')
+    name = raw.get('id')
+    label = f'Foot articulation {name!r}' if name is not None else f'Foot articulation {index + 1}'
+    foot, mode, profile = raw.get('foot'), raw.get('mode', 'match'), raw.get('profile', 'default')
+    if foot not in FEET:
+        raise ValueError(f'{label}: foot must be one of {", ".join(FEET)}, got {foot!r}')
+    if mode not in MODES:
+        raise ValueError(f'{label}: mode must be one of {", ".join(MODES)}, got {mode!r}')
+    if profile not in PROFILES:
+        raise ValueError(f'{label}: profile must be one of {", ".join(PROFILES)}, got {profile!r}')
+    strength = _number(raw.get('strength', 1.0), label + ' strength')
+    if not 0 <= strength <= 1:
+        raise ValueError(f'{label}: strength must be between 0 and 1')
+    enabled = raw.get('enabled', True)
+    if not isinstance(enabled, bool):
+        raise ValueError(f'{label}: enabled must be true or false')
+    source = raw.get('source', 'user')
+    if not isinstance(source, str):
+        raise ValueError(f'{label}: source must be a string')
+    if name is not None and (not isinstance(name, str) or not ID_PATTERN.fullmatch(name)):
+        raise ValueError(f'{label}: id must be 1-64 letters, digits, ".", "_" or "-"')
+    return dict(id=name, foot=foot, mode=mode, strength=strength, profile=profile, enabled=enabled,
+                ranges=_ranges(raw.get('ranges', []), frames, label + ' ranges'),
+                automatic=_ranges(raw.get('automatic', []), frames, label + ' automatic'), source=source)
+
+
+def normalize_articulation(entries, frames):
+    """Validated foot articulation entries with ids filled in; one enabled mode per foot and frame."""
+    if isinstance(frames, bool) or not isinstance(frames, int) or frames < 1:
+        raise ValueError('Foot articulation frame count must be a positive integer')
+    if not isinstance(entries, (list, tuple)):
+        raise ValueError('Foot articulation must be a list')
+    result = [_articulation(raw, frames, i) for i, raw in enumerate(entries)]
+    used = set()
+    for entry in result:
+        if entry['id'] is not None:
+            if entry['id'] in used:
+                raise ValueError(f'Duplicate foot articulation id {entry["id"]!r}')
+            used.add(entry['id'])
+    for entry in result:
+        if entry['id'] is None:
+            stem = short_name(entry['foot']) + '-' + entry['mode']
+            name, count = stem, 2
+            while name in used:
+                name, count = f'{stem}-{count}', count + 1
+            entry['id'] = name
+            used.add(name)
+    for i, a in enumerate(result):
+        for b in result[i + 1:]:
+            if not (a['enabled'] and b['enabled'] and a['foot'] == b['foot']):
+                continue
+            for s0, e0 in a['ranges']:
+                for s1, e1 in b['ranges']:
+                    if s0 < e1 and s1 < e0:
+                        raise ValueError(f'Foot articulations {a["id"]!r} and {b["id"]!r} both set {a["foot"]} on frames '
+                                         f'{max(s0, s1)}-{min(e0, e1) - 1}; one foot can have one mode at a time')
+    return result
+
+
+def _payload(project, base, context):
+    """(payload or None, state, warning) for the committed slot; None with a warning when the time base differs."""
     state = _state(project, base)
     if not state:
-        return [], None, ''
+        return None, state, ''
     current = state.get('revision')
     try:
         same = int(state['frames']) == int(context['frames']) and float(state['fps']) == float(context['fps'])
     except (KeyError, TypeError, ValueError):
         same = False
     if not same:
-        return [], current, 'Saved self-contacts belong to motion with a different length or frame rate; they are not applied. Review them.'
+        return None, state, 'belong to motion with a different length or frame rate; they are not applied. Review them.'
     filename = state.get('file')
     if filename not in slot_names(base):
         raise ValueError('Invalid self-contact edit file')
     data = json.loads((Path(project) / filename).read_text(encoding='utf-8'))
     if data.get('revision') != current:
         raise ValueError('Incomplete self-contact save; edit the self-contacts again')
-    return normalize_tracks(data.get('tracks', []), int(context['frames'])), current, ''
+    return data, state, ''
 
 
-def save(project, base, tracks, context):
-    """Write the payload to the slot not referenced by the current state, then commit the state. Returns the new revision."""
+def read(project, base, context):
+    """(tracks, revision, warning). No file: ([], None, ''). A different time base keeps the revision but no tracks."""
+    data, state, warning = _payload(project, base, context)
+    if warning:
+        return [], state.get('revision'), 'Saved self-contacts ' + warning
+    if data is None:
+        return [], None, ''
+    return normalize_tracks(data.get('tracks', []), int(context['frames'])), state.get('revision'), ''
+
+
+def read_articulation(project, base, context):
+    """(entries, revision, warning) for foot articulation, with the same rules as read()."""
+    data, state, warning = _payload(project, base, context)
+    if warning:
+        return [], state.get('revision'), ('Saved foot articulation ' + warning) if _stored_articulation(project, base) else ''
+    if data is None:
+        return [], None, ''
+    return normalize_articulation(data.get('articulation', []), int(context['frames'])), state.get('revision'), ''
+
+
+def _stored_articulation(project, base):
+    """Raw articulation entries of the committed slot, whatever its time base; [] when unreadable."""
+    state = _state(project, base)
+    filename = state.get('file')
+    if filename not in slot_names(base):
+        return []
+    try:
+        data = json.loads((Path(project) / filename).read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return []
+    return data.get('articulation', []) if data.get('revision') == state.get('revision') else []
+
+
+def save(project, base, tracks, context, articulation=None):
+    """Write the payload to the slot not referenced by the current state, then commit the state. Returns the new revision.
+
+    articulation=None keeps the stored foot articulation entries; pass a list (possibly empty) to replace them.
+    """
     import uuid
     from .storage import atomic_json
     frames, fps = int(context['frames']), float(context['fps'])
     if frames < 1 or not math.isfinite(fps) or fps <= 0:
         raise ValueError('Invalid self-contact time base')
     tracks = normalize_tracks(tracks, frames)
+    if articulation is None:
+        articulation = _stored_articulation(project, base)
+    articulation = normalize_articulation(articulation, frames)
     previous = _state(project, base)
     current = uuid.uuid4().hex
     first, second = slot_names(base)
     filename = first if previous.get('file') == second else second
     payload = [{**track, 'ranges': [list(p) for p in track['ranges']], 'automatic': [list(p) for p in track['automatic']]} for track in tracks]
-    atomic_json(Path(project) / filename, {'version': VERSION, 'revision': current, 'tracks': payload})
+    record = {'version': VERSION, 'revision': current, 'tracks': payload}
+    if articulation:
+        record['articulation'] = [{**e, 'ranges': [list(p) for p in e['ranges']], 'automatic': [list(p) for p in e['automatic']]} for e in articulation]
+    atomic_json(Path(project) / filename, record)
     atomic_json(state_path(project, base), {'frames': frames, 'fps': fps, 'sources': dict(context.get('sources') or {}),
                                             'revision': current, 'file': filename})
     return current
 
 
-def clear(project, base):
-    """Remove all self-contact files so revisions fall back to foot-lock values only. True if anything was removed."""
+def save_articulation(project, base, entries, context):
+    """Replace the foot articulation entries, keeping the tracks. Removes the files when both end up empty."""
+    tracks, _, warning = read(project, base, context)
+    if warning and _state(project, base):
+        raise ValueError(warning)
+    entries = normalize_articulation(entries, int(context['frames']))
+    if not tracks and not entries:
+        clear(project, base, articulation=True)
+        return None
+    return save(project, base, tracks, context, articulation=entries)
+
+
+def clear(project, base, articulation=False):
+    """Remove all self-contact tracks. True if anything was removed.
+
+    Stored foot articulation entries are kept (re-saved without tracks) unless articulation=True; only when nothing is
+    left are the files deleted, so revisions fall back to foot-lock values only.
+    """
+    state = _state(project, base)
+    kept = [] if articulation else _stored_articulation(project, base)
+    if kept:
+        data = json.loads((Path(project) / state['file']).read_text(encoding='utf-8'))
+        save(project, base, [], state, articulation=kept)
+        return bool(data.get('tracks'))
     removed = False
     for path in (state_path(project, base), *(Path(project) / name for name in slot_names(base))):
         if path.exists():

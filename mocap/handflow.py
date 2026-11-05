@@ -125,8 +125,10 @@ def run(project,emit,result):
         from . import self_contact_store
         if not self_contact_store.state_path(project,kind).exists():
             tracks,_,_=self_contact_store.read(project,source_kind,dict(frames=n,fps=fps))
-            if tracks:
-                self_contact_store.save(project,kind,tracks,dict(frames=n,fps=fps,sources={target.name:file_stat(target),'hmr4d_results.pt':file_stat(project/'hmr4d_results.pt')}))
+            feet,_,_=self_contact_store.read_articulation(project,source_kind,dict(frames=n,fps=fps))
+            if tracks or feet:
+                self_contact_store.save(project,kind,tracks,dict(frames=n,fps=fps,sources={target.name:file_stat(target),'hmr4d_results.pt':file_stat(project/'hmr4d_results.pt')}),
+                                        articulation=feet)
         written.append(kind)
     if input_signature(project)[0]!=signature:raise ValueError('HandFlow inputs changed during merge.')
     atomic_json(project/'handflow_report.json',dict(results=written,cached=cached,frames=n,body_and_wrists_unchanged=True,

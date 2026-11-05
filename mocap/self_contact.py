@@ -21,6 +21,28 @@ REACH_ELBOW_DEG = 165.
 ELBOW_MAX_DEG = 170.
 KNEE_MAX_DEG = 170.
 RECIPROCAL_MARGIN_M = .01
+# Wrist range of motion (deg) relative to the forearm, normal adult active ranges (AAOS; Norkin & White). Swing about the
+# radial-ulnar axis is flexion/extension, about the palm normal radial/ulnar deviation (bounded together by an elliptical
+# cone per quadrant); twist about the forearm axis is pronation/supination, zero at the T-pose mid-position (palm down,
+# thumb forward). SMPL forearm twist is shared between elbow and wrist; only the wrist-local part is limited here.
+WRIST_LIMITS_DEG = dict(flexion=80., extension=70., radial=20., ulnar=30., pronation=80., supination=80.)
+# Wrist-local axes in the SMPL rest pose: palms face -Y, thumbs point +Z, the hand continues the rest forearm axis.
+PALM_NORMAL = np.array([0., -1., 0.])
+THUMB = np.array([0., 0., 1.])
+# Grip shape: absolute flexion (deg) of MCP/PIP/DIP per finger in MANO order (index, middle, pinky, ring, thumb), a wrap
+# around a ~4 cm limb; the thumb row is CMC opposition, MCP and IP. Scaled per target part (thick or flat targets less).
+FINGER_CURL_DEG = ((45., 60., 35.), (50., 65., 35.), (60., 65., 35.), (55., 65., 35.), (35., 25., 30.))
+GRIP_CURL = {'Foot': 1., 'ToeBase': .8, 'Leg': 1., 'UpLeg': .6, 'Shoulder': .4, 'Arm': .9, 'ForeArm': 1., 'Hand': .5, 'Neck': .8, 'Head': .3,
+             'Hips': .3, 'Spine': .25, 'Spine1': .25, 'Spine2': .25}
+CHILD = {0: 3, 1: 4, 2: 5, 3: 6, 4: 7, 5: 8, 6: 9, 7: 10, 8: 11, 9: 12, 12: 15, 13: 16, 14: 17, 16: 18, 17: 19, 18: 20, 19: 21}
+# Grip search: coarse wrist-limit grid (flexion, radial, pronation samples), finger-wrap and frame-to-frame weights per
+# degree of palm-facing error, and the arm swivel about the shoulder-wrist line it may add (penalised per degree).
+GRIP_GRID_STEPS = (11, 6, 9)
+GRIP_FINGER_WEIGHT = .25
+GRIP_STEP_WEIGHT = 10.
+SWIVELS_DEG = np.arange(-45., 46., 9.)
+SWIVEL_WEIGHT = .3
+SWIVEL_STEP_WEIGHT = 10.
 
 
 def quat_matrix(q):
@@ -201,6 +223,260 @@ def blend(rest, root, start, solved, weights, joints, distal):
     return out
 
 
+def unit(v):
+    return v / np.maximum(np.linalg.norm(v, axis=-1, keepdims=True), 1e-12)
+
+
+def forearm_axis(rest, h):
+    _, _, elbow, wrist = ARMS[h]
+    return unit(rest[wrist] - rest[elbow])
+
+
+def wrist_basis(rest, h):
+    """Forearm twist axis t and the swing axes ez (radial-ulnar, thumb side) and ey (palm normal side) orthogonal to it."""
+    t = forearm_axis(rest, h)
+    ez = unit(THUMB - (THUMB @ t) * t)
+    ey = unit(-PALM_NORMAL - (-PALM_NORMAL @ t) * t - (-PALM_NORMAL @ ez) * ez)
+    return t, ez, ey
+
+
+def wrist_angles(local, rest, h):
+    """(flexion, radial, pronation) in degrees of wrist-local rotations (..., 3, 3), swing-twist about the rest forearm axis.
+
+    Left forearm runs +X: +Z rotation lifts the fingers (extension), +Y turns them to the pinky (ulnar), +X turns the thumb
+    down (pronation). The right forearm runs -X, which mirrors all three signs.
+    """
+    t, ez, ey = wrist_basis(rest, h); s = 1. if h == 0 else -1.
+    q = Rotation.from_matrix(np.asarray(local, float).reshape(-1, 3, 3)).as_quat()
+    q = np.where(q[:, 3:] < 0, -q, q)
+    projection = q[:, :3] @ t
+    twist = 2 * np.arctan2(projection, q[:, 3])
+    twist_q = np.c_[projection[:, None] * t, q[:, 3]]
+    swing = (Rotation.from_quat(q) * Rotation.from_quat(unit(twist_q)).inv()).as_rotvec()
+    shape = np.shape(local)[:-2]
+    return tuple(np.rad2deg(x).reshape(shape) for x in (-s * (swing @ ez), -s * (swing @ ey), s * twist))
+
+
+def swing_cone(flex, radial):
+    limits = WRIST_LIMITS_DEG
+    return np.hypot(flex / np.where(flex >= 0, limits['flexion'], limits['extension']), radial / np.where(radial >= 0, limits['radial'], limits['ulnar']))
+
+
+def limit_wrist(flex, radial, pron):
+    """Angles (deg) moved into the limits: the swing scaled radially onto its cone, the twist clipped."""
+    scale = 1 / np.maximum(swing_cone(flex, radial), 1)
+    return flex * scale, radial * scale, np.clip(pron, -WRIST_LIMITS_DEG['supination'], WRIST_LIMITS_DEG['pronation'])
+
+
+def wrist_local(flex, radial, pron, rest, h):
+    """Wrist-local rotation matrices from (flexion, radial, pronation) degrees; inverse of wrist_angles."""
+    t, ez, ey = wrist_basis(rest, h); s = 1. if h == 0 else -1.
+    f, r, p = (np.deg2rad(np.asarray(x, float)).ravel() for x in (flex, radial, pron))
+    swing = Rotation.from_rotvec(-s * f[:, None] * ez - s * r[:, None] * ey)
+    return (swing * Rotation.from_rotvec(s * p[:, None] * t)).as_matrix().reshape(np.shape(flex) + (3, 3))
+
+
+def clamp_wrist(local, rest, h):
+    """Wrist-local rotations pulled into WRIST_LIMITS_DEG; frames already inside are returned unchanged."""
+    local = np.asarray(local, float)
+    angles = wrist_angles(local, rest, h); limited = limit_wrist(*angles)
+    outside = (limited[0] != angles[0]) | (limited[2] != angles[2])
+    out = local.copy()
+    if outside.any():out[outside] = wrist_local(*(x[outside] for x in limited), rest, h)
+    return out
+
+
+def angle_between(a, b):
+    return np.rad2deg(np.arccos(np.clip((unit(a) * unit(b)).sum(-1), -1, 1)))
+
+
+def rotation_angle(a, b):
+    """Angle in degrees of a^T b for stacks of rotation matrices."""
+    trace = np.einsum('...ji,...ji->...', a, b)
+    return np.rad2deg(np.arccos(np.clip((trace - 1) / 2, -1, 1)))
+
+
+def limb_segments(tj):
+    """Bone segments (joint, joint) adjacent to the target joint; 'palm' is the target hand's palm point."""
+    from .correction import PARENTS
+    if tj in (20, 21):return [(ARMS[tj - 20][2], tj), (tj, 'palm')]
+    return ([(PARENTS[tj], tj)] if PARENTS[tj] >= 0 else []) + ([(tj, CHILD[tj])] if tj in CHILD else [])
+
+
+def grip_geometry(rest, root, q, offsets, tj, point, segment=None):
+    """Palm-facing direction n (target point toward the limb axis), the limb axis d and the chosen segment on pose q."""
+    from .correction import fk
+    jj, gg = fk(rest, root, q); pp, _, _ = palms(rest, root, q, offsets)
+    at = lambda k: pp[:, tj - 20] if k == 'palm' else jj[:, k]
+    segments = limb_segments(tj)
+    if segment is None:
+        def distance(a, b):
+            along = np.clip(((point - a) * (b - a)).sum(1) / np.maximum(((b - a) ** 2).sum(1), 1e-12), 0, 1)
+            return np.median(np.linalg.norm(point - a - along[:, None] * (b - a), axis=1))
+        segment = int(np.argmin([distance(at(a), at(b)) for a, b in segments]))
+    a, b = (at(k) for k in segments[segment])
+    d = unit(b - a)
+    toward = a + ((point - a) * d).sum(1, keepdims=True) * d - point
+    joint = jj[:, tj] - point
+    n = np.where(np.linalg.norm(toward, axis=1, keepdims=True) > .005, unit(toward), unit(joint))
+    return n, d, segment, jj, gg
+
+
+def viterbi(unary, transition):
+    """Index path minimising the summed per-frame costs (m, k) plus transition costs (k, k) between frames."""
+    m, k = unary.shape; cost = unary[0].copy(); back = np.zeros((m, k), int)
+    for i in range(1, m):
+        total = cost[:, None] + transition
+        back[i] = total.argmin(0); cost = total[back[i], np.arange(k)] + unary[i]
+    path = np.empty(m, int); path[-1] = int(cost.argmin())
+    for i in range(m - 1, 0, -1):path[i - 1] = back[i, path[i]]
+    return path
+
+
+def wrist_grid():
+    """(k, 3) coarse (flexion, radial, pronation) samples inside the wrist limits."""
+    limits = WRIST_LIMITS_DEG
+    grid = np.stack(np.meshgrid(np.linspace(-limits['extension'], limits['flexion'], GRIP_GRID_STEPS[0]),
+                                np.linspace(-limits['ulnar'], limits['radial'], GRIP_GRID_STEPS[1]),
+                                np.linspace(-limits['supination'], limits['pronation'], GRIP_GRID_STEPS[2]), indexing='ij'), -1).reshape(-1, 3)
+    return grid[swing_cone(grid[:, 0], grid[:, 1]) <= 1 + 1e-9]
+
+
+def grip_cost(forearm, palm_local, finger_local, n, wrap, usable):
+    """Palm-facing error plus weighted finger-wrap error (deg) for forearms (m, 3, 3) and wrist candidates (..., k, 3)."""
+    palm = np.einsum('tij,t...kj->t...ki', forearm, palm_local)
+    fingers = np.einsum('tij,t...kj->t...ki', forearm, finger_local)
+    shape = (len(n),) + (1,) * (palm.ndim - 2) + (3,)
+    miss = angle_between(fingers, wrap.reshape(shape)) * usable.reshape(shape[:-1])
+    return angle_between(palm, n.reshape(shape)) + GRIP_FINGER_WEIGHT * miss
+
+
+def grip_wrist(rest, h, forearm, n, d, sign, fps):
+    """Wrist world rotations inside the limits with the palm normal closest to n and the fingers around the limb axis d.
+
+    Viterbi over a coarse grid of the limit space (penalising wrist change between frames, so the twist never flips),
+    then smoothing and a local refinement in angle space, where averaging stays inside the convex limits.
+    """
+    t = forearm_axis(rest, h); m = len(n)
+    around = np.cross(d, n); usable = (np.linalg.norm(around, axis=1) > 1e-6).astype(float); wrap = sign * unit(around)
+    grid = wrist_grid(); local = wrist_local(grid[:, 0], grid[:, 1], grid[:, 2], rest, h)
+    unary = grip_cost(forearm, np.broadcast_to(local @ PALM_NORMAL, (m,) + grid.shape), np.broadcast_to(local @ t, (m,) + grid.shape), n, wrap, usable)
+    path = viterbi(unary, GRIP_STEP_WEIGHT * rotation_angle(local[:, None], local[None]))
+    sigma = max(.5, fps * .05)
+    angles = gaussian_filter1d(grid[path], sigma, axis=0, mode='nearest')
+    spacing = np.array([np.ptp(grid[:, i]) / (GRIP_GRID_STEPS[i] - 1) for i in range(3)]) / 2
+    steps = np.stack(np.meshgrid(*[(-1., 0., 1.)] * 3, indexing='ij'), -1).reshape(-1, 3)
+    for scale in (1., .5, .25):
+        trial = np.stack(limit_wrist(*np.moveaxis(angles[:, None] + steps * spacing * scale, -1, 0)), -1)
+        candidates = wrist_local(trial[..., 0], trial[..., 1], trial[..., 2], rest, h)
+        cost = grip_cost(forearm, candidates @ PALM_NORMAL, candidates @ t, n, wrap, usable)
+        angles = trial[np.arange(m), cost.argmin(1)]
+    angles = np.stack(limit_wrist(*gaussian_filter1d(angles, sigma / 2, axis=0, mode='nearest').T), -1)
+    return forearm @ wrist_local(angles[:, 0], angles[:, 1], angles[:, 2], rest, h)
+
+
+def swivel_arm(rest, root, q, h, degrees):
+    """Rotate the arm about its shoulder-wrist line by degrees per frame; wrist position and world rotation are kept."""
+    from .correction import fk
+    j, g = fk(rest, root, q); collar, shoulder, elbow, wrist = ARMS[h]
+    spin = Rotation.from_rotvec(unit(j[:, wrist] - j[:, shoulder]) * np.deg2rad(degrees)[:, None]).as_matrix()
+    out = q.copy()
+    out[:, shoulder] = matrix_quat(g[:, collar].swapaxes(-1, -2) @ spin @ g[:, shoulder])
+    out[:, wrist] = matrix_quat((spin @ g[:, elbow]).swapaxes(-1, -2) @ g[:, wrist])
+    return out
+
+
+def grip_swivel(rest, h, j, g, n, d, sign, fps):
+    """Per-frame arm swivel (deg) that lets the limited wrist face the palm best, penalised by size and change."""
+    _, shoulder, elbow, wrist = ARMS[h]; t = forearm_axis(rest, h)
+    around = np.cross(d, n); usable = (np.linalg.norm(around, axis=1) > 1e-6).astype(float); wrap = sign * unit(around)
+    grid = wrist_grid(); local = wrist_local(grid[:, 0], grid[:, 1], grid[:, 2], rest, h)
+    axis = unit(j[:, wrist] - j[:, shoulder]); unary = np.empty((len(n), len(SWIVELS_DEG)))
+    for i, degrees in enumerate(SWIVELS_DEG):
+        forearm = Rotation.from_rotvec(axis * np.deg2rad(degrees)).as_matrix() @ g[:, elbow]
+        shape = (len(n),) + grid.shape
+        cost = grip_cost(forearm, np.broadcast_to(local @ PALM_NORMAL, shape), np.broadcast_to(local @ t, shape), n, wrap, usable)
+        unary[:, i] = cost.min(1) + SWIVEL_WEIGHT * abs(degrees)
+    path = viterbi(unary, SWIVEL_STEP_WEIGHT * np.abs(SWIVELS_DEG[:, None] - SWIVELS_DEG[None]))
+    return gaussian_filter1d(SWIVELS_DEG[path].astype(float), max(.5, fps * .1), mode='nearest')
+
+
+def set_wrist_world(rest, root, q, h, world):
+    from .correction import fk
+    _, g = fk(rest, root, q); out = q.copy(); _, _, elbow, wrist = ARMS[h]
+    out[:, wrist] = matrix_quat(g[:, elbow].swapaxes(-1, -2) @ world)
+    return out
+
+
+def grip_arms(rest, root, prior, solved, offsets, fps, lo, goals, hands, h, tj, inside):
+    """Turn the palm to the target limb, re-solve the arm so the moved palm point reaches the goal, clamp the wrist."""
+    from .correction import fk
+    _, _, elbow, wrist = ARMS[h]
+    n, d, segment, jj, gg = grip_geometry(rest, root, solved, offsets, tj, goals[h])
+    around = np.cross(d, n); fingers = gg[:, wrist] @ forearm_axis(rest, h)
+    sign = 1. if np.median((fingers * around).sum(1)[inside]) >= 0 else -1.
+    swivel = grip_swivel(rest, h, jj, gg, n, d, sign, fps)
+    arm = swivel_arm(rest, root, solved, h, swivel)
+    for iteration in range(1, 4):
+        _, ga = fk(rest, root, arm)
+        world = grip_wrist(rest, h, ga[:, elbow], n, d, sign, fps)
+        # The planner starts from the gripping arm, so it only corrects the palm point moved by the new wrist rotation.
+        graspable = set_wrist_world(rest, root, arm, h, world)
+        full = prior.copy(); full[lo:lo + len(root)] = graspable
+        solved, report = solve_arms(rest, root, graspable, full, offsets, fps, lo, goals, ARM_CONFIG)
+        solved, clamped = clamp_elbows(rest, root, solved, hands)
+        n, d, _, _, gg = grip_geometry(rest, root, solved, offsets, tj, goals[h], segment)
+        local = gg[:, elbow].swapaxes(-1, -2) @ gg[:, wrist]
+        excess = rotation_angle(local, clamp_wrist(local, rest, h))
+        if excess.max() < .5:break
+        arm = solved
+    outside = np.flatnonzero(excess > 1e-4)
+    if len(outside):
+        solved = solved.copy(); solved[outside, wrist] = matrix_quat(clamp_wrist(local[outside], rest, h))
+    return solved, report, clamped, dict(iterations=iteration, finger_side=int(sign), final_wrist_clamp_max_deg=float(excess.max()),
+                                         arm_swivel_max_deg=float(np.abs(swivel).max()), arm_swivel_frames=int((np.abs(swivel) > .5).sum()))
+
+
+def joint_name(k):
+    from .mixamo_rig import BODY_NAMES
+    return 'palm' if k == 'palm' else BODY_NAMES[k]
+
+
+def wrist_report(rest, h, start_g, final_g, changed):
+    _, _, elbow, wrist = ARMS[h]; limits = WRIST_LIMITS_DEG
+    out = {}
+    for label, g in (('source', start_g), ('result', final_g)):
+        flex, radial, pron = wrist_angles(g[:, elbow].swapaxes(-1, -2) @ g[:, wrist], rest, h)
+        f, r, p = flex[changed], radial[changed], pron[changed]
+        cone = swing_cone(f, r)
+        at_limit = (cone > .99) | (p > limits['pronation'] - .5) | (p < .5 - limits['supination'])
+        out[label] = dict(flexion_max_deg=float(max(f.max(), 0)), extension_max_deg=float(max(-f.min(), 0)), radial_max_deg=float(max(r.max(), 0)),
+                          ulnar_max_deg=float(max(-r.min(), 0)), pronation_max_deg=float(max(p.max(), 0)), supination_max_deg=float(max(-p.min(), 0)),
+                          swing_cone_max=float(cone.max()), frames_at_limit=int(at_limit.sum()), frames_outside_limits=int(((cone > 1.001) |
+                          (p > limits['pronation'] + .1) | (p < -limits['supination'] - .1)).sum()))
+    out['limits_deg'] = dict(limits)
+    return out
+
+
+def grip_shape(rest, h):
+    """(15, 3, 3) local finger rotations of the grip in MANO order; rest holds the full SMPL-X (55) or SMPL-H (52) joints."""
+    first = (25 if len(rest) == 55 else 22) + 15 * h
+    out = np.empty((15, 3, 3))
+    for k in range(15):
+        j = first + k; segment = k % 3
+        direction = rest[j + 1] - rest[j] if segment < 2 else rest[j] - rest[j - 1]
+        axis = unit(np.cross(direction, PALM_NORMAL))
+        out[k] = Rotation.from_rotvec(axis * np.deg2rad(FINGER_CURL_DEG[k // 3][segment])).as_matrix()
+    return out
+
+
+def curl_fingers(current, target, weights):
+    """Slerp (m, 15, 3, 3) finger rotations toward the grip target by per-frame weights."""
+    q0 = Rotation.from_matrix(current.reshape(-1, 3, 3)).as_quat()[:, [3, 0, 1, 2]].reshape(len(current), 15, 4)
+    q1 = np.broadcast_to(Rotation.from_matrix(target).as_quat()[:, [3, 0, 1, 2]], q0.shape)
+    return quat_matrix(slerp(q0, q1, np.repeat(weights[:, None], 15, 1)))
+
+
 def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_ranges):
     from .correction import fk
     from .contact_arm_plan import source_reach_gap
@@ -278,6 +554,14 @@ def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_range
     prior = np.asarray(quats, float).copy(); prior[lo:hi] = work
     solved, arm_report = solve_arms(rest, root, work, prior, offsets, fps, lo, arm_goals, ARM_CONFIG)
     solved, clamped = clamp_elbows(rest, root, solved, hands)
+    facing, _, segment, _, gs = grip_geometry(rest, root, solved, offsets, tj, arm_goals[h])
+    palm_before = angle_between(gs[:, ARMS[h][3]] @ PALM_NORMAL, facing)[inside]
+    grip = 'off'
+    if track['grip'] == 'auto':
+        solved, arm_report, clamped, grip = grip_arms(rest, root, prior, solved, offsets, fps, lo, arm_goals, hands, h, tj, inside)
+        # The gripping wrist is slerped in local space like the arm; only other distal joints keep their source world frame.
+        distal.remove(ARMS[h][3])
+        grip.update(mode='auto', fingers=dict(hand=h, window=[int(lo), int(hi)], contact=[int(a), int(b)], ease=int(ease), curl=GRIP_CURL.get(part, .5)))
     final = blend(rest, root, start, solved, weights, sorted(set(joints)), distal)
     j0, g0 = fk(rest, root, start); js, _ = fk(rest, root, solved)
     # Slerping twisted elbow frames can straighten past both ends; never end straighter than the limit or the source.
@@ -309,7 +593,13 @@ def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_range
                  arm_solver=[dict(hand=r['hand'], iterations=r['iterations'], success=r['success'], reach_gap_max_m=r['reach_gap_max_m'],
                                   reach_gain_min=r['reach_gain_min'], selected_elbow_limit_deg=r['selected_elbow_limit_deg'])
                              for r in arm_report.get('hands', [])],
-                 grip='not implemented' if track['grip'] != 'off' else 'off')
+                 grip=grip)
+    facing, _, _, _, _ = grip_geometry(rest, root, final, offsets, tj, arm_goals[h], segment)
+    palm_after = angle_between(gf[:, ARMS[h][3]] @ PALM_NORMAL, facing)[inside]
+    entry['palm_facing_deg'] = dict(before_median=float(np.median(palm_before)), before_max=float(palm_before.max()),
+                                    after_median=float(np.median(palm_after)), after_max=float(palm_after.max()),
+                                    limb_axis=[joint_name(k) for k in limb_segments(tj)[segment]])
+    entry['wrist'] = wrist_report(rest, h, g0, gf, changed)
     if 'reciprocal' in entry and part in LEG_PARTS:
         leg = side
         entry['reciprocal']['knee_interior_max_deg'] = float(interior(*(jf[:, LEGS[leg][i]] for i in range(3)))[changed].max())
@@ -324,7 +614,7 @@ def apply(rest, out_roots, out_quats, offsets, fps, tracks, foot_ranges, emit=la
     work = [(t, r) for t in tracks if t.get('enabled', True) for r in t['ranges']]
     if not work:return None
     started = time.perf_counter(); rest = np.asarray(rest, float)[:22]; offsets = np.asarray(offsets, float)
-    entries = []; changed = []; warnings = []
+    entries = []; changed = []; warnings = []; wrists = []; fingers = []
     for index, (track, interval) in enumerate(work):
         update, entry = solve_interval(rest, out_roots, out_quats, offsets, fps, track, interval, foot_ranges)
         entries.append(entry)
@@ -332,6 +622,9 @@ def apply(rest, out_roots, out_quats, offsets, fps, tracks, foot_ranges, emit=la
             s, e, joints, values = update
             out_quats[s:e, joints] = values[:, joints].astype(out_quats.dtype)
             changed.append(dict(joints=[int(x) for x in joints], start=int(s), end=int(e)))
+            if isinstance(entry['grip'], dict):
+                wrists.append(dict(joint=ARMS[entry['grip']['fingers']['hand']][3], start=int(s), end=int(e)))
+                fingers.append(entry['grip']['fingers'])
             if entry['residual_max_m'] > .03:
                 warnings.append('%s -> %s %d-%d: palm stays up to %.1f cm from its target.' % (
                     track['effector'], track['target'], interval[0], interval[1] - 1, 100 * entry['residual_max_m']))
@@ -339,9 +632,9 @@ def apply(rest, out_roots, out_quats, offsets, fps, tracks, foot_ranges, emit=la
                 warnings.append('%s -> %s %d-%d: a foot lock kept the target leg still on %d frames.' % (
                     track['effector'], track['target'], interval[0], interval[1] - 1, entry['reciprocal']['foot_lock_conflict_frames']))
         emit('progress', stage='correct', current=index + 1, total=len(work), phase='self_contact', message='Motion Correction: solving self-contacts')
-    grip = sorted({t['id'] for t, _ in work if t.get('grip', 'off') != 'off'})
+    # wrist_changed declares the only rows whose wrist world rotation may differ from the source (grip).
     return dict(method=METHOD, tracks=entries, changed=changed, seconds=time.perf_counter() - started,
-                grip_not_implemented=grip, warning=' '.join(['Self-contact: ' + w for w in warnings]))
+                wrist_changed=wrists, fingers=fingers, warning=' '.join(['Self-contact: ' + w for w in warnings]))
 
 
 def from_store(project, base, context, rest, out_roots, out_quats, offsets, fps, segments, emit=lambda *a, **k: None):
@@ -355,6 +648,17 @@ def from_store(project, base, context, rest, out_roots, out_quats, offsets, fps,
     report['revision'] = revision
     report['warning'] = ' '.join(filter(None, (report['warning'], warning)))
     return report, (before if report['changed'] else None)
+
+
+def audit_exemptions(report, preserved):
+    """(start, end, column ids) of the export upper-body audit a self-contact report exempts, columns indexing preserved.
+
+    Changed arm joints are exempt on their rows; a wrist (whose world rotation is otherwise kept) only on wrist_changed rows.
+    """
+    report = report or {}
+    rows = [(c['start'], c['end'], [preserved.index(j) for j in c['joints'] if j in preserved and j not in (20, 21)]) for c in report.get('changed', [])]
+    return rows + [(c['start'], c['end'], [preserved.index(c['joint'])]) for c in report.get('wrist_changed', [])
+                   if c['joint'] in (20, 21) and c['joint'] in preserved]
 
 
 def unwritten(changed, written):
@@ -389,3 +693,65 @@ def publish_rot6d(output, params, matrices, before, changed, written):
             if j in written:prior[0, s:e, j] = torch.from_numpy(quat_matrix(before[s:e, j])[:, :, :2].reshape(e - s, 6).astype(np.float32))
             else:prior[0, s:e, j] = params['rot6d'][0, s:e, j]
     return prior
+
+
+def finger_rows(spec):
+    """(frame ids, weights) of a finger spec; only frames with a positive weight are written."""
+    lo, hi = spec['window']
+    weights = ease_weights(lo, hi, *spec['contact'], spec['ease']) * spec['curl']
+    ids = np.flatnonzero(weights > 0)
+    return lo + ids, weights[ids]
+
+
+def note_fingers(spec, applied, before=None, after=None, note=None):
+    spec['applied'] = applied
+    if note:spec['note'] = note
+    if applied:
+        spec['joint_change_max_deg'] = float(rotation_angle(before, after).max())
+        spec['frames'] = int(len(before))
+
+
+def publish_fingers_smplx(output, params, report, rest, mean):
+    """Blend the grip into 45-D SMPL-X hand poses (residuals to the hand mean); return the source hand fields replaced.
+
+    rest is the full 55-joint SMPL-X rest and mean the (55, 3) pose mean, whose rows 25-39 / 40-54 are the hand means.
+    """
+    import torch
+    replaced = {}
+    for spec in (report or {}).get('fingers', []):
+        h = spec['hand']; field = ('left', 'right')[h] + '_hand_pose'; value = params.get(field)
+        if value is None or value.shape[-1] != 45 or len(rest) != 55:
+            note_fingers(spec, False, note='no 45-D finger rotations in this result; fingers unchanged')
+            continue
+        if field not in replaced:
+            replaced[field] = params[field]; output[field] = params[field].clone()
+        ids, weights = finger_rows(spec); ids = torch.from_numpy(ids)
+        hand_mean = np.asarray(mean, float)[25 + 15 * h:40 + 15 * h]
+        current = Rotation.from_rotvec((output[field][ids].double().numpy().reshape(-1, 15, 3) + hand_mean).reshape(-1, 3)).as_matrix().reshape(-1, 15, 3, 3)
+        curled = curl_fingers(current, grip_shape(rest, h), weights)
+        values = Rotation.from_matrix(curled.reshape(-1, 3, 3)).as_rotvec().reshape(-1, 15, 3) - hand_mean
+        output[field][ids] = torch.from_numpy(values.reshape(-1, 45).astype(np.float32))
+        note_fingers(spec, True, current, curled)
+    return replaced
+
+
+def rot6d_matrix(x):
+    """FlowHMR rot6d (first two matrix columns, row-major (3, 2)) to rotation matrices."""
+    x = np.asarray(x, float).reshape(np.shape(x)[:-1] + (3, 2))
+    b1 = unit(x[..., 0]); b2 = unit(x[..., 1] - (b1 * x[..., 1]).sum(-1, keepdims=True) * b1)
+    return np.stack((b1, b2, np.cross(b1, b2)), -1)
+
+
+def publish_fingers_rot6d(output, report, rest):
+    """SMPL-H variant: blend the grip into output['rot6d'] finger joints 22-36 (left) / 37-51 (right) in place."""
+    import torch
+    for spec in (report or {}).get('fingers', []):
+        h = spec['hand']; rot6d = output['rot6d']
+        if rot6d.shape[2] < 52 or len(rest) != 52:
+            note_fingers(spec, False, note='no finger joints in this result; fingers unchanged')
+            continue
+        ids, weights = finger_rows(spec); ids = torch.from_numpy(ids); joints = slice(22 + 15 * h, 37 + 15 * h)
+        current = rot6d_matrix(rot6d[0, ids, joints].double().numpy())
+        curled = curl_fingers(current, grip_shape(rest, h), weights)
+        rot6d[0, ids, joints] = torch.from_numpy(curled[..., :2].reshape(len(ids), 15, 6).astype(np.float32))
+        note_fingers(spec, True, current, curled)
