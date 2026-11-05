@@ -231,6 +231,21 @@ class VideoGripTest(unittest.TestCase):
         self.assertEqual(sc.rotation_angle(g0[outside, 21], g1[outside, 21]).max(), 0.)
 
 
+class VideoArmTest(unittest.TestCase):
+    def test_elbow_position_separates_swivels_the_direction_cannot(self):
+        # Two elbows in the same 2D direction from the shoulder; only the one on the video elbow costs nothing.
+        rows = np.arange(2); video = FakeVideo(2); shoulder = np.array([[-.2, 1.4, 0.]] * 2)
+        seen = np.array([[-.45, 1.4, 0.]] * 2); far = shoulder + (seen - shoulder) * .4
+        video.keypoints[rows[:, None], [6, 8], :2] = video.project(np.stack([shoulder, seen], 1), rows)
+        candidates = np.stack([seen, far], 1)
+        direction = sc.video_arm_cost(video, 1, rows, shoulder, candidates)
+        np.testing.assert_allclose(direction, 0., atol=1e-6)
+        aligned = (np.zeros((2, 2)), np.full(2, 300.))
+        position = sc.video_arm_cost(video, 1, rows, shoulder, candidates, aligned)
+        self.assertLess(position[0, 0], 1e-6)
+        self.assertGreater(position[0, 1], 5.)
+
+
 class FingerCurlTest(unittest.TestCase):
     def test_fingers_stop_at_the_skin(self):
         skin = synthetic_skin()

@@ -93,8 +93,10 @@ ARM_HINGES = ((0., -1., 0.), (0., 1., 0.))
 # Hand search on a skin anchor (costs in degrees of wrist excess): hand roll candidates about the palm normal and arm swivel
 # candidates (deg), cost per degree of roll away from the solved hand and of roll change between frames (swivels use
 # SWIVEL_WEIGHT / SWIVEL_STEP_WEIGHT), the part of the forearm (from the elbow) checked against the target limb's capsules,
-# reach used of the straight arm, the 2D video hand- and upper-arm-direction weights (per degree), the cost of fingers along
-# the limb instead of across it, and the cost per metre of capsule clearance short of ARM_CLEARANCE_M.
+# reach used of the straight arm, the 2D video hand- and upper-arm-direction weights (per degree), the video elbow position
+# weight (per torso length of 2D miss), the cost of fingers along the limb instead of across it, and the cost per metre of
+# capsule clearance short of ARM_CLEARANCE_M. A bent elbow seen end-on looks straight in the video: only the elbow position
+# tells the swivel that points it at the camera from one that lifts it beside the head.
 HAND_ROLLS_DEG = np.arange(0., 360., 30.)
 HAND_SWIVELS_DEG = np.arange(-180., 180., 15.)
 HAND_ROLL_WEIGHT = .01
@@ -103,6 +105,7 @@ FOREARM_REACH = .75
 REACH_FRACTION = .995
 VIDEO_ROLL_WEIGHT = .3
 VIDEO_ARM_WEIGHT = .5
+VIDEO_ELBOW_POSITION_WEIGHT = 40.
 HAND_WRAP_WEIGHT = 20.
 CAPSULE_COST_PER_M = 3000.
 CAPSULE_BONES = {'thigh': ((1, 4), (2, 5)), 'shin': ((4, 7), (5, 8)), 'foot': ((7, 10), (8, 11)), 'upperarm': ((16, 18), (17, 19)),
@@ -1171,20 +1174,19 @@ def wrist_excess(rest, h, upper, forearm, hand):
     return (excess + .02 * np.rad2deg(np.abs(rolls)) + np.maximum(np.abs(twist) - ELBOW_TWIST_DEG, 0)).min(-1)
 
 
-def hand_search(rest, skin, root, q, h, goal, inward, limb, offsets, fps, active, clear_names, video=None, rows=None, angles=None, video_hand=False):
-    """Lay the palm on the skin at the goal and pick, per frame, the hand's roll about the palm normal and the arm swivel.
+def wrap_deg(a):
+    return np.abs((a + 180) % 360 - 180)
 
-    The wrist sits where the rolled hand puts the palm point on the goal; the arm reaches it from the solved shoulder (arm_pose).
-    Costs: the wrist outside its limits (after the best forearm roll), fingers along the limb axis (limb (m, 3)) rather than
-    around it, forearm / upper-arm capsules closer than ARM_CLEARANCE_M to the target limb's, a shortfall of reach, degrees
-    away from the solved hand and elbow, and with video the 2D upper-arm direction (video_hand: also the 2D hand direction).
-    Costs are evaluated on every other active frame and interpolated; a Viterbi path over (roll, swivel) keeps both
-    continuous. angles (roll, swivel rad (m,)) from an earlier call skip the search. Only active frames change.
-    Returns (quats, report, angles).
-    """
-    from .correction import fk
-    collar, shoulder, elbow, wrist = ARMS[h]
-    j, g = fk(rest, root, q); m = len(root)
+
+def hand_prior():
+    """(rolls, swivels) cost of hand roll and arm swivel candidates away from the solved hand and elbow."""
+    return HAND_ROLL_WEIGHT * wrap_deg(HAND_ROLLS_DEG)[:, None] + SWIVEL_WEIGHT * wrap_deg(HAND_SWIVELS_DEG)[None]
+
+
+def palm_frames(rest, g, h, inward):
+    """hands(ids, roll) -> (hand world rotations, long axes) of frames ids with the palm facing inward (m, 3), rolled by roll
+    (rad, (len(ids),) or (len(ids), k)) about the palm normal from the wrist's current long axis."""
+    wrist = ARMS[h][3]
     t = forearm_axis(rest, h); n = unit(inward)
     palm = unit(PALM_NORMAL - (PALM_NORMAL @ t) * t); rest_basis = np.stack([t, palm, np.cross(t, palm)], -1)
     ref = g[:, wrist] @ t; ref = ref - (ref * n).sum(1, keepdims=True) * n
@@ -1193,15 +1195,53 @@ def hand_search(rest, skin, root, q, h, goal, inward, limb, offsets, fps, active
     ref = unit(ref); side = np.cross(ref, n)
 
     def hands(ids, roll):
-        """Hand world rotations and long axes of frames ids for rolls (len(ids),) or (len(ids), k)."""
         pad = (slice(None),) + (None,) * (np.ndim(roll) - 1)
         along = np.cos(roll)[..., None] * ref[ids][pad] + np.sin(roll)[..., None] * side[ids][pad]
         normal = np.broadcast_to(n[ids][pad], along.shape)
         return np.stack([along, normal, np.cross(along, normal)], -1) @ rest_basis.T, along
+    return hands
+
+
+def video_arm_score(video, h, rows):
+    kp = video.keypoints[rows][:, [5 + h, 7 + h]]
+    return np.clip((kp[:, :, 2].min(1) - HAND_SCORE_LOW) / (HAND_SCORE - HAND_SCORE_LOW), 0, 1)
+
+
+def video_arm_cost(video, h, rows, shoulder, elbows, aligned=None):
+    """Video upper-arm cost of elbow candidates (m, ..., 3), scaled by the keypoint confidence: VIDEO_ARM_WEIGHT x the 2D angle
+    (deg) between the projected and the video shoulder -> elbow, plus with aligned (alignment offset px (m, 2), torso px (m,))
+    VIDEO_ELBOW_POSITION_WEIGHT x the projected elbow's distance (torso units) to the video elbow."""
+    kp = video.keypoints[rows][:, [5 + h, 7 + h]]; m = len(rows)
+    uv = video.project(np.concatenate([shoulder[:, None], elbows.reshape(m, -1, 3)], 1), rows)
+    pad = (m,) + (1,) * (elbows.ndim - 2)
+    cost = VIDEO_ARM_WEIGHT * angle_2d(uv[:, 1:] - uv[:, :1], (kp[:, 1, :2] - kp[:, 0, :2])[:, None]).reshape(elbows.shape[:-1])
+    if aligned is not None:
+        offset, torso = aligned
+        miss = np.linalg.norm(uv[:, 1:] + offset[:, None] - kp[:, 1:, :2], axis=-1) / torso[:, None]
+        cost = cost + VIDEO_ELBOW_POSITION_WEIGHT * miss.reshape(elbows.shape[:-1])
+    return video_arm_score(video, h, rows).reshape(pad) * cost
+
+
+def hand_search(rest, skin, root, q, h, goal, inward, limb, offsets, fps, active, clear_names, video=None, rows=None, angles=None, video_hand=False):
+    """Lay the palm on the skin at the goal and pick, per frame, the hand's roll about the palm normal and the arm swivel.
+
+    The wrist sits where the rolled hand puts the palm point on the goal; the arm reaches it from the solved shoulder (arm_pose).
+    Costs: the wrist outside its limits (after the best forearm roll), fingers along the limb axis (limb (m, 3)) rather than
+    around it, forearm / upper-arm capsules closer than ARM_CLEARANCE_M to the target limb's, a shortfall of reach, degrees
+    away from the solved hand and elbow, and with video the 2D upper-arm direction and elbow position (video_hand: also the 2D
+    hand direction).
+    Costs are evaluated on every other active frame and interpolated; a Viterbi path over (roll, swivel) keeps both
+    continuous. angles (roll, swivel rad (m,)) from an earlier call skip the search. Only active frames change.
+    Returns (quats, report, angles).
+    """
+    from .correction import fk
+    from .limb_placement import alignment
+    collar, shoulder, elbow, wrist = ARMS[h]
+    j, g = fk(rest, root, q); m = len(root)
+    hands = palm_frames(rest, g, h, inward)
     elbow_local = quat_matrix(q[:, elbow]); ids = np.flatnonzero(active)
     rolls = np.deg2rad(HAND_ROLLS_DEG); swivels = np.deg2rad(HAND_SWIVELS_DEG); k, s = len(rolls), len(swivels)
-    wrap = lambda a: np.abs((a + 180) % 360 - 180)  # noqa: E731
-    prior = HAND_ROLL_WEIGHT * wrap(HAND_ROLLS_DEG)[:, None] + SWIVEL_WEIGHT * wrap(HAND_SWIVELS_DEG)[None]
+    prior = hand_prior()
     if angles is None and len(ids):
         f = np.unique(np.r_[ids[::2], ids[-1]])
         hand, along = hands(f, np.broadcast_to(rolls, (len(f), k)))
@@ -1219,19 +1259,16 @@ def hand_search(rest, skin, root, q, h, goal, inward, limb, offsets, fps, active
                 cost = cost + CAPSULE_COST_PER_M * np.maximum(ARM_CLEARANCE_M - (segment_distance(start, end, P0, P1) - radius - own), 0)
         if video is not None:
             # The upper arm follows the video's shoulder -> elbow; grip auto also turns the hand to the video's wrist -> knuckle.
-            arm_kp = video.keypoints[rows[f]][:, [5 + h, 7 + h]]
-            arm_score = np.clip((arm_kp[:, :, 2].min(1) - HAND_SCORE_LOW) / (HAND_SCORE - HAND_SCORE_LOW), 0, 1)
-            uv = video.project(np.concatenate([j[f, shoulder][:, None], E.reshape(len(f), -1, 3)], 1), rows[f])
-            arm = angle_2d(uv[:, 1:] - uv[:, :1], (arm_kp[:, 1, :2] - arm_kp[:, 0, :2])[:, None]).reshape(len(f), k, s)
-            cost = cost + VIDEO_ARM_WEIGHT * arm_score[:, None, None] * arm
+            offset, torso = alignment(video, j, rows)
+            cost = cost + video_arm_cost(video, h, rows[f], j[f, shoulder], E, (offset[f], torso[f]))
             if video_hand:
                 kp, confidence, _ = video.hand(h, rows[f])
                 tip = video.project(np.stack([W[:, :, 0], W[:, :, 0] + along * .08], 2).reshape(len(f), -1, 3), rows[f]).reshape(len(f), k, 2, 2)
                 cost = cost + (VIDEO_ROLL_WEIGHT * confidence[:, None] * angle_2d(tip[:, :, 1] - tip[:, :, 0], (kp[:, 1] - kp[:, 0])[:, None]))[..., None]
         full = np.broadcast_to(prior, (m, k, s)).copy()
         full[ids] += np.stack([np.interp(ids, f, c) for c in cost.reshape(len(f), -1).T], 1).reshape(len(ids), k, s)
-        transition = HAND_ROLL_STEP_WEIGHT * wrap(HAND_ROLLS_DEG[:, None] - HAND_ROLLS_DEG[None])[:, None, :, None] + \
-            SWIVEL_STEP_WEIGHT * wrap(HAND_SWIVELS_DEG[:, None] - HAND_SWIVELS_DEG[None])[None, :, None]
+        transition = HAND_ROLL_STEP_WEIGHT * wrap_deg(HAND_ROLLS_DEG[:, None] - HAND_ROLLS_DEG[None])[:, None, :, None] + \
+            SWIVEL_STEP_WEIGHT * wrap_deg(HAND_SWIVELS_DEG[:, None] - HAND_SWIVELS_DEG[None])[None, :, None]
         pick_roll, pick_swivel = np.unravel_index(viterbi(full.reshape(m, -1), transition.reshape(k * s, k * s)), (k, s))
         sigma = max(.5, fps * .05)
         angles = tuple(gaussian_filter1d(np.unwrap(x), sigma, mode='nearest') for x in (rolls[pick_roll], swivels[pick_swivel]))
@@ -1247,7 +1284,7 @@ def hand_search(rest, skin, root, q, h, goal, inward, limb, offsets, fps, active
     out[ids, wrist] = matrix_quat((forearm.swapaxes(-1, -2) @ hand)[ids])
     out = limit_wrist_rows(rest, root, out, h, fps)
     report = dict(hand_roll_deg=[float(np.rad2deg(roll[ids]).min(initial=0)), float(np.rad2deg(roll[ids]).max(initial=0))],
-                  arm_swivel_max_deg=float(wrap(np.rad2deg(swivel[ids])).max(initial=0)), reach_short_max_m=float(short[ids].max(initial=0)),
+                  arm_swivel_max_deg=float(wrap_deg(np.rad2deg(swivel[ids])).max(initial=0)), reach_short_max_m=float(short[ids].max(initial=0)),
                   wrist_excess_max_deg=float(excess[ids].max(initial=0)), frames=int(len(ids)))
     if video is not None and rows is not None and len(ids):
         ok = ids[video.hand(h, rows[ids])[1] > 0]
