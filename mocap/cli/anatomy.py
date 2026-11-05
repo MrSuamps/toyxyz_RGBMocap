@@ -52,7 +52,7 @@ HAND_DIRECTION_DEG = 50.0
 HAND_EDGE_ON = 0.35             # |sin| of the wrist->knuckle vs knuckle-row angle below which the palm order is unreliable
 HAND_MIN_TORSO = 0.06
 PREFIX = dict(hyperextension='HX', locked_limb='LL', wrist_limit='WL', joint_twist='TW', joint_flip='JF', sudden_fold='SF', finger_pose='FG',
-              hand_orientation='HO', self_penetration='SP', contact_gap='CG')
+              hand_orientation='HO', self_penetration='SP', contact_gap='CG', sunk_hand='SH')
 # Skin interpenetration (posed SMPL-X mesh, segments by skinning weight): depth of one segment's vertices inside another.
 PENETRATION_M = 0.01
 PENETRATION_HIGH_M = 0.025
@@ -60,6 +60,24 @@ PENETRATION_HIGH_M = 0.025
 CONTACT_GAP_M = 0.015
 CONTACT_GAP_HIGH_M = 0.04
 SEGMENT_JOINT = dict(hand=(20, 21), forearm=(18, 19), upperarm=(16, 17), thigh=(1, 2), shin=(4, 5), foot=(7, 8))
+# A hand resting on the body that the model sank into it (contacts suggest): a penetration run of at least SUNK_SECONDS
+# reaching SUNK_DEPTH_M whose palm moves slowly in the target bone's frame. Measured on dance clips, resting hands move
+# 0.03-0.21 m/s (median) against the bone, faster runs 0.6-1.3 m/s. Those fast runs were all spins (hips or arm turning
+# 400-530 deg/s) with the hands on the hips or the arms crossed in the video: ExMR's arms lag a turning body, so with the
+# target turning faster than SUNK_TURN_DEG_S a fast run is still suggested, as low severity.
+SUNK_DEPTH_M = 0.02
+SUNK_SECONDS = 0.2
+SUNK_SPEED_M_S = 0.4
+SUNK_TURN_DEG_S = 250.0
+SUNK_GAP_SECONDS = 0.1          # penetration dips this short are bridged
+SUNK_PAD_SECONDS = 0.5          # the interval extends over adjacent frames with the hand skin on the target, up to this far
+HAND_REACH_M = 0.08             # wrist -> palm centre along the forearm, as review's missed-contact check
+# Bones a hand can hold per penetrated segment; the one nearest the palm is the target. A bone runs from its joint to the
+# child joint; end bones (no child) continue their parent bone's direction by SUNK_END_M (skull top, toes, fingers).
+# The head segment is always Head: hands on the side of the head sit level with the head joint, nearest the Neck bone's end.
+SUNK_BONES = dict(torso=('Hips', 'Spine', 'Spine1', 'Spine2', 'LeftShoulder', 'RightShoulder'), head=('Head',), thigh=('UpLeg',),
+                  shin=('Leg',), foot=('Foot', 'ToeBase'), forearm=('ForeArm',), upperarm=('Arm',), hand=('Hand',))
+SUNK_END_M = dict(Head=0.2, ToeBase=0.05, Hand=0.1)
 REVIEW_PREFIX = dict(missed_contact='MC', pose_error='PE', foot_slide='FS', floor_penetration='FP', jitter='JT', placement_drift='PD', body_offset='BO')
 SEVERITY = {'high': 0, 'medium': 1, 'low': 2, 'info': 3}
 
@@ -637,6 +655,120 @@ def check_self_penetration(pose, frames):
                                      f'{what} is {peak * 100:.1f} cm inside the {into} (median {median * 100:.1f} cm) on {count} frames',
                                      'push the contact out of the target skin (self-contact solver) or fix the limb placement',
                                      dict(smpl=(segment_joint(effector), segment_joint(target)), series={f'{what} in {into} cm': depth * 100})))
+    return issues
+
+
+def palm_points(pose, s):
+    """(N, 3) palm centre of hand s: the wrist moved HAND_REACH_M along the forearm."""
+    wrist = pose.joints[:, WRISTS[s]]
+    return wrist + HAND_REACH_M * unit(wrist - pose.joints[:, ELBOWS[s]])
+
+
+def turn_rate(world, fps):
+    """Median rotation speed (deg/s) of a bone over consecutive frames of its (n, 3, 3) world rotations."""
+    if len(world) < 2:
+        return 0.0
+    step = np.einsum('nji,njk->nik', world[:-1], world[1:])
+    angle = np.degrees(np.arccos(np.clip((np.trace(step, axis1=1, axis2=2) - 1) / 2, -1, 1)))
+    return float(np.median(angle)) * fps
+
+
+def sunk_target(pose, s, segment, palm, rows):
+    """(bone, joint) a hand on `segment` holds: of SUNK_BONES the one nearest the palm (median over rows), never its own arm."""
+    from ..mixamo_rig import BODY_NAMES, BODY_PARENTS
+    from ..self_contact import CHILD
+    from ..self_contact_store import arm_chain
+    side, _, part = segment.partition('_')
+    names = [side.capitalize() + name for name in SUNK_BONES[part]] if part else list(SUNK_BONES[segment])
+    names = [n for n in names if n not in arm_chain(SIDES[s].capitalize() + 'Hand')]
+    if len(names) == 1:
+        return names[0], BODY_NAMES.index(names[0])
+    best = None
+    for name in names:
+        joint = BODY_NAMES.index(name)
+        head, p = pose.joints[rows, joint], palm[rows]
+        if joint in CHILD:
+            axis = pose.joints[rows, CHILD[joint]] - head
+        else:
+            axis = SUNK_END_M[name.removeprefix('Left').removeprefix('Right')] * unit(head - pose.joints[rows, BODY_PARENTS[joint]])
+        t = np.clip(np.sum((p - head) * axis, 1) / np.maximum(np.sum(axis * axis, 1), 1e-12), 0, 1)
+        head = head + t[:, None] * axis
+        distance = float(np.median(np.linalg.norm(p - head, axis=1)))
+        if best is None or distance < best[0]:
+            best = (distance, name, joint)
+    return best[1], best[2]
+
+
+def check_sunk_hands(pose, frames, fps, rejected=None):
+    """Hands resting on the body but inside it, which review reports only as self_penetration: contacts to suggest.
+
+    A penetration run (dips of SUNK_GAP_SECONDS bridged) qualifies with SUNK_SECONDS of frames deeper than PENETRATION_M,
+    a peak of SUNK_DEPTH_M and a palm slower than SUNK_SPEED_M_S (median) in the target bone's frame, so a hand swinging
+    through the body is left out; a faster palm counts (low severity) only while the target turns faster than SUNK_TURN_DEG_S.
+    The interval then grows over adjacent frames where the hand skin stays within
+    CONTACT_GAP_M of the target, up to SUNK_PAD_SECONDS, and intervals of one pair less than SUNK_SECONDS apart join.
+    Issues carry `effector` and `target` bones; runs that fail are appended to `rejected` with the reason.
+    """
+    if pose.mesh is None:
+        return []
+    n = len(frames)
+    measured = pose.mesh.measure([pair for pair in penetration_pairs() if pair[0].endswith('_hand')])
+    minimum, bridge, pad = max(3, round(SUNK_SECONDS * fps)), max(1, round(SUNK_GAP_SECONDS * fps)), round(SUNK_PAD_SECONDS * fps)
+    issues = []
+    for (hand, (segment,)), (depth, _, gap) in measured.items():
+        flag = depth > PENETRATION_M
+        if not flag.any():
+            continue
+        s = SIDES.index(hand.partition('_')[0])
+        effector, palm = SIDES[s].capitalize() + 'Hand', palm_points(pose, s)
+        touching = flag | (np.nan_to_num(gap, nan=np.inf) <= CONTACT_GAP_M)
+        found = []
+        for a, b in runs(flag, bridge, 1):
+            count, peak = int(flag[a:b + 1].sum()), float(depth[a:b + 1].max())
+            name, joint = sunk_target(pose, s, segment, palm, np.flatnonzero(flag[a:b + 1]) + a)
+            # Palm path in the target bone's frame: a resting hand moves with the bone, a passing one through it.
+            local = np.einsum('nji,nj->ni', pose.world[a:b + 1, joint], palm[a:b + 1] - pose.joints[a:b + 1, joint])
+            speed = float(np.median(np.linalg.norm(np.diff(local, axis=0), axis=1))) * fps if b > a else 0.0
+            turn = turn_rate(pose.world[a:b + 1, joint], fps)
+            reason = (f'only {count} frames inside (fewer than {minimum})' if count < minimum else
+                      f'at most {peak * 100:.1f} cm deep (less than {SUNK_DEPTH_M * 100:.0f} cm)' if peak < SUNK_DEPTH_M else
+                      f'the palm moves {speed:.2f} m/s against the {name} (faster than {SUNK_SPEED_M_S} m/s) while it turns only {turn:.0f} deg/s'
+                      if speed > SUNK_SPEED_M_S and turn <= SUNK_TURN_DEG_S else None)
+            if reason:
+                if rejected is not None:
+                    rejected.append(dict(effector=effector, target=name, segment=segment, frames=[int(frames[a]), int(frames[b])], reason=reason))
+                continue
+            lo, hi = a, b
+            while lo > max(a - pad, 0) and touching[lo - 1]:
+                lo -= 1
+            while hi < min(b + pad, n - 1) and touching[hi + 1]:
+                hi += 1
+            # A lift shorter than a contact may be is no new contact: join it.
+            turning = speed > SUNK_SPEED_M_S
+            if found and found[-1]['target'] == name and lo - found[-1]['hi'] - 1 < minimum:
+                found[-1].update(hi=max(hi, found[-1]['hi']), cores=found[-1]['cores'] + [(a, b)], speed=max(speed, found[-1]['speed']),
+                                 turn=max(turn, found[-1]['turn']), turning=turning and found[-1]['turning'])
+            else:
+                found.append(dict(lo=lo, hi=hi, cores=[(a, b)], target=name, joint=joint, speed=speed, turn=turn, turning=turning))
+        for run in found:
+            core = np.zeros(n, bool)
+            for a, b in run['cores']:
+                core[a:b + 1] = flag[a:b + 1]
+            worst = int(np.argmax(np.where(core, depth, -1)))
+            peak, count, median = float(depth[worst]), int(core.sum()), float(np.median(depth[core]))
+            what, into = hand.replace('_', ' '), segment.replace('_', ' ')
+            severity = 'low' if run['turning'] else 'high' if peak >= PENETRATION_HIGH_M else 'medium'
+            how = (f'during a fast turn ({run["turn"]:.0f} deg/s, palm {run["speed"]:.2f} m/s against it: check the video)' if run['turning'] else
+                   f'moving with it ({run["speed"]:.2f} m/s)')
+            issue = make_issue('sunk_hand', severity, count * median, frames, run['lo'], run['hi'], worst, [hand, segment],
+                               dict(frames_flagged=count, depth_max_m=peak, depth_median_m=median, palm_speed_m_s_median=run['speed'],
+                                    target_turn_deg_s_median=run['turn'], penetration_frames=[[int(frames[a]), int(frames[b])] for a, b in run['cores']]),
+                               f'{effector} rests on the {run["target"]} but is {peak * 100:.1f} cm inside the {into} (median {median * 100:.1f} cm) '
+                               f'on {count} frames, {how}',
+                               'hold the hand on the skin: accept the suggested self-contact and run `correct`',
+                               dict(smpl=(segment_joint(hand), run['joint']), series={f'{what} in {into} cm': depth * 100}))
+            issue.update(effector=effector, target=run['target'])
+            issues.append(issue)
     return issues
 
 

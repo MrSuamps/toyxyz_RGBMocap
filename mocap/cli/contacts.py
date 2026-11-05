@@ -83,10 +83,12 @@ def register(commands, common):
                        help='remove every self-contact track (foot, placement and smoothing rows are kept unless the files are for other motion)')
     p.set_defaults(handler=cmd_remove)
 
-    p = actions.add_parser('suggest', parents=parents, help='run review\'s missed-contact check and store suggested intervals',
-                           description='Run the `review` missed-contact check and store each issue as a track\'s suggested '
-                                       '(automatic) intervals. Every run replaces all suggestions; --accept also adds them to the '
-                                       'tracks\' ranges, skipping frames another enabled track already holds with the same hand.')
+    p = actions.add_parser('suggest', parents=parents, help='find missed and sunk hand contacts and store suggested intervals',
+                           description='Run the `review` missed-contact check (hands touching in the video but apart in 3D) and find '
+                                       'hands resting inside the body (sustained, slow penetration of the SMPL-X mesh), and store '
+                                       'each as a track\'s suggested (automatic) intervals. Suggestions alone do not make the corrected '
+                                       'result stale. Every run replaces all suggestions; --accept also adds them to the tracks\' ranges, '
+                                       'skipping frames another enabled track already holds with the same hand.')
     p.add_argument('--accept', action='store_true', help='also copy the suggestions into the ranges that `correct` applies')
     p.add_argument('--min-severity', dest='min_severity', choices=SEVERITIES, default='low', help='ignore weaker issues (default low = all)')
     p.add_argument('--result', metavar='KIND', help='result to review (default: the uncorrected base, before any self-contact)')
@@ -599,7 +601,8 @@ def cmd_remove(args, session):
     return finish(store, session, 'remove', tracks, revision, removed=args.id)
 
 
-def review_issues(store, kind, session):
+def review_issues(store, kind, session, rejected=None):
+    """Ranked contacts to suggest: review's missed contacts plus hands resting sunk into the body (anatomy.check_sunk_hands)."""
     from . import review
     if store.model not in review.SOURCES:
         raise CliError(f'contacts suggest uses review, which supports {", ".join(review.SOURCES)} projects; this one is {store.model}.')
@@ -618,7 +621,21 @@ def review_issues(store, kind, session):
     if last < 2:
         raise CliError('Review needs at least 3 frames.')
     issues = review.check_missed_contacts(review.Context(obs, motion, 0, last))
-    return review.rank(issues)
+    return review.rank(issues + sunk_issues(store, kind, last, session, rejected))
+
+
+def sunk_issues(store, kind, last, session, rejected=None):
+    """anatomy.check_sunk_hands on the SMPL-X mesh of `kind` over frames 0-last; [] with a note when the mesh cannot be posed."""
+    import numpy as np
+    from . import anatomy
+    session.info(f'Measuring hands inside the body on {kind} ...')
+    try:
+        pose, _ = anatomy.load_project_pose(store.project, kind)
+    except (CliError, OSError, ValueError, KeyError, RuntimeError) as error:
+        session.say(f'note: hands resting inside the body were not checked ({error}).')
+        return []
+    frames = np.arange(last + 1)
+    return anatomy.check_sunk_hands(pose.rows(frames), frames, store.context['fps'], rejected)
 
 
 def cmd_suggest(args, session):
@@ -629,7 +646,8 @@ def cmd_suggest(args, session):
         raise CliError(f'Unknown result {kind!r}', EXIT_USAGE)
     tracks, _, _ = store.read(True)
     limit = SEVERITIES.index(args.min_severity)
-    issues = [i for i in review_issues(store, kind, session) if SEVERITIES.index(i['severity']) <= limit]
+    rejected = []
+    issues = [i for i in review_issues(store, kind, session, rejected) if SEVERITIES.index(i['severity']) <= limit]
     source = 'review:' + time.strftime('%Y-%m-%dT%H:%M')
     pairs = {}
     for issue in issues:
@@ -659,15 +677,30 @@ def cmd_suggest(args, session):
     tracks, revision = store.save(tracks, session)
     for issue in issues:
         session.info(f"  {issue['id']} [{issue['severity']}] {issue['effector']} -> {issue['target']} frames "
-                     f"{issue['frames'][0]}-{issue['frames'][1]} ({issue['metrics']['distance_3d_m_median']:.2f} m apart in 3D)")
+                     f"{issue['frames'][0]}-{issue['frames'][1]} ({evidence(issue)})")
+    for row in rejected:
+        session.info(f"  not suggested: {row['effector']} inside the {row['segment'].replace('_', ' ')} frames "
+                     f"{row['frames'][0]}-{row['frames'][1]}: {row['reason']}")
     for row in skipped:
         session.say(f"  not accepted for {row['effector']} -> {row['target']}: frames {row['frames_inclusive']} (hand already held by another track)")
     verb = 'Accepted' if args.accept else 'Suggested'
-    session.say(f'{verb} {len(issues)} missed contact(s) from {kind} into {len(touched)} track(s).'
+    sunk = sum(i['check'] == 'sunk_hand' for i in issues)
+    session.say(f'{verb} {len(issues) - sunk} missed contact(s) and {sunk} hand(s) resting inside the body from {kind} into {len(touched)} track(s).'
                 + ('' if args.accept or not issues else ' Accept with `contacts suggest --accept` or `contacts edit --id ID --accept`.'))
-    used = [dict(id=i['id'], severity=i['severity'], effector=i['effector'], target=i['target'], frames_inclusive=i['frames'],
-                 distance_3d_m_median=round(float(i['metrics']['distance_3d_m_median']), 3)) for i in issues]
-    return finish(store, session, 'suggest', tracks, revision, reviewed=kind, issues=used, accepted=args.accept, skipped=skipped)
+    used = [dict(id=i['id'], check=i['check'], severity=i['severity'], effector=i['effector'], target=i['target'], frames_inclusive=i['frames'],
+                 **({'depth_max_m': round(float(i['metrics']['depth_max_m']), 3)} if i['check'] == 'sunk_hand' else
+                    {'distance_3d_m_median': round(float(i['metrics']['distance_3d_m_median']), 3)})) for i in issues]
+    return finish(store, session, 'suggest', tracks, revision, reviewed=kind, issues=used, accepted=args.accept, skipped=skipped,
+                  not_suggested=rejected)
+
+
+def evidence(issue):
+    m = issue['metrics']
+    if issue['check'] == 'sunk_hand':
+        from .anatomy import SUNK_SPEED_M_S
+        how = 'during a fast turn' if m['palm_speed_m_s_median'] > SUNK_SPEED_M_S else 'resting'
+        return f"{m['depth_max_m'] * 100:.1f} cm inside the {issue['joints'][1].replace('_', ' ')}, {how}"
+    return f"{m['distance_3d_m_median']:.2f} m apart in 3D"
 
 
 # Foot articulation --------------------------------------------------------------------------------------------------

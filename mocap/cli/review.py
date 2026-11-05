@@ -549,11 +549,12 @@ def check_missed_contacts(ctx):
             worst = a + int(np.argmax(np.where(hit, gap3[span], -1)))
             bones = [pairs[i][1][3] for i in best[span][hit] if i >= 0]
             target_bone = max(set(bones), key=bones.count) if bones else targets[0][3]
-            effector = side + 'Hand'
+            effector, touched = side + 'Hand', name
             if kind == 'hand':
                 # Pin the hand whose 2D wrist error is larger; the other one is presumably right.
                 left, right = (np.nanmean(ctx.err[span, POSE_INDEX[f'{s}_wrist']]) for s in ('left', 'right'))
                 effector, target_bone = ('RightHand', 'LeftHand') if np.nan_to_num(right) > np.nan_to_num(left) else ('LeftHand', 'RightHand')
+                touched = target_bone
             gaps = gap3[span][hit]
             evidence = 'image' if float(np.median(gap_proj[span][hit])) > 0.4 else 'depth'
             count = int(hit.sum())
@@ -569,7 +570,7 @@ def check_missed_contacts(ctx):
                 metrics=dict(frames_flagged=count, distance_2d_torso_median=float(np.median(gap2[span][hit])),
                              distance_3d_m_median=float(np.median(gaps)), distance_3d_m_max=float(gaps.max()),
                              projected_distance_torso_median=float(np.median(gap_proj[span][hit])), **reach),
-                message=(f'{effector} touches {name} in the video ({np.median(gap2[span][hit]):.2f} torso apart in 2D) but is '
+                message=(f'{effector} touches {touched} in the video ({np.median(gap2[span][hit]):.2f} torso apart in 2D) but is '
                          f'{np.median(gaps):.2f} m away in 3D' + (' (separated mostly in depth)' if evidence == 'depth' else '')),
                 fix=dict(pins=pins), **({'fix_reach_note': note} if note else {}),
                 _draw=dict(pair=(pair[0], pair[1]), series={'2D torso': gap2, '3D m': gap3})))

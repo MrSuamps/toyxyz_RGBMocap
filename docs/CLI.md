@@ -293,7 +293,7 @@ are relabelled and listed under `keypoint_swaps`.
 
 | Check | Flags (runs of at least 3 frames, gaps of up to 2 bridged) | Suggested fix |
 | --- | --- | --- |
-| `missed_contact` | A wrist or hand is within 0.25 torso of a foot, the other hand, the head (0.25), a knee (0.20) or a hip (0.15) in 2D, but more than 0.15 m away in 3D (head 0.25 m, hip 0.22 m). | Hand pin onto the nearest bone. If the arm is too short to reach, `chain` 3 plus a second pin moving the target limb to the hand. |
+| `missed_contact` | A wrist or hand is within 0.25 torso of a foot, the other hand, the head (0.25), a knee (0.20) or a hip (0.15) in 2D, but more than 0.15 m away in 3D (head 0.25 m, hip 0.22 m). Between the hands the one with the larger 2D wrist error is pinned onto the other (`effector`, `target` and the message name that pair). | Hand pin onto the nearest bone. If the arm is too short to reach, `chain` 3 plus a second pin moving the target limb to the hand. |
 | `pose_error` | An arm (elbow, wrist) or leg (knee, ankle) differs from the keypoints by more than 0.35 torso after alignment. | None (re-run reconstruction or edit by hand). |
 | `foot_slide` | During ground contact, the slower of ankle and toe moves horizontally faster than 0.15 m/s. | `world` pin on that foot. |
 | `floor_penetration` | The ankle or toe joint is more than 1 cm below its resting height above the floor during contact. | None (`correct --pelvis-offset` / `--floor`). |
@@ -308,7 +308,7 @@ are relabelled and listed under `keypoint_swaps`.
 | `joint_flip` | An arm or leg flips: the upper or lower bone turns more than 45 deg in one frame against the torso, or the elbow / knee swings (while bent below 150 deg) or the hand / foot twists about the lower bone by more than 45 deg in one frame or 120 deg within 5 frames (per 1/30 s; scaled to the clip's fps). High from 150 deg or 1.5 times the step limit. Typically an IK / contact solve changing the elbow branch. | None (re-run `correct`). |
 | `finger_pose` | A finger joint is more than 10 deg past its flexion / spread / twist range (SMPL-X hand pose relative to the flat hand). | None. |
 | `hand_orientation` | On frames with confident hand keypoints, the 2D wrist-to-middle-knuckle direction differs by more than 50 deg from the motion, or the thumb and pinky sides are swapped. | None. |
-| `self_penetration` | On the posed SMPL-X mesh, a hand or forearm is more than 1 cm inside a leg, the head, the torso or the other arm, or the legs pass through each other (high from 2.5 cm). | None (self-contact solver or limb placement). |
+| `self_penetration` | On the posed SMPL-X mesh, a hand or forearm is more than 1 cm inside a leg, the head, the torso or the other arm, or the legs pass through each other (high from 2.5 cm). | None (self-contact solver or limb placement; `contacts suggest` proposes a contact for a hand resting inside the body). |
 | `contact_gap` | During an enabled self-contact interval the hand skin floats more than 1.5 cm from the target skin (high from a 4 cm median). | None (`correct` with the track enabled). |
 
 `suggested_fixes` contains the high and medium issues in rank order. A pin whose limb and ease window would overlap an
@@ -396,15 +396,28 @@ edits and shared with the app. The project needs a corrected result first (`corr
   frame, metres, default auto), `--reciprocal` (move the target limb too: `off`, `auto` when the arm cannot reach,
   `always`; default auto), `--grip` (`auto` turns the palm toward the target and wraps the fingers; default off).
 - One hand holds one target at a time: two enabled tracks of the same hand may not overlap in frames.
-- `suggest` runs the `review` missed-contact check (ExMR) on the uncorrected base result (`--result` to choose another)
-  and stores each issue as suggested (`automatic`) intervals on the track for that hand and target, creating it if
-  needed. Each run replaces all suggestions. `--accept` also adds them to the tracks' intervals, strongest issue first,
+- `suggest` reviews the uncorrected base result (ExMR; `--result` to choose another) and stores each finding as
+  suggested (`automatic`) intervals on the track for that hand and target, creating it if needed:
+  - `missed_contact` (MC): the `review` check, a hand touching a body part in the video but apart in 3D.
+  - `sunk_hand` (SH): a hand resting on the body that the model put inside it, which `review` shows only as
+    `self_penetration`. On the SMPL-X mesh a hand is more than 1 cm inside the torso, head, a leg or the other arm for at
+    least 0.2 s (dips up to 0.1 s bridged), at least 2 cm deep at its deepest, and its palm moves slower than 0.4 m/s
+    (median) in the target bone's frame: a resting hand moves with the body, a hand swinging through it does not. The
+    target is the bone nearest the palm (torso: `Hips`, `Spine`, `Spine1`, `Spine2` or the other `Shoulder`; head: `Head`;
+    legs and arms: that bone). The interval extends over adjacent frames where the hand skin is within 1.5 cm of the
+    target (up to 0.5 s), and intervals of one pair less than 0.2 s apart are joined. A faster palm is still suggested,
+    as `low`, while the target bone turns faster than 250 deg/s: in spins ExMR's arms lag the turning body even with the
+    hands on the hips in the video. High from 2.5 cm deep, else medium. Runs left out are listed with their reason
+    (`not_suggested` in `--json`).
+  Each run replaces all suggestions. `--accept` also adds them to the tracks' intervals, strongest issue first,
   skipping frames another enabled track already holds with the same hand; `edit --id ID --accept` accepts one track.
 - `list` prints the tracks, intervals, suggestions, settings and, after `correct`, the last residuals per track.
-- Every change gives the tracks a new revision, so the corrected result and its exports become stale until `correct`
-  runs again (the command says so). `remove --all` deletes the tracks (foot, placement and smoothing rows are kept, see below); with nothing
-  left the files are deleted and a result corrected without self-contacts is then
-  current again. `--dry-run` validates a change without writing it.
+- A change to what `correct` applies (intervals of enabled tracks, track settings, foot, placement and smoothing rows)
+  gives the tracks a new revision, so the corrected result and its exports become stale until `correct` runs again (the
+  command says so). Suggestions alone (`suggest` without `--accept`, settings of a track without intervals, disabled
+  tracks) keep the revision: a store holding nothing else counts as no store. `remove --all` deletes the tracks (foot,
+  placement and smoothing rows are kept, see below); with nothing left the files are deleted and a result corrected
+  without self-contacts is then current again. `--dry-run` validates a change without writing it.
 
 ### Foot articulation
 

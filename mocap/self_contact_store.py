@@ -62,7 +62,46 @@ def _state(project, base):
 
 
 def revision(project, base):
-    return _state(project, base).get('revision')
+    """Identity of what correction applies, folded into contact_revision; None when the store holds only suggestions.
+
+    It changes only with enabled track intervals, track settings and pose rows: suggestions (`automatic`) and `source` never
+    stale the corrected result. A state written before `applied` existed keeps its payload revision.
+    """
+    state = _state(project, base)
+    return state['applied'] if 'applied' in state else state.get('revision')
+
+
+def _applied_content(frames, fps, tracks, rows):
+    """Canonical text of what correction applies, or None when nothing would change the motion.
+
+    Tracks count when enabled with intervals (the solver skips the rest). Pose rows count whole, as their hooks run on any
+    entry; only their suggestions and provenance are left out.
+    """
+    def strip(entry):
+        return {key: value for key, value in entry.items() if key not in ('automatic', 'source')}
+    held = [strip(t) for t in tracks if t['enabled'] and t['ranges']]
+    kept = {key: [strip(e) for e in entries] for key, entries in rows.items() if entries}
+    if not held and not kept:
+        return None
+    return json.dumps(dict(frames=frames, fps=fps, tracks=held, **kept), sort_keys=True)
+
+
+def _committed_content(project, base, state):
+    """(applied revision, applied content) of the committed slot; content False when it cannot be read."""
+    if not state:
+        return None, None
+    applied = state['applied'] if 'applied' in state else state.get('revision')
+    if state.get('file') not in slot_names(base):
+        return applied, False
+    try:
+        data = json.loads((Path(project) / state['file']).read_text(encoding='utf-8'))
+        if data.get('revision') != state.get('revision'):
+            return applied, False
+        frames, fps = int(state['frames']), float(state['fps'])
+        rows = {key: NORMALIZE[key](data.get(key, []), frames) for key in ROW_KINDS}
+        return applied, _applied_content(frames, fps, normalize_tracks(data.get('tracks', []), frames), rows)
+    except (OSError, ValueError, KeyError, TypeError):
+        return applied, False
 
 
 def _ranges(value, frames, label):
@@ -288,9 +327,10 @@ def _stored_articulation(project, base):
 
 
 def save(project, base, tracks, context, articulation=None, placement=None, smoothing=None):
-    """Write the payload to the slot not referenced by the current state, then commit the state. Returns the new revision.
+    """Write the payload to the slot not referenced by the current state, then commit the state. Returns the new payload revision.
 
     articulation / placement / smoothing = None keeps the stored entries of that kind; pass a list (possibly empty) to replace them.
+    The state's `applied` revision (see revision()) is carried over when the applied content is unchanged.
     """
     import uuid
     from .storage import atomic_json
@@ -305,6 +345,9 @@ def save(project, base, tracks, context, articulation=None, placement=None, smoo
     smoothing = normalize_smoothing(_stored(project, base, 'smoothing') if smoothing is None else smoothing, frames)
     previous = _state(project, base)
     current = uuid.uuid4().hex
+    content = _applied_content(frames, fps, tracks, {'articulation': articulation, 'placement': placement, 'smoothing': smoothing})
+    was, before = _committed_content(project, base, previous)
+    applied = was if before is not False and content == before else None if content is None else current
     first, second = slot_names(base)
     filename = first if previous.get('file') == second else second
     payload = [{**track, 'ranges': [list(p) for p in track['ranges']], 'automatic': [list(p) for p in track['automatic']]} for track in tracks]
@@ -316,7 +359,7 @@ def save(project, base, tracks, context, articulation=None, placement=None, smoo
             record[key] = [{**e, 'ranges': [list(p) for p in e['ranges']], 'automatic': [list(p) for p in e['automatic']]} for e in rows]
     atomic_json(Path(project) / filename, record)
     atomic_json(state_path(project, base), {'frames': frames, 'fps': fps, 'sources': dict(context.get('sources') or {}),
-                                            'revision': current, 'file': filename})
+                                            'revision': current, 'applied': applied, 'file': filename})
     return current
 
 

@@ -74,12 +74,16 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(foot_contacts.contact_revision(self.project, BASE), combined)
         self.assertEqual(foot_contacts.read_edit(self.project, BASE, CONTEXT)[1], combined)
         self.assertEqual(foot_contacts.footlock_revision(self.project, BASE), foot)
+        sc2 = store.save(self.project, BASE, [track(ranges=[[300, 421]])], CONTEXT)
+        self.assertEqual(foot_contacts.contact_revision(self.project, BASE), f'{foot}|sc:{sc2}')
+        foot2 = self.footlock([[(0, 10)], [(5, 20)]])
+        self.assertEqual(foot_contacts.contact_revision(self.project, BASE), f'{foot2}|sc:{sc2}')
+        self.assertEqual(foot_contacts.with_self_contacts(self.project, BASE, foot2), f'{foot2}|sc:{sc2}')
+        # A store that applies nothing adds nothing, as if there were no file.
         empty = store.save(self.project, BASE, [], CONTEXT)
         self.assertEqual(store.read(self.project, BASE, CONTEXT), ([], empty, ''))
-        self.assertEqual(foot_contacts.contact_revision(self.project, BASE), f'{foot}|sc:{empty}')
-        foot2 = self.footlock([[(0, 10)], [(5, 20)]])
-        self.assertEqual(foot_contacts.contact_revision(self.project, BASE), f'{foot2}|sc:{empty}')
-        self.assertEqual(foot_contacts.with_self_contacts(self.project, BASE, foot2), f'{foot2}|sc:{empty}')
+        self.assertIsNone(store.revision(self.project, BASE))
+        self.assertEqual(foot_contacts.contact_revision(self.project, BASE), foot2)
 
     def test_without_footlock_state(self):
         sc = store.save(self.project, BASE, [track()], CONTEXT)
