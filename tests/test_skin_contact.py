@@ -60,8 +60,8 @@ class PenetrationTest(unittest.TestCase):
         far = self.measure([0, .5, 0])
         self.assertEqual(far['depth'], 0.); self.assertTrue(np.isinf(far['gap'])); self.assertTrue(np.isnan(sc.signed_gap(far)))
 
-    def test_corner_and_edge_points_use_the_winding_number(self):
-        # Closest features are an edge and a corner: the normal sign is ambiguous there, the winding number is not.
+    def test_corner_and_edge_points(self):
+        # Closest features are an edge and a corner: the face normal sign is ambiguous there, the pseudo-normal is not.
         for point, depth in (([.049, .049, 0], .001), ([.06, .06, 0], 0.), ([.049, .049, .049], .001), ([.051, .051, .051], 0.)):
             self.assertAlmostEqual(self.measure(point)['depth'], depth, places=9, msg=point)
 
@@ -80,6 +80,20 @@ class PenetrationTest(unittest.TestCase):
         self.assertAlmostEqual(sc.winding(np.array([[0, -.12, 0]]), closed)[0], 0., places=6)
         # Depth is measured to the real skin only (sides), never to the cap.
         self.assertAlmostEqual(sc.penetration(np.array([[0, -.09, 0]]), v, segment)['depth'], .05, places=6)
+
+    def test_pseudo_normals_agree_with_the_winding_number(self):
+        v, faces = box([0, 0, 0], [.05, .1, .05])
+        keep = ~(v[faces][:, :, 1] <= -.1 + 1e-12).all(1)
+        segment = sc.Segment(faces[keep], np.arange(len(v)))
+        points = np.random.default_rng(0).uniform([-.07, -.12, -.07], [.07, .12, .07], (400, 3))
+        sd, _ = sc.signed_distance(points, v, segment, near=.1)
+        np.testing.assert_array_equal(sd < 0, np.abs(sc.winding(points, segment.closed(v))) > .5)
+
+    def test_segment_distance(self):
+        a, b = np.array([0., 0, 0]), np.array([1., 0, 0])
+        self.assertAlmostEqual(sc.segment_distance(a, b, np.array([.5, 1, 0]), np.array([.5, 2, 0])), 1.)
+        self.assertAlmostEqual(sc.segment_distance(a, b, np.array([2., 0, 1]), np.array([3., 0, 1])), np.sqrt(2))
+        self.assertAlmostEqual(sc.segment_distance(a, a, np.array([0., 1, 0]), np.array([0., 1, 0])), 1.)
 
     def test_closest_point_regions(self):
         a, b, c = np.array([0., 0, 0]), np.array([1., 0, 0]), np.array([0., 1, 0])
@@ -117,6 +131,34 @@ class LoopTest(unittest.TestCase):
         self.assertLess(contact['penetration_interval_max_m'], .006)
         self.assertLess(abs(contact['skin_gap_median_m']), .01)
         self.assertGreater(contact['push_max_m'], .01)
+
+    def test_anchor_is_one_skin_point_on_the_target_bone(self):
+        skin = synthetic_skin()
+        root, q = clip(); before = q.copy()
+        report = sc.apply(REST, root, q, OFFSETS, FPS, [track()], [[], []], skin=skin)
+        entry = report['tracks'][0]; anchor = entry['anchor']
+        self.assertEqual(anchor['joint'], 'RightUpLeg'); self.assertIn(anchor['side'], ('front', 'back', 'inner', 'outer', 'top', 'bottom'))
+        self.assertTrue(entry['goal'].startswith('skin of right_thigh'))
+        # The palm lies on the skin (palm normal against the anchor normal) and the wrist rows are declared.
+        _, g = fk(REST, root.astype(float), q.astype(float))
+        normal = g[30:60, 2] @ np.array(anchor['normal_local'])
+        self.assertLess(sc.angle_between(g[30:60, 21] @ sc.PALM_NORMAL, -normal).max(), 10.)
+        changed = report['changed'][0]
+        self.assertEqual(report['wrist_changed'], [dict(joint=21, start=changed['start'], end=changed['end'])])
+        self.assertEqual(entry['grip']['wrist'], 'palm')
+        self.assertLess(entry['skin']['penetration_interval_max_m'], .001); self.assertEqual(entry['skin']['arm_penetrating_frames'], 0)
+        outside = np.ones(N, bool); outside[changed['start']:changed['end']] = False
+        self.assertEqual(q[outside].tobytes(), before[outside].tobytes())
+
+    def test_arm_pose_flexes_the_elbow_the_right_way(self):
+        from mocap.limb_placement import bend
+        root, q = clip(); j, g = fk(REST, root.astype(float), q.astype(float))
+        targets = j[:, 17] + np.random.default_rng(1).normal(size=(N, 3)) * .15 + [0, .1, .25]
+        for swivel in (-2., 0., 2.5):
+            upper, forearm, E, W, short = sc.arm_pose(REST, j, g, sc.quat_matrix(q[:, 19]), 1, targets, np.full(N, swivel))
+            self.assertGreater(np.rad2deg(bend(j[:, 17], E, W, upper, np.array(sc.ARM_HINGES[1]))).min(), 0.)
+            reached = short < 1e-9
+            np.testing.assert_allclose(W[reached], targets[reached], atol=1e-6)
 
     def test_without_skin_no_loop_runs(self):
         root, q = clip()
@@ -177,9 +219,12 @@ class VideoGripTest(unittest.TestCase):
         video = FakeVideo(N); video.draw(skin.rest, 1, j[:, 21], g[:, 19] @ sc.wrist_local(np.full(N, 50.), 0, np.full(N, 60.), REST, 1), rows)
         report = sc.apply(REST, root, q, OFFSETS, FPS, [track(grip='auto')], [[], []], skin=skin, video=video)
         entry = report['tracks'][0]; changed = report['changed'][0]
-        self.assertEqual(entry['grip']['wrist'], 'video')
+        # On a skin anchor the palm lies on the skin; grip auto rolls it toward the video hand.
+        self.assertEqual((entry['grip']['mode'], entry['grip']['wrist']), ('auto', 'palm'))
         self.assertEqual(report['wrist_changed'], [dict(joint=21, start=changed['start'], end=changed['end'])])
-        self.assertLess(entry['grip']['direction_error_median_deg'], entry['grip']['direction_error_source_median_deg'])
+        _, q_off = clip()
+        off = sc.apply(REST, root, q_off, OFFSETS, FPS, [track()], [[], []], skin=skin, video=video)['tracks'][0]['grip']
+        self.assertLessEqual(entry['grip']['direction_error_median_deg'], off['direction_error_median_deg'] + 1e-6)
         self.assertEqual(entry['wrist']['result']['frames_outside_limits'], 0)
         _, g1 = fk(REST, root.astype(float), q.astype(float)); _, g0 = fk(REST, root.astype(float), before.astype(float))
         outside = np.ones(N, bool); outside[changed['start']:changed['end']] = False

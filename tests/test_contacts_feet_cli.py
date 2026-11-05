@@ -156,6 +156,15 @@ class BeforeCurrentTest(Project):
         self.assertIn('Comparing against the original instead', note)
 
 
+class SheetFramesTest(unittest.TestCase):
+    def test_ranges_then_suggestions_then_none(self):
+        self.assertEqual(render.sheet_frames(None, [(10, 41)], 100), [10, 20, 30, 40])
+        self.assertEqual(render.sheet_frames(None, [], 100, [(20, 51)]), [20, 30, 40, 50])
+        self.assertIsNone(render.sheet_frames(None, [], 100, []))
+        self.assertEqual(render.sheet_frames('5,7', [], 100), [5, 7])
+        self.assertEqual(render.sheet_frames('0-30', [], 100), [0, 10, 20, 30])
+
+
 class CodeIdentityTest(unittest.TestCase):
     def setUp(self):
         self.folder = tempfile.TemporaryDirectory()

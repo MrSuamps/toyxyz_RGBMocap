@@ -115,7 +115,7 @@ class Mesh:
                 r = penetrations(points, {t: boxes[t][0] for t in near}, self.segments, list(near))
                 depth, inside, gap = out[(effector, targets)]
                 depth[i], inside[i] = r['depth'], r['inside']
-                gap[i] = signed_gap(r) if near[0] == targets[0] else -r['depth'] if r['depth'] > 0 else np.nan
+                gap[i] = signed_gap(r)
         self.cache[key] = out
         return out
 

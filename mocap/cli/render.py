@@ -600,8 +600,9 @@ SHEET_COLORS = ((205, 185, 165), (120, 175, 235), (140, 210, 140), (200, 150, 22
 GREEN, MAGENTA = (60, 220, 60), (230, 60, 230)
 
 
-def sheet_frames(value, ranges, count):
-    """Frames of a sheet: --frames A,B,C as given, A-B (or a contact range) as SHEET_FRAMES evenly spaced frames."""
+def sheet_frames(value, ranges, count, automatic=()):
+    """Frames of a sheet: --frames A,B,C as given, A-B (or the contact's ranges, else its suggested ranges) as SHEET_FRAMES
+    evenly spaced frames; None without --frames for a contact that has neither."""
     import numpy as np
     if value and ',' in value:
         try:
@@ -611,7 +612,10 @@ def sheet_frames(value, ranges, count):
         if frames[0] < 0 or frames[-1] >= count:
             raise CliError(f'--frames {value}: frames must lie in 0-{count - 1}', EXIT_USAGE)
         return frames
-    first, last = parse_frames(value, count) if value else (ranges[0][0], ranges[-1][1] - 1)
+    spans = list(ranges) or list(automatic)
+    if not value and not spans:
+        return None
+    first, last = parse_frames(value, count) if value else (min(a for a, _ in spans), max(b for _, b in spans) - 1)
     return sorted({int(round(x)) for x in np.linspace(first, last, SHEET_FRAMES)})
 
 
@@ -773,7 +777,14 @@ def cmd_sheet(args, session, project, model, kind, started):
     grip = {t.get('grip', 'off') for t in tracks}
     layers.append(Layer('After' + (f' (grip {grip.pop()})' if len(grip) == 1 else ''), 'result', body.pose(load_params(project / filename, key)), kind))
     obs = load_exmr(project)
-    plans = [(track, sheet_frames(args.frames, track['ranges'], count)) for track in tracks]
+    plans = [(track, sheet_frames(args.frames, track['ranges'], count, track.get('automatic', ()))) for track in tracks]
+    skipped = [track.get('id') or f"{track['effector']}-{track['target']}" for track, frames in plans if frames is None]
+    plans = [(track, frames) for track, frames in plans if frames is not None]
+    if skipped:
+        note = ' '.join(filter(None, (note, f"Skipped {', '.join(skipped)}: no frame ranges or suggestions (pass --frames).")))
+        session.info('Note: ' + note)
+    if not plans:
+        raise CliError('No self-contact frame ranges to make a sheet for; pass --frames A-B.', EXIT_USAGE)
     videos = read_frames(obs.video, {f for _, frames in plans for f in frames})
     out.mkdir(parents=True, exist_ok=True)
     written = []
