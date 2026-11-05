@@ -177,6 +177,17 @@ class ChecksTest(unittest.TestCase):
         self.assertEqual([(i['joints'], i['severity']) for i in twist], [(['right_wrist'], 'high')])
         self.assertAlmostEqual(abs(twist[0]['metrics']['twist_signed_at_worst_deg']), 120, places=5)
 
+    def test_shoulder_and_hip_twist(self):
+        n = 20
+        local = identity(n)
+        local[:, 17] = rot([0, 0, 1], 40) @ rot([-1, 0, 0], 60)  # right arm lowered, upper arm rolled 60: in range
+        local[4:16, 17] = rot([0, 0, 1], 40) @ rot([-1, 0, 0], 165)  # rolled 165 deg about the humerus
+        local[:, 1] = rot([0, -1, 0], 50)                          # left thigh rolled 50 (limit 60)
+        local[6:12, 2] = rot([0, -1, 0], -75)                      # right thigh rolled 75
+        twist = anatomy.check_twist(pose_from_locals(local), self.frames(n))
+        found = {i['joints'][0]: (i['frames'], i['severity'], round(abs(i['metrics']['twist_signed_at_worst_deg']))) for i in twist}
+        self.assertEqual(found, {'right_shoulder': ([104, 115], 'high', 165), 'right_hip': ([106, 111], 'medium', 75)})
+
     def swivelled(self, angles):
         """Right elbow bent 90 deg, the whole arm turned by angles (deg per frame) about the shoulder-wrist line."""
         local = identity(len(angles))

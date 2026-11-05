@@ -160,6 +160,26 @@ class LoopTest(unittest.TestCase):
             reached = short < 1e-9
             np.testing.assert_allclose(W[reached], targets[reached], atol=1e-6)
 
+    def test_upper_twist_is_the_roll_about_the_humerus(self):
+        collar = Rotation.from_rotvec([0, .3, .2]).as_matrix()
+        axis = sc.unit(REST[19] - REST[17]); swing = Rotation.from_rotvec(.6 * sc.unit(np.cross(axis, [0, 1., 0]))).as_matrix()
+        for degrees in (-150., -30., 0., 75., 170.):
+            local = swing @ Rotation.from_rotvec(np.deg2rad(degrees) * axis).as_matrix()
+            self.assertAlmostEqual(float(sc.upper_twist(REST, 1, collar, collar @ local)), degrees, places=6)
+        cost = sc.upper_twist_cost(np.array([0., 90., 120., 179., -179.]), np.array([0., 90., 90., -179., 179.]))
+        wrung = sc.UPPER_TWIST_WEIGHT * 89 + sc.UPPER_TWIST_SOURCE_WEIGHT * 2
+        np.testing.assert_allclose(cost, [0, 0, sc.UPPER_TWIST_WEIGHT * 30 + sc.UPPER_TWIST_SOURCE_WEIGHT * 30, wrung, wrung])
+
+    def test_swivels_span_the_upper_arm_twist(self):
+        # Swivelling a bent arm round the shoulder-hand line rolls the humerus: some candidates are in range, some wring it.
+        root, q = clip(); j, g = fk(REST, root.astype(float), q.astype(float))
+        targets = j[:, 17] + [0, -.15, .3]; swivels = np.deg2rad(sc.HAND_SWIVELS_DEG)
+        upper = sc.arm_pose(REST, j, g, sc.quat_matrix(q[:, 19]), 1, np.broadcast_to(targets[:, None], (N, len(swivels), 3)),
+                            np.broadcast_to(swivels, (N, len(swivels))))[0]
+        twist = sc.upper_twist(REST, 1, g[:, None, 14], upper)
+        self.assertLess(np.abs(twist).min(1).max(), sc.UPPER_TWIST_DEG)
+        self.assertGreater(np.abs(twist).max(1).min(), 150.)
+
     def test_hand_steps_keep_the_elbow_branch(self):
         # Two candidates per frame (one roll, two swivels): stay put, or turn the upper arm 180 deg over the clip.
         m = 13; turn = np.linspace(0, np.pi, m)

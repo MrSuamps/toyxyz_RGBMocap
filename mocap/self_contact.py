@@ -108,6 +108,14 @@ HAND_ROLL_STEP_WEIGHT = .1
 ARM_STEP_WEIGHT = .5
 ARM_STEP_DEG_S = 300.
 ARM_SPEED_WEIGHT = .5
+# The swivel also sets the upper arm's twist about its own bone (shoulder local to the collar, rest bone axis). Past
+# UPPER_TWIST_DEG from the rest roll the humerus is out of anatomical range and the SMPL-X LBS armpit wrings (180 inverts the
+# elbow): UPPER_TWIST_WEIGHT per deg past it, and UPPER_TWIST_SOURCE_WEIGHT per deg away from the solved arm's own twist.
+# The hand's roll goes to the forearm instead: wrist_excess tries FOREARM_ROLLS_DEG, the range roll_forearm applies.
+UPPER_TWIST_DEG = 90.
+UPPER_TWIST_WEIGHT = 2.
+UPPER_TWIST_SOURCE_WEIGHT = .05
+FOREARM_ROLLS_DEG = np.arange(-90., 91., 15.)
 FOREARM_REACH = .75
 REACH_FRACTION = .995
 VIDEO_ROLL_WEIGHT = .3
@@ -1174,7 +1182,7 @@ def wrist_excess(rest, h, upper, forearm, hand):
     """Degrees the wrist (forearm -> hand) sits outside its limits after the best forearm roll (as roll_forearm), plus the
     elbow twist past ELBOW_TWIST_DEG; broadcast over leading axes."""
     t = forearm_axis(rest, h)
-    rolls = np.deg2rad(np.arange(-60., 61., 30.)); spin = Rotation.from_rotvec(rolls[:, None] * t).as_matrix()
+    rolls = np.deg2rad(FOREARM_ROLLS_DEG); spin = Rotation.from_rotvec(rolls[:, None] * t).as_matrix()
     local = np.swapaxes(forearm, -1, -2) @ hand; elbow = np.swapaxes(upper, -1, -2) @ forearm
     turned = np.swapaxes(spin, -1, -2) @ local[..., None, :, :]
     excess = rotation_angle(turned, clamp_wrist(turned.reshape(-1, 3, 3), rest, h).reshape(turned.shape))
@@ -1184,6 +1192,17 @@ def wrist_excess(rest, h, upper, forearm, hand):
 
 def wrap_deg(a):
     return np.abs((a + 180) % 360 - 180)
+
+
+def upper_twist(rest, h, collar, upper):
+    """Twist (deg) of arm h's upper-arm world rotations (..., 3, 3) about its rest bone, local to the collar world rotations."""
+    _, shoulder, elbow, _ = ARMS[h]
+    return twist_deg(np.swapaxes(collar, -1, -2) @ upper, unit(rest[elbow] - rest[shoulder]))
+
+
+def upper_twist_cost(twist, source):
+    """Hand-search cost of upper-arm twists (deg) out of range and away from the solved arm's twist (see UPPER_TWIST_DEG)."""
+    return UPPER_TWIST_WEIGHT * np.maximum(np.abs(twist) - UPPER_TWIST_DEG, 0) + UPPER_TWIST_SOURCE_WEIGHT * wrap_deg(twist - source)
 
 
 def hand_prior():
@@ -1251,8 +1270,8 @@ def hand_search(rest, skin, root, q, h, goal, inward, limb, offsets, fps, active
     The wrist sits where the rolled hand puts the palm point on the goal; the arm reaches it from the solved shoulder (arm_pose).
     Costs: the wrist outside its limits (after the best forearm roll), fingers along the limb axis (limb (m, 3)) rather than
     around it, forearm / upper-arm capsules closer than ARM_CLEARANCE_M to the target limb's, a shortfall of reach, degrees
-    away from the solved hand and elbow, and with video the 2D upper-arm direction and elbow position (video_hand: also the 2D
-    hand direction).
+    away from the solved hand and elbow, the upper-arm twist (upper_twist_cost), and with video the 2D upper-arm direction and
+    elbow position (video_hand: also the 2D hand direction).
     Costs are evaluated on every other active frame and interpolated; a Viterbi path over (roll, swivel), stepping by the
     world rotation of the upper arm and hand (hand_steps), keeps the arm on one elbow branch. angles (roll, swivel rad (m,))
     from an earlier call skip the search. Only active frames change.
@@ -1273,6 +1292,8 @@ def hand_search(rest, skin, root, q, h, goal, inward, limb, offsets, fps, active
         upper, forearm, E, W, short = arm_pose(rest, j[f], g[f], elbow_local[f], h, np.broadcast_to(target, (len(f), k, s, 3)),
                                                np.broadcast_to(swivels, (len(f), k, s)))
         cost = wrist_excess(rest, h, upper, forearm, hand[:, :, None]) + 1000 * short
+        source = upper_twist(rest, h, g[f, collar], g[f, shoulder])[:, None, None]
+        cost = cost + upper_twist_cost(upper_twist(rest, h, g[f, collar][:, None, None], upper), source)
         # Fingers across the limb wrap around it; along it they dig in.
         cost = cost + HAND_WRAP_WEIGHT * np.abs((along * limb[f, None]).sum(-1))[..., None]
         upper_radius, forearm_radius = (capsules(skin, [SIDES[h] + '_' + name])[0][2] for name in ('upperarm', 'forearm'))
@@ -1310,7 +1331,8 @@ def hand_search(rest, skin, root, q, h, goal, inward, limb, offsets, fps, active
     out = limit_wrist_rows(rest, root, out, h, fps)
     report = dict(hand_roll_deg=[float(np.rad2deg(roll[ids]).min(initial=0)), float(np.rad2deg(roll[ids]).max(initial=0))],
                   arm_swivel_max_deg=float(wrap_deg(np.rad2deg(swivel[ids])).max(initial=0)), reach_short_max_m=float(short[ids].max(initial=0)),
-                  wrist_excess_max_deg=float(excess[ids].max(initial=0)), frames=int(len(ids)))
+                  wrist_excess_max_deg=float(excess[ids].max(initial=0)), frames=int(len(ids)),
+                  upper_twist_max_deg=float(np.abs(upper_twist(rest, h, g[ids, collar], upper[ids])).max(initial=0)))
     if video is not None and rows is not None and len(ids):
         ok = ids[video.hand(h, rows[ids])[1] > 0]
         if len(ok):

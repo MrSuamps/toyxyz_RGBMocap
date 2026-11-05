@@ -28,8 +28,11 @@ LOCK_HIGH_DEG = {'elbow': 177.0, 'knee': 179.5}
 LOCK_FRAMES = 6
 # Wrist range relative to the forearm (swing split into palm flexion / extension and radial / ulnar deviation).
 WRIST_LIMITS = dict(flexion=80.0, extension=70.0, radial=25.0, ulnar=40.0)
-# Twist about the bone's own rest axis; LBS skin collapses ("candy-wrap") well before 90 deg on a single joint.
-TWIST_LIMITS = {'knee': 40.0, 'elbow': 80.0, 'wrist': 80.0}
+# Twist about the bone's own rest axis; LBS skin collapses ("candy-wrap") well before 90 deg on a single joint. Shoulder and
+# hip: upper-arm / thigh twist (the joint's local rotation about its rest bone), the humerus and femur anatomical roll range.
+TWIST_LIMITS = {'knee': 40.0, 'elbow': 80.0, 'wrist': 80.0, 'shoulder': 90.0, 'hip': 60.0}
+TWIST_HINTS = {'shoulder': 'the upper arm is rolled about its own bone: re-run `correct` (the self-contact arm keeps its twist in range)',
+               'hip': 'the thigh is rolled about its own bone: check the knee direction against the video'}
 FOLD_DEG = 35.0                 # dip below both neighbouring maxima inside the window
 FOLD_SECONDS = 0.35
 # Joint flip: an elbow / knee swinging round its root-end line (swivel, measured while bent below FLIP_BENT_DEG interior),
@@ -323,10 +326,13 @@ def check_limbs(pose, frames, fps):
 
 
 def joint_twists(pose):
-    """{name: signed twist degrees} for knees, elbows (about their child segment) and wrists (about the forearm)."""
+    """{name: (kind, joint, signed twist degrees)} for hips, knees, shoulders, elbows (about their child segment) and wrists
+    (about the forearm)."""
     out = {}
-    for side, (hip, knee, ankle), (elbow, wrist) in zip(SIDES, ((1, 4, 7), (2, 5, 8)), ((18, 20), (19, 21))):
+    for side, (hip, knee, ankle), (shoulder, elbow, wrist) in zip(SIDES, ((1, 4, 7), (2, 5, 8)), ((16, 18, 20), (17, 19, 21))):
+        out[f'{side}_hip'] = ('hip', hip, swing_twist(pose.local[:, hip], unit(pose.rest[knee] - pose.rest[hip]))[1])
         out[f'{side}_knee'] = ('knee', knee, swing_twist(pose.local[:, knee], unit(pose.rest[ankle] - pose.rest[knee]))[1])
+        out[f'{side}_shoulder'] = ('shoulder', shoulder, swing_twist(pose.local[:, shoulder], unit(pose.rest[elbow] - pose.rest[shoulder]))[1])
         forearm = unit(pose.rest[wrist] - pose.rest[elbow])
         out[f'{side}_elbow'] = ('elbow', elbow, swing_twist(pose.local[:, elbow], forearm)[1])
         out[f'{side}_wrist'] = ('wrist', wrist, swing_twist(pose.local[:, wrist], forearm)[1])
@@ -346,7 +352,7 @@ def check_twist(pose, frames):
             issues.append(make_issue('joint_twist', severity, count * (peak - limit), frames, a, b, worst, [name],
                                      dict(frames_flagged=count, twist_max_deg=peak, twist_signed_at_worst_deg=float(twist[worst]), limit_deg=limit),
                                      f'{name.replace("_", " ")} twists {peak:.0f} deg about its bone (limit {limit:.0f}): skin may candy-wrap',
-                                     'check the limb roll; on an FBX, export surface roll adds forearm twist', dict(smpl=(joint,),
+                                     TWIST_HINTS.get(kind, 'check the limb roll; on an FBX, export surface roll adds forearm twist'), dict(smpl=(joint,),
                                      series={f'{name} twist deg': twist})))
     return issues
 
