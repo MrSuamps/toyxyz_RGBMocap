@@ -4,11 +4,13 @@ from PySide6.QtCore import Qt,QRectF,QPointF
 from PySide6.QtGui import QColor,QPen
 from PySide6.QtWidgets import QMenu
 from .foot_contacts import FOOT_COLORS
+from .selfcontact_rows import SelfContactEditor,FIRST_ROW,SELF_UNDO
 CONTACT_COLORS=(*FOOT_COLORS,"#79a9db","#bf8dcf")
 
 
-class FootLockEditor:
+class FootLockEditor(SelfContactEditor):
     def init_contacts(self):
+        self.init_self_contacts()
         self.contacts=[[],[]];self.automatic_contacts=[[],[]]
         self.contacts_available=False;self.contact_edit_enabled=False
         self.contact_revision=0;self._contact_identity=None;self._contact_token=None
@@ -23,7 +25,8 @@ class FootLockEditor:
         if (identity,token)==(self._contact_identity,self._contact_token):self.update();return
         incoming=[list(map(tuple,track)) for track in ranges] if ranges is not None else [[],[]]
         if identity!=self._contact_identity or incoming!=self.contacts:
-            self._undo_contacts.clear();self._redo_contacts.clear();self._selected_contact=None
+            self._drop_foot_history();self._selected_contact=None
+        if ranges is None:self.set_self_contacts(None)
         self._contact_identity=identity;self._contact_token=token
         self.contacts_available=ranges is not None
         self.contacts=incoming
@@ -31,9 +34,15 @@ class FootLockEditor:
         self._foot_drag=None;self._foot_draft=None
         self._index_contacts()
 
+    def _drop_foot_history(self):
+        # Self-contact steps keep their place in the shared undo order.
+        self._undo_contacts[:]=[c for c in self._undo_contacts if c==SELF_UNDO]
+        self._redo_contacts[:]=[c for c in self._redo_contacts if c==SELF_UNDO]
+
     def _index_contacts(self):
-        self._contact_starts=[[s for s,e in track] for track in self.contacts]
-        self._contact_ends=[[e for s,e in track] for track in self.contacts]
+        tracks=self._all_tracks()
+        self._contact_starts=[[s for s,e in track] for track in tracks]
+        self._contact_ends=[[e for s,e in track] for track in tracks]
         self.contact_revision+=1;self.update()
         self.contacts_preview_changed.emit()
 
@@ -63,6 +72,7 @@ class FootLockEditor:
     def _contact_row(self,event):
         position=event.position() if hasattr(event,'position') else event.pos()
         row=int((position.y()-28)//self.TRACK_HEIGHT)-2
+        if row>=FIRST_ROW:return self.self_contact_row(row)
         return row if 0<=row<len(self.contacts) and self.contact_track_enabled[row] else None
 
     def _edge_position(self,event):
@@ -74,29 +84,32 @@ class FootLockEditor:
         position=event.position() if hasattr(event,'position') else event.pos()
         frame=self._edge_position(event);x=position.x()
         index=bisect_right(self._contact_starts[foot],frame)-1
-        candidates=[]
+        candidates=[];track=self._track(foot)
         for i in (index-1,index,index+1):
-            if not 0<=i<len(self.contacts[foot]):continue
-            s,e=self.contacts[foot][i]
+            if not 0<=i<len(track):continue
+            s,e=track[i]
             for edge,mode in ((s,'left'),(e-1,'right')):
                 distance=abs(x-self.frame_x(edge))
                 if distance<=6:candidates.append((distance,0 if self._selected_contact==(foot,i) else 1,i,mode))
         if candidates:
             _,_,index,mode=min(candidates);return index,mode
-        if index>=0 and self.contacts[foot][index][0]<=frame<self.contacts[foot][index][1]:return index,'move'
+        if index>=0 and track[index][0]<=frame<track[index][1]:return index,'move'
         return None,'new'
 
     def _foot_press(self,event):
         foot=self._contact_row(event)
-        if event.button()!=Qt.LeftButton or foot is None or event.position().x()<self.LEFT or not self.contact_edit_enabled:return False
+        if event.button()!=Qt.LeftButton or foot is None or event.position().x()<self.LEFT or not self._editable(foot):return False
         self.contacts_edit_started.emit();self.setFocus(Qt.MouseFocusReason)
         index,mode=self._contact_hit(foot,event)
         frame=min(self.maximum(),self._edge_position(event))
         insertion=bisect_right(self._contact_starts[foot],frame) if index is None else index
-        track=self.contacts[foot]
+        track=self._track(foot)
         low=track[insertion-1][1] if insertion else 0
         high=track[insertion+(0 if index is None else 1)][0] if insertion+(0 if index is None else 1)<len(track) else self.maximum()+1
         original=track[index] if index is not None else None
+        bounds=self._clamp_bounds(foot,low,high,frame,original)
+        if bounds is None:event.accept();return True
+        low,high=bounds
         self._foot_drag={'foot':foot,'index':insertion,'mode':mode,'original':original,
                          'frame':frame,'pixel':event.position().x(),'low':low,'high':high}
         self._foot_draft=original
@@ -131,6 +144,7 @@ class FootLockEditor:
         self.setCursor(Qt.ArrowCursor);self.update();self.contacts_preview_changed.emit();event.accept();return True
 
     def _contact_command(self,foot,index,before,after,record=True):
+        if foot>=FIRST_ROW:self.self_contact_command(foot,index,before,after);return
         if before is None:self.contacts[foot].insert(index,after)
         elif after is None:self.contacts[foot].pop(index)
         else:self.contacts[foot][index]=after
@@ -145,39 +159,51 @@ class FootLockEditor:
 
     def undo_contact(self):
         if not self.contact_edit_enabled or not self._undo_contacts:return
+        if self._undo_contacts[-1]==SELF_UNDO:
+            if self.sc_editable and self.undo_self_contact():self._redo_contacts.append(self._undo_contacts.pop())
+            return
         foot,index,before,after=self._undo_contacts.pop()
         self._redo_contacts.append((foot,index,before,after))
         self._contact_command(foot,index,after,before,False)
 
     def redo_contact(self):
         if not self.contact_edit_enabled or not self._redo_contacts:return
+        if self._redo_contacts[-1]==SELF_UNDO:
+            if self.sc_editable and self.redo_self_contact():self._undo_contacts.append(self._redo_contacts.pop())
+            return
         command=self._redo_contacts.pop();self._undo_contacts.append(command)
         self._contact_command(*command,False)
 
     def delete_contact(self):
         if not self.contact_edit_enabled or self._selected_contact is None:return
         foot,index=self._selected_contact
-        self._contact_command(foot,index,self.contacts[foot][index],None)
+        if not self._editable(foot) or not 0<=index<len(self._track(foot)):return
+        self._contact_command(foot,index,self._track(foot)[index],None)
 
     def add_contact(self,foot,frame):
-        if not self.contact_edit_enabled:return
+        if not self._editable(foot):return
         index=bisect_right(self._contact_starts[foot],frame)
-        if index and self.contacts[foot][index-1][1]>frame:return
-        high=self.contacts[foot][index][0] if index<len(self.contacts[foot]) else self.maximum()+1
+        track=self._track(foot)
+        if index and track[index-1][1]>frame:return
+        high=track[index][0] if index<len(track) else self.maximum()+1
+        high=self._add_limit(foot,frame,high)
+        if high is None:return
         end=min(high,frame+max(1,round(self.fps*.3)))
         if end>frame:self._contact_command(foot,index,None,(frame,end))
 
     def reset_contact_foot(self,foot):
         if not self.contact_edit_enabled:return
         self.contacts[foot]=list(self.automatic_contacts[foot])
-        self._undo_contacts.clear();self._redo_contacts.clear();self._selected_contact=None
+        self._drop_foot_history();self._selected_contact=None
         self._index_contacts();self._emit_contacts()
 
     def mouseDoubleClickEvent(self,event):
         foot=self._contact_row(event)
-        if event.button()==Qt.LeftButton and foot is not None and self.contact_edit_enabled and event.position().x()>=self.LEFT:
+        if event.button()==Qt.LeftButton and foot is not None and self._editable(foot) and event.position().x()>=self.LEFT:
             self._foot_drag=None;self._foot_draft=None
-            self.contacts_edit_started.emit();self.add_contact(foot,min(self.maximum(),self._edge_position(event)))
+            frame=min(self.maximum(),self._edge_position(event))
+            self.contacts_edit_started.emit()
+            if not self.accept_suggestion_at(foot,frame):self.add_contact(foot,frame)
             event.accept();return
         # QSlider's default double-click handler can seek outside our frame handle.
         self.mousePressEvent(event)
@@ -196,6 +222,7 @@ class FootLockEditor:
         super().keyPressEvent(event)
 
     def contextMenuEvent(self,event):
+        if self.self_contact_menu(event):return
         foot=self._contact_row(event)
         if foot is None or not self.contact_edit_enabled:return
         index,_=self._contact_hit(foot,event)
@@ -225,36 +252,41 @@ class FootLockEditor:
                 p.setPen(QColor('#777777'));p.drawText(QRectF(self.LEFT+8,y,max(0,self.width()-self.LEFT-25),self.TRACK_HEIGHT),Qt.AlignVCenter,'Disabled');continue
             if not self.contacts_available or foot>=len(self.contacts):
                 p.setPen(QColor('#777777'));p.drawText(QRectF(self.LEFT+8,y,max(0,self.width()-self.LEFT-25),self.TRACK_HEIGHT),Qt.AlignVCenter,'Apply Correction to generate locks');continue
-            p.save();p.setClipRect(QRectF(self.LEFT,y,max(1,self.width()-self.LEFT-self.RIGHT),self.TRACK_HEIGHT))
-            tint=QColor(color);tint.setAlpha(90 if self.contact_edit_enabled else 40)
-            lo=bisect_right(self._contact_ends[foot],self.view_start)
-            hi=bisect_right(self._contact_starts[foot],self.view_start+self.span())
-            if hi-lo>max(1,(self.width()-self.LEFT-self.RIGHT)//3):
-                # At distant zoom, query coverage per pixel column rather than
-                # scanning every contact in a multi-hour recording.
-                for x in range(self.LEFT,self.width()-self.RIGHT,3):
-                    self.contact_draw_queries+=1
-                    a=self.view_start+(x-self.LEFT)*self.span()/max(1,self.width()-self.LEFT-self.RIGHT)
-                    b=a+3*self.span()/max(1,self.width()-self.LEFT-self.RIGHT)
-                    index=bisect_right(self._contact_ends[foot],a)
-                    if index<len(self.contacts[foot]) and self.contacts[foot][index][0]<b:p.fillRect(QRectF(x,y+2,3,self.TRACK_HEIGHT-5),tint)
-            else:
-                for index in range(lo,hi):
-                    self.contact_draw_queries+=1
-                    if self._foot_drag and (foot,index)==(self._foot_drag['foot'],self._foot_drag['index']) and self._foot_drag['original'] is not None:continue
-                    rect=self._contact_rect(foot,self.contacts[foot][index]);p.fillRect(rect,tint)
-                    p.setPen(QPen(QColor(color),1));p.drawRect(rect)
-                    if rect.width()>42:
-                        s,e=self.contacts[foot][index]
-                        p.drawText(rect,Qt.AlignCenter,f'{s+1}–{e}' if self._selected_contact==(foot,index) else 'Lock')
-            p.restore()
+            self._paint_track_intervals(p,foot,color,'Lock')
+        self.paint_self_contact_rows(p)
+
+    def _paint_track_intervals(self,p,foot,color,label):
+        y=28+(foot+2)*self.TRACK_HEIGHT;track=self._track(foot)
+        p.save();p.setClipRect(QRectF(self.LEFT,y,max(1,self.width()-self.LEFT-self.RIGHT),self.TRACK_HEIGHT))
+        tint=QColor(color);tint.setAlpha(90 if self._editable(foot) else 40)
+        lo=bisect_right(self._contact_ends[foot],self.view_start)
+        hi=bisect_right(self._contact_starts[foot],self.view_start+self.span())
+        if hi-lo>max(1,(self.width()-self.LEFT-self.RIGHT)//3):
+            # At distant zoom, query coverage per pixel column rather than
+            # scanning every contact in a multi-hour recording.
+            for x in range(self.LEFT,self.width()-self.RIGHT,3):
+                self.contact_draw_queries+=1
+                a=self.view_start+(x-self.LEFT)*self.span()/max(1,self.width()-self.LEFT-self.RIGHT)
+                b=a+3*self.span()/max(1,self.width()-self.LEFT-self.RIGHT)
+                index=bisect_right(self._contact_ends[foot],a)
+                if index<len(track) and track[index][0]<b:p.fillRect(QRectF(x,y+2,3,self.TRACK_HEIGHT-5),tint)
+        else:
+            for index in range(lo,hi):
+                self.contact_draw_queries+=1
+                if self._foot_drag and (foot,index)==(self._foot_drag['foot'],self._foot_drag['index']) and self._foot_drag['original'] is not None:continue
+                rect=self._contact_rect(foot,track[index]);p.fillRect(rect,tint)
+                p.setPen(QPen(QColor(color),1));p.drawRect(rect)
+                if rect.width()>42:
+                    s,e=track[index]
+                    p.drawText(rect,Qt.AlignCenter,f'{s+1}–{e}' if self._selected_contact==(foot,index) else label)
+        p.restore()
 
     def paint_contact_selection(self,p):
         target=None
         if self._foot_drag and self._foot_draft is not None:target=(self._foot_drag['foot'],self._foot_draft)
         elif self._selected_contact is not None:
             foot,index=self._selected_contact
-            if index<len(self.contacts[foot]):target=(foot,self.contacts[foot][index])
+            if index is not None and index<len(self._track(foot)):target=(foot,self._track(foot)[index])
         if target:
             foot,interval=target
             p.save();p.setClipRect(QRectF(self.LEFT,25,max(1,self.width()-self.LEFT-self.RIGHT),self.height()-25))

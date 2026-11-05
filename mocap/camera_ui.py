@@ -74,10 +74,11 @@ def actors(view):
         if 0<=view.index<len(view.target_frames):
             p,parents=skeleton(view.target_frames[view.index],view.target_asset)
             yield p,parents,'#ffcf4a'
+    if not view.people_mode and getattr(view,'compare_overlay',None) is not None:yield from view.compare_overlay.camera_actors(view)
 
 class CameraCanvas(VideoView):
     def __init__(self,tools):
-        super().__init__();self.tools=tools;self.show_observations=False;self.pair=None
+        super().__init__();self.tools=tools;self.show_observations=False;self.pair=None;self.pair_index=None
     def mirror(self,*args):
         tool=self.tools;w=tool.w;source=w.video_view;view=w.motion_view
         if not tool.data or source.frame is None:
@@ -90,7 +91,7 @@ class CameraCanvas(VideoView):
         # Approximate displacement is a camera-gizmo aid, not a replacement for
         # the saved projection used to inspect the source/correction overlay.
         matrix=at(camera,view.scene_time,0)
-        self.pair=(camera,matrix,list(actors(view)) if ready else [])
+        self.pair=(camera,matrix,list(actors(view)) if ready else []);self.pair_index=view.index if ready else None
         self.frame=source.frame;self.source_size=source.source_size;self.index=source.index;self.update();source.update()
     def paintEvent(self,event):
         super().paintEvent(event)
@@ -208,6 +209,8 @@ class CameraTools:
                                 q=np.array([a,b])@k.T;q=q[:,:2]/q[:,2:]
                                 q[:,0]=rect.left()+q[:,0]*rect.width()/width;q[:,1]=rect.top()+q[:,1]*rect.height()/height
                                 painter.drawLine(QPointF(*q[0]),QPointF(*q[1]))
+                        overlay=getattr(self.w.motion_view,'compare_overlay',None)
+                        if overlay is not None and overlay.show:overlay.paint_keypoints(painter,rect,camera,self.canvas.pair_index,labels)
                         painter.setClipping(False)
                     if labels and not paired_actors:message+=' | no source bones at this time'
                     if labels and self.message:message+='\n'+self.message

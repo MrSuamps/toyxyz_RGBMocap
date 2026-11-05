@@ -407,6 +407,8 @@ class MainWindow(PreviewExportWorkspace,PearWorkspace,PromptHMRWorkspace,MammaWo
         self.data_loader.failed.connect(self.preview_failed)
         self.data_loader.tracked_actor_ready.connect(self.tracked_actor_ready)
         build_workspace(self)
+        from .selfcontact_ui import SelfContactController
+        self.self_contacts=SelfContactController(self)
         self.init_characters()
         self.video_view.frame_presented.connect(self.refresh_preview_export_action)
         self.scene_loader.ready.connect(self.refresh_preview_export_action)
@@ -521,6 +523,7 @@ class MainWindow(PreviewExportWorkspace,PearWorkspace,PromptHMRWorkspace,MammaWo
         self.sync_mamma_controls()
         self.sync_prompthmr_controls()
         if hasattr(self,'camera_tools'):self.camera_tools.sync()
+        if hasattr(self,'self_contacts'):self.self_contacts.sync()
 
     def sync_correction_floor_preview(self):
         self.motion_view.correction_floor_applicable=self.correction_mode.currentData()=='flat'
@@ -984,6 +987,7 @@ class MainWindow(PreviewExportWorkspace,PearWorkspace,PromptHMRWorkspace,MammaWo
         self.data_loader.wait()
         self.contact_writer.stop()
         self.contact_writer.wait()
+        if hasattr(self,'self_contacts'):self.self_contacts.close()
         self.video_view.shutdown()
         self.motion_view.cleanup_gl()
 
@@ -1148,6 +1152,7 @@ class MainWindow(PreviewExportWorkspace,PearWorkspace,PromptHMRWorkspace,MammaWo
             identity=(str(self.project),base),token=id(info))
         from .foot_contacts import contact_levels
         self.motion_view.foot_lock_levels=lambda frame:contact_levels(info,frame)
+        if hasattr(self,'self_contacts'):self.self_contacts.refresh()
 
     def foot_contacts_changed(self,ranges):
         self.save_foot_contacts(ranges)

@@ -912,6 +912,7 @@ class MotionView(ViewportBase):
                 painter.setBrush(QColor("#66baff"))
                 painter.drawPolygon(QPolygonF([QPointF(*point) for point in arrow]))
             self.draw_mesh(painter,index)
+            if getattr(self,'compare_overlay',None) is not None:self.compare_overlay.paint_view(self,painter,index,lines3d)
             bone_actors=None
             painter.setPen(QColor("#bebebe"))
             painter.drawText(QRectF(18, 39, self.width() - 36, 20), Qt.AlignLeft, f"Frame {index + 1} / {len(self.joints)}")

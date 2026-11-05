@@ -21,6 +21,9 @@ def main():
     if stage=='camera_reference':
         from .camera_reference import main as camera_main
         return camera_main()
+    if stage=='selfcontact_compare':
+        from .compare_worker import main as compare_main
+        return compare_main()
     if stage=='copy_bvh':
         from .source_export_worker import main as save_main
         return save_main(emit)
