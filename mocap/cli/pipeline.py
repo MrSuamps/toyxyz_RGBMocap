@@ -134,7 +134,7 @@ def build_settings(args, model, saved=None):
                 raise CliError('--floor expects a height in meters or "auto"', 2) from None
     if getattr(args, 'pelvis_offset', None) is not None:
         options['pelvis_offset'] = round(float(args.pelvis_offset), 3)
-    for key in ('foot_lock', 'hand_lock'):
+    for key in ('foot_lock', 'hand_lock', 'grounding'):
         if getattr(args, key, None) is not None:
             options[key] = getattr(args, key)
     try:

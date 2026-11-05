@@ -38,11 +38,14 @@ COMPATIBLE_CODE = {
     # Self-contact, foot articulation, placement and smoothing passes run only when a project has those rows; without them the
     # corrected tensors are byte-identical.
     'correction.py': {
-        '7b25e1eb57ed810bdf995a918d7b7633e7e558c25f982ba273f7d64783105ec3': '5a4ebe5d6b5c5bc808374ccc58508248b25b4f97af9f5fb25ee957b76e3e8c1b',
-        '12f1b1bde44627ecd0df187a28454c9db05f80693f679aa0de9932e4c353c469': '5a4ebe5d6b5c5bc808374ccc58508248b25b4f97af9f5fb25ee957b76e3e8c1b',
-        '3819776b36321c8b8b7a6bd382d9fdf62f6364e15e1d55ec46010df3bb42e024': '5a4ebe5d6b5c5bc808374ccc58508248b25b4f97af9f5fb25ee957b76e3e8c1b',
-        '013d4078998fa572c66eb8f648bed4d9a56d3da35e1b598d5d823af6229af0bc': '5a4ebe5d6b5c5bc808374ccc58508248b25b4f97af9f5fb25ee957b76e3e8c1b',
+        '7b25e1eb57ed810bdf995a918d7b7633e7e558c25f982ba273f7d64783105ec3': 'e00370016af9c4dbf04a385a0060d989e88e4bee0b18fc8cf78361ace6eb9e7a',
+        '12f1b1bde44627ecd0df187a28454c9db05f80693f679aa0de9932e4c353c469': 'e00370016af9c4dbf04a385a0060d989e88e4bee0b18fc8cf78361ace6eb9e7a',
+        '3819776b36321c8b8b7a6bd382d9fdf62f6364e15e1d55ec46010df3bb42e024': 'e00370016af9c4dbf04a385a0060d989e88e4bee0b18fc8cf78361ace6eb9e7a',
+        '013d4078998fa572c66eb8f648bed4d9a56d3da35e1b598d5d823af6229af0bc': 'e00370016af9c4dbf04a385a0060d989e88e4bee0b18fc8cf78361ace6eb9e7a',
+        '5a4ebe5d6b5c5bc808374ccc58508248b25b4f97af9f5fb25ee957b76e3e8c1b': 'e00370016af9c4dbf04a385a0060d989e88e4bee0b18fc8cf78361ace6eb9e7a',
     },
+    # Camera grounding is opt-in; the default vertical grounding keeps every option and result unchanged.
+    'correction_settings.py': {'83d0a23eafe9a40a6da6acaee3581be81b54a1e9f394c8a08f862aff7b46f51a': '430cf3e5b6d97ee6e1e6e051f63261b83070bcad86d2412ef242926d46374855'},
 }
 
 

@@ -662,6 +662,9 @@ def build_parser():
     p.add_argument('--project', required=True, metavar='P', help='workspace root, model project, people root or person take')
     p.add_argument('--people', nargs='+', metavar='ID', help='people whose takes receive the settings (default: all corrected takes)')
     p.add_argument('--result', choices=results, metavar='KIND', help='base result to correct (default: the project selection)')
+    p.add_argument('--grounding', choices=('vertical', 'camera'),
+                   help='flat-ground root move: vertical (default), or camera (static ExMR camera: also toward/away from the camera so the '
+                        'body stays on the person)')
     p.add_argument('--no-character-refresh', dest='no_character_refresh', action='store_true',
                    help='only mark linked characters as needing retarget')
     p.add_argument('--model', choices=MODELS, help='model inside a workspace root (default: its active model)')

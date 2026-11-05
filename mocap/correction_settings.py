@@ -20,6 +20,8 @@ DESCRIPTIONS = {
 MODES = {'flat': 'Flat Ground', 'multi_level': 'Multi Level'}
 MODE_HELP = ('Flat Ground uses one correction floor. Multi Level keeps source elevation and locks each stance at its own 3D position. '
              'Use for stairs, slopes and climbing. It preserves inferred distal rotations and does not reconstruct terrain. Overhead hand contacts require manual timing.')
+# Flat-ground root move: straight down, or (static ExMR camera) also toward/away from the fixed camera to stay on the person.
+GROUNDING = ('vertical', 'camera')
 
 
 def correction_options(options=None):
@@ -37,7 +39,14 @@ def correction_options(options=None):
     pelvis = float(options.get('pelvis_offset', 0.))
     if not math.isfinite(pelvis) or abs(pelvis) > .25:
         raise ValueError('Pelvis height offset must be between -0.25 and +0.25 meters')
-    return {'auto_floor': auto, 'floor': floor, 'preset': preset, 'pelvis_offset': pelvis, 'mode':mode, 'foot_lock':bool(options.get('foot_lock',True)), 'hand_lock':bool(options.get('hand_lock',False))}
+    grounding = options.get('grounding', 'vertical')
+    if grounding not in GROUNDING:
+        raise ValueError('Unknown Motion Correction grounding: ' + str(grounding))
+    result = {'auto_floor': auto, 'floor': floor, 'preset': preset, 'pelvis_offset': pelvis, 'mode':mode,
+              'foot_lock':bool(options.get('foot_lock',True)), 'hand_lock':bool(options.get('hand_lock',False))}
+    # Absent means vertical, so saved settings, reports and cache identities of existing projects stay unchanged.
+    if grounding != 'vertical':result['grounding'] = grounding
+    return result
 
 
 def effective_options(project,state):

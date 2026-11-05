@@ -290,6 +290,41 @@ airborne intervals, and split anchors when the source intentionally travels.
     return active,anchors,offsets,shift,floor,segments
 
 
+def static_camera_centre(project,source,pelvis):
+    """World centre of the one fixed camera the GUI camera view uses for a static ExMR take (frame-0 pairing), else None."""
+    try:
+        sources=json.loads((project/'exmr_camera_sources.json').read_text(encoding='utf-8'))
+        policy=json.loads(((project/sources['root']).resolve()/'exmr_camera.json').read_text(encoding='utf-8'))
+        if not policy['identity']['static']:return None
+        world,incam=source['smpl_params_global'],source['smpl_params_incam']
+    except (OSError,ValueError,KeyError,TypeError):return None
+    rotation=lambda params:Rotation.from_rotvec(params['global_orient'][0].numpy()).as_matrix()
+    paired=rotation(incam)@rotation(world).T
+    centre=world['transl'][0].numpy()+pelvis-paired.T@(incam['transl'][0].numpy()+pelvis)
+    return np.asarray(centre,float) if np.isfinite(centre).all() else None
+
+
+def camera_grounding(rest,roots,quats,probes,probabilities,fps,floor,preset,contact_ranges,centre):
+    """Move the source root in X/Z so the flat grounding drop keeps the body where a static camera sees the person.
+
+Per frame, the X/Z move minimises the joints' summed angular displacement seen from `centre`, with the Y move fixed to
+the grounding drop. Modifies `roots` and `probes` in place; returns the report entry."""
+    drop=prepare_contacts(probes,probabilities,fps,floor,preset,contact_ranges)[3][:,1].astype(float)
+    joints=fk(rest,np.asarray(roots,float),np.asarray(quats,float))[0]
+    d=joints-centre;inverse=1/np.einsum('tjk,tjk->tj',d,d)
+    # Sum over joints of (I - u u^T)/r^2 (u the unit ray, r its length): the angular displacement a translation causes.
+    a=np.eye(3)*inverse.sum(1)[:,None,None]-np.einsum('tji,tjk,tj->tik',d,d,inverse**2)
+    xz=-np.linalg.solve(a[:,[0,2]][:,:,[0,2]],a[:,[0,2],1:2]*drop[:,None,None])[...,0]
+    # Over 2 s, so the per-frame pose spread does not slide a planted foot.
+    xz=gaussian_filter1d(xz,2*fps,axis=0,mode='nearest')
+    xz*=np.minimum(1.,.75/np.maximum(np.linalg.norm(xz,axis=1),1e-8))[:,None]
+    roots[:,[0,2]]+=xz.astype(roots.dtype);probes[...,[0,2]]+=xz[:,None].astype(probes.dtype)
+    pelvis=joints[:,0]-centre;moved=pelvis+np.c_[xz[:,0],drop,xz[:,1]]
+    depth=np.linalg.norm(moved,axis=1)-np.linalg.norm(pelvis,axis=1)
+    return {'camera_centre':centre.tolist(),'max_xz_m':float(np.linalg.norm(xz,axis=1).max()),
+            'depth_change_m':[float(depth.min()),float(depth.max())]}
+
+
 def correct_arrays(rest, root, quat, probes, probabilities, fps=30., floor=None, core=CORE, output=None, emit=lambda *a,**k:None, preset='normal',contact_ranges=None,pelvis_offset=0.,mode='flat',foot_enabled=True):
     from .correction_settings import correction_options
     pelvis_offset=correction_options({'pelvis_offset':pelvis_offset})['pelvis_offset']
@@ -638,6 +673,12 @@ def run(project,emit,result):
                 # Articulated feet (pointe/flat/match) are source pose: the foot plan, grounding and leg IK all see them.
                 from .foot_articulation import from_store as articulate
                 feet=articulate(project,base,context,geometry,roots,quats,probes,fps,transform,emit)
+                grounding=None
+                if options.get('grounding')=='camera':
+                    centre=None if shared or options['mode']!='flat' or not options['foot_lock'] else static_camera_centre(project,source,geometry.rest[0])
+                    grounding=(camera_grounding(geometry.rest[:22],roots,quats,probes,probabilities,fps,floor,preset,contact_ranges,centre)
+                               if centre is not None else {'warning':'Camera grounding needs one static ExMR camera, Flat Ground and foot lock; '
+                                                                     'the body was grounded vertically.'})
                 for attempt in range(1 if feet is None else 1+feet.passes):
                     # Shin-relative feet (pointe) re-aim at the corrected shins between passes; the leg IK keeps ankle world rotations.
                     if attempt and not feet.follow_shins(geometry,roots,quats,probes,out_roots,out_quats):break
@@ -647,6 +688,9 @@ def run(project,emit,result):
                 if feet is not None:
                     report['foot_articulation']=feet.report
                     report['warning']=' '.join(filter(None,(report['warning'],feet.report['warning'])))
+                if grounding is not None:
+                    report['camera_grounding']=grounding
+                    report['warning']=' '.join(filter(None,(report['warning'],grounding.get('warning'))))
                 from .hand_lock import apply as apply_hands
                 report['hand_lock']=apply_hands(geometry.rest[:22],roots,quats,out_roots,out_quats,geometry.palm_offsets,fps,options['mode'],report['floor'],preset,hand_ranges,options['hand_lock'],emit)
                 report['warning']=' '.join(filter(None,(report['warning'],report['hand_lock']['warning'])))

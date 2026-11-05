@@ -114,7 +114,7 @@ is resolved once. If the workspace has no project for `--model` yet, the workspa
 
 ```
 rgbmocap-cli.cmd correct --project P [--preset ...] [--floor ...] [--floor-mode ...] [--pelvis-offset M] [--foot-lock ...] [--hand-lock ...]
-                         [--people 1,3] [--result KIND] [--no-character-refresh]
+                         [--people 1,3] [--result KIND] [--grounding vertical|camera] [--no-character-refresh]
 ```
 
 The GUI's Apply Correction: the correction settings are written to the project, then `correct` and `export` run. On a people root
@@ -126,7 +126,9 @@ The flat floor model shifts the root so each support frame lands on one floor he
 more than 0.15 m (the source world's floor drifts or tilts), `<kind>_correction.json` `warning` says so: the body may
 move off the video person (review `body_offset`); Multi Level keeps the source elevation. For a moving ExMR camera, the
 GUI camera gizmos and the Blender export camera follow the root change correction made, so the body keeps its place in
-view.
+view. `--grounding camera` (single static-camera ExMR take, Flat Ground; saved with the settings, the GUI does not show it)
+also moves the root toward or away from the GUI's fixed camera, smoothed over 2 s, so the drop keeps the body on the
+person; `<kind>_correction.json` `camera_grounding` gives the depth change. Default `vertical`.
 
 ## Export
 
