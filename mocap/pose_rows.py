@@ -53,6 +53,9 @@ class Section:
     writer: str = ''    # save(project, base, entries, context)
     normalizer: str = ''  # normalize(entries, frames) -> validated entries with ids
     mode_field: str = 'mode'
+    # Single-row section whose intervals may overlap (the store's normalizer decides which): they stack in lanes, plus an empty
+    # lane to draw an overlapping interval in.
+    stack: bool = False
 
     def setting_keys(self):
         return ((self.mode_field,) if self.mode_field else ()) + tuple(p.name for p in self.params) + ('enabled',)
@@ -86,7 +89,7 @@ SECTIONS = (
             (Param('joints', 'Joints', 'list', presets=('all-written', 'arms', 'legs', 'spine')),
              Param('window_frames', 'Window', 'int', low=3, high=61, presets=(3, 5, 9, 15), suffix='f')),
             dict(joints='all-written', window_frames=5, enabled=True), 'read_smoothing', 'save_smoothing', 'normalize_smoothing',
-            mode_field=None),
+            mode_field=None, stack=True),
 )
 
 
@@ -117,7 +120,8 @@ def _key(values):
 class PoseRows:
     """Entries of one section with snapshot undo; every committed state passes the store's normalizer.
 
-    Stricter than the store: no two intervals of one row overlap, enabled or not, so a row reads as one interval list."""
+    Stricter than the store: no two intervals of one row overlap, enabled or not, so a row reads as one interval list. A stacked
+    section is one row shown as lanes instead: overlapping intervals go to the first lane they fit in, earliest start first."""
 
     LIMIT = 100
 
@@ -184,7 +188,7 @@ class PoseRows:
             entry['ranges'] = clamp(entry['ranges'], self.frames)
         entries = [e for e in entries if e['ranges'] or e.get('automatic')]
         entries = self._normalize(entries)
-        for r in range(len(self.section.rows)):
+        for r in range(0 if self.section.stack else len(self.section.rows)):
             pieces = sorted((s, e) for entry in self._row_entries(entries, r) for s, e in entry['ranges'])
             for (s0, e0), (s1, e1) in zip(pieces, pieces[1:]):
                 if s1 < e0:
@@ -200,11 +204,35 @@ class PoseRows:
 
     # Rows -------------------------------------------------------------------------------------------------------------
 
+    def _layout(self):
+        """Per timeline row, sorted (start, end, entry index); a stacked section's rows are its lanes."""
+        if self._rows is None:
+            if not self.section.stack:
+                self._rows = [sorted((s, e, i) for i, entry in enumerate(self.entries) if self._in_row(entry, row) for s, e in entry['ranges'])
+                              for row in range(len(self.section.rows))]
+            else:
+                lanes = []
+                for piece in sorted((s, e, i) for i, entry in enumerate(self.entries) for s, e in entry['ranges']):
+                    lane = next((lane for lane in lanes if lane[-1][1] <= piece[0]), None)
+                    if lane is None:
+                        lanes.append([piece])
+                    else:
+                        lane.append(piece)
+                self._rows = lanes + [[]]
+        return self._rows
+
     def row_count(self):
-        return len(self.section.rows)
+        return len(self._layout())
 
     def row_label(self, r):
-        return self.section.rows[r][1]
+        label = self.section.rows[0 if self.section.stack else r][1]
+        if not self.section.stack or r == 0:
+            return label
+        return f'{label} {r + 1}' if self.intervals(r) else '+ ' + label
+
+    def is_spare(self, r):
+        """The empty lane below a stacked section's intervals."""
+        return self.section.stack and r > 0 and not self.intervals(r)
 
     def _in_row(self, entry, r):
         name = self.section.row_field
@@ -215,13 +243,27 @@ class PoseRows:
 
     def intervals(self, r):
         """Sorted (start, end, entry index) of one row."""
-        if self._rows is None:
-            self._rows = [sorted((s, e, i) for i, entry in enumerate(self.entries) if self._in_row(entry, row) for s, e in entry['ranges'])
-                          for row in range(self.row_count())]
-        return self._rows[r]
+        layout = self._layout()
+        return layout[r] if r < len(layout) else []
 
     def ranges(self, r):
         return [(s, e) for s, e, _ in self.intervals(r)]
+
+    def _taken(self, r):
+        """Frames suggestions of row r may not cover: the row, or every lane of a stacked section."""
+        from .selfcontact_rows import merge
+        return merge(p for lane in range(self.row_count()) for p in self.ranges(lane)) if self.section.stack else self.ranges(r)
+
+    def locate(self, piece):
+        """(row, position) of the interval equal to piece, else of the first one holding its first frame, else None."""
+        found = None
+        for r in range(self.row_count()):
+            for position, (s, e, _) in enumerate(self.intervals(r)):
+                if (s, e) == tuple(piece):
+                    return r, position
+                if found is None and s <= piece[0] < e:
+                    found = r, position
+        return found
 
     def settings(self, entry):
         return {k: entry.get(k, self.section.defaults.get(k)) for k in self.section.setting_keys()}
@@ -286,15 +328,19 @@ class PoseRows:
     def suggestions(self, r):
         """(start, end, entry index) automatic intervals not covered by the row."""
         from .selfcontact_rows import subtract
-        taken = self.ranges(r)
+        if self.section.stack and r:
+            return []  # A stacked section shows its suggestions in the first lane.
+        taken = self._taken(r)
         return sorted((s, e, i) for i, entry in enumerate(self.entries) if self._in_row(entry, r)
                       for s, e in subtract(entry.get('automatic', []), taken))
 
     def accept(self, r, interval=None):
         """Copy suggestions (all, or those inside interval) into their entries; returns accepted frames."""
         from .selfcontact_rows import merge, subtract
+        if self.section.stack and r:
+            return 0
         entries = copy.deepcopy(self.entries)
-        taken, total = self.ranges(r), 0
+        taken, total = self._taken(r), 0
         for i, entry in enumerate(entries):
             if not self._in_row(entry, r):
                 continue
@@ -320,12 +366,19 @@ class PoseRows:
         self._commit(entries)
 
     def clear_row(self, r):
+        """Remove the row's intervals; in a stacked section only those of lane r."""
         entries = copy.deepcopy(self.entries)
-        for entry in self._row_entries(entries, r):
-            entry['ranges'] = []
+        if self.section.stack:
+            for s, e, i in self.intervals(r):
+                entries[i]['ranges'] = [p for p in entries[i]['ranges'] if p != (s, e)]
+        else:
+            for entry in self._row_entries(entries, r):
+                entry['ranges'] = []
         self._commit(entries)
 
     def has_automatic(self, r):
+        if self.section.stack and r:
+            return False
         return any(entry.get('automatic') for entry in self._row_entries(self.entries, r))
 
 
@@ -400,7 +453,8 @@ class SettingsDialog:
 class PoseRowEditor:
     """Timeline mixin for pose rows; track index t = pose_first_row() + n addresses pose row n, after the '+ Pair' row.
 
-    The host (SelfContactEditor) provides placeholder_row(), sc_visible/sc_editable and the shared undo plumbing."""
+    The host (SelfContactEditor) provides placeholder_row(), sc_visible/sc_editable, _update_self_height() and the shared undo
+    plumbing."""
 
     def init_pose_rows(self):
         self.pose_models = [PoseRows(section) for section in SECTIONS]
@@ -428,6 +482,16 @@ class PoseRowEditor:
     def pose_row_models(self):
         return [(model, r) for model in self.pose_models for r in range(model.row_count())]
 
+    def pose_track(self, model, r):
+        """Track index t of row r of model."""
+        return self.pose_first_row() + self.pose_row_models().index((model, r))
+
+    def _select_piece(self, model, piece):
+        """Follow an edited interval of a stacked section, whose lanes are laid out again after every edit."""
+        found = model.locate(piece) if model.section.stack else None
+        if found is not None:
+            self._selected_contact = (self.pose_track(model, found[0]), found[1])
+
     def pose_writable(self, model):
         return self.sc_editable and not self.pose_messages.get(model.section.key)
 
@@ -444,6 +508,7 @@ class PoseRowEditor:
             self._foot_drag = None
             self._foot_draft = None
         self._index_contacts()
+        self._update_self_height()
 
     def pose_command(self, t, index, before, after):
         model, r = self.pose_row(t)
@@ -451,6 +516,8 @@ class PoseRowEditor:
         if self._model_apply(model, model.set_interval, r, index, before, after) is None:
             self._selected_contact = None
             self._index_contacts()
+        elif after is not None:
+            self._select_piece(model, after)
 
     def _pose_suggestion(self, t, frame):
         model, r = self.pose_row(t)
@@ -542,7 +609,9 @@ class PoseRowEditor:
             self.contact_revision += 1
             self.update()
             return
-        self._model_apply(model, model.set_settings, r, index, **values)
+        piece = model.intervals(r)[index][:2]
+        if self._model_apply(model, model.set_settings, r, index, **values) is not None:
+            self._select_piece(model, piece)
 
     def _pose_dialog(self, model, r, index):
         current = model.interval_settings(r, index) if index is not None else model.draw_settings(r)
@@ -565,7 +634,7 @@ class PoseRowEditor:
         for n, (model, r) in enumerate(self.pose_row_models()):
             t = first + n
             y = 28 + (t + 2) * self.TRACK_HEIGHT
-            p.setPen(QColor('#aaaaaa'))
+            p.setPen(QColor('#8c8c8c' if model.is_spare(r) else '#aaaaaa'))
             p.drawText(QRectF(8, y, 53, self.TRACK_HEIGHT), Qt.AlignVCenter, model.row_label(r))
             text_rect = QRectF(self.LEFT + 8, y, max(0, width - 11), self.TRACK_HEIGHT)
             message = self.pose_messages.get(model.section.key)
@@ -612,4 +681,7 @@ class PoseRowEditor:
                 p.setPen(QColor('#777777'))
                 hint = f'Drag to add {model.describe(model.draw_settings(r))}; right-click for ' + ('modes and settings' if model.section.mode_field
                                                                                                   else 'settings')
+                if model.is_spare(r):
+                    hint = (f'Drag to add {model.describe(model.draw_settings(r))} overlapping the rows above (other joints); '
+                            'right-click for settings')
                 p.drawText(text_rect, Qt.AlignVCenter, hint)

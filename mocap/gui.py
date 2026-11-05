@@ -490,6 +490,7 @@ class MainWindow(PreviewExportWorkspace,PearWorkspace,PromptHMRWorkspace,MammaWo
         flat=self.correction_mode.currentData()=='flat'
         self.auto_floor.setEnabled(not self.busy and flat)
         self.floor_height.setEnabled(not self.busy and flat and not self.auto_floor.isChecked())
+        self.correction_grounding.setEnabled(not self.busy and flat)
         self.correction_button.setEnabled(not self.busy and not self.contact_saving and self.project is not None and
             (self.project/RESULTS[base_result(self.active_result)][0]).exists())
         self.slider.trim_enabled = not self.busy and self.info is not None
@@ -1086,7 +1087,8 @@ class MainWindow(PreviewExportWorkspace,PearWorkspace,PromptHMRWorkspace,MammaWo
         from .correction_settings import correction_options
         return correction_options({'auto_floor':self.auto_floor.isChecked(),'floor':self.floor_height.value(),
                                    'mode':self.correction_mode.currentData(),'foot_lock':self.foot_lock.isChecked(),'hand_lock':self.hand_lock.isChecked(),
-                                   'preset':self.correction_preset.currentData(),'pelvis_offset':self.pelvis_offset.value()})
+                                   'preset':self.correction_preset.currentData(),'pelvis_offset':self.pelvis_offset.value(),
+                                   'grounding':self.correction_grounding.currentData()})
 
     def update_correction_description(self):
         descriptions = {
@@ -1099,11 +1101,14 @@ class MainWindow(PreviewExportWorkspace,PearWorkspace,PromptHMRWorkspace,MammaWo
             self.floor_description.setText('Multi Level uses the inferred height of each foot contact. This floor value is unused; switch to Flat Ground to edit it.')
         else:
             self.floor_description.setText('Higher values raise the correction floor. Use the Correction Floor checkbox to preview it; Apply Correction updates the motion.')
+        from .workspace_ui import camera_grounding_note
+        self.grounding_note.setText(camera_grounding_note(getattr(self,'project',None),self.selected_correction_options()))
 
     def restore_correction_options(self, options):
         from .correction_settings import correction_options
         options=correction_options(options)
-        controls=(self.correction_mode,self.correction_preset,self.auto_floor,self.floor_height,self.pelvis_offset,self.foot_lock,self.hand_lock)
+        controls=(self.correction_mode,self.correction_preset,self.auto_floor,self.floor_height,self.pelvis_offset,self.foot_lock,self.hand_lock,
+                  self.correction_grounding)
         for control in controls:control.blockSignals(True)
         try:
             self.correction_preset.setCurrentIndex(self.correction_preset.findData(options['preset']))
@@ -1111,6 +1116,7 @@ class MainWindow(PreviewExportWorkspace,PearWorkspace,PromptHMRWorkspace,MammaWo
             self.foot_lock.setChecked(options['foot_lock']);self.hand_lock.setChecked(options['hand_lock'])
             self.auto_floor.setChecked(options['auto_floor']);self.floor_height.setValue(options['floor'])
             self.pelvis_offset.setValue(options['pelvis_offset'])
+            self.correction_grounding.setCurrentIndex(self.correction_grounding.findData(options.get('grounding','vertical')))
         finally:
             for control in controls:control.blockSignals(False)
         self.update_correction_description()

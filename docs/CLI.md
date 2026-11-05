@@ -126,9 +126,12 @@ The flat floor model shifts the root so each support frame lands on one floor he
 more than 0.15 m (the source world's floor drifts or tilts), `<kind>_correction.json` `warning` says so: the body may
 move off the video person (review `body_offset`); Multi Level keeps the source elevation. For a moving ExMR camera, the
 GUI camera gizmos and the Blender export camera follow the root change correction made, so the body keeps its place in
-view. `--grounding camera` (single static-camera ExMR take, Flat Ground; saved with the settings, the GUI does not show it)
-also moves the root toward or away from the GUI's fixed camera, smoothed over 2 s, so the drop keeps the body on the
-person; `<kind>_correction.json` `camera_grounding` gives the depth change. Default `vertical`.
+view. `--grounding camera` (single static-camera ExMR take, Flat Ground; saved with the settings and shown as the app's
+**Grounding** setting) also moves the root toward or away from the GUI's fixed camera, smoothed over 2 s, so the drop keeps
+the body on the person; `<kind>_correction.json` `camera_grounding` gives the depth change. Elsewhere (moving camera, people
+group, Multi Level, foot lock off, other models) the take is grounded vertically and `warning` says so (FlowHMR correction
+ignores the setting). Default `vertical` (not stored); later `correct` runs keep the saved value, `capture` and
+`reconstruct` start again from `vertical`.
 
 ## Export
 
@@ -443,7 +446,8 @@ One enabled row per chain and frame; ids default to e.g. `rl-place`. Placement n
 A pose smoothing row calms rotation jitter of a bone group (`--group`, default `all-written`: the legs, plus the arms when
 the hand lock moved them) or a bone list (`--joints`, any body bone except `Hips`) over frame intervals; `correct` applies
 it last, after the self-contacts. `--window` is the Gaussian window in frames (3-61, default 5; keep it small). Leg joints
-stay put while their foot is locked. Enabled rows sharing a bone may not overlap; ids default to e.g. `smooth-arms`.
+stay put while their foot is locked. Enabled rows sharing a bone may not overlap (rows of other bones may; the app's Smooth
+row stacks them in lanes); ids default to e.g. `smooth-arms`.
 
 Both use the same inclusive `--frames`, live in the same `selfcontact_<base>_*.json` files (`placement`, `smoothing`) and
 make the corrected result stale the same way. `place remove --all` / `smooth remove --all` remove only their own rows and

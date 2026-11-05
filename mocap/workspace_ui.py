@@ -13,6 +13,28 @@ from .paths import ROOT
 from .correction_settings import PRESETS
 from .sidebar_scroll import SettingsScrollArea
 
+GROUNDING_HELP=('How Flat Ground moves the body onto the correction floor. Vertical (default) only lowers or raises it. Camera, for one static '
+                'ExMR camera with Foot on, also moves it toward or away from the camera, smoothed over 2 s, so the body stays on the person in '
+                'the video. Moving cameras, people groups and other models are grounded vertically. Apply Correction to update.')
+
+
+def camera_grounding_note(project,options):
+    """Why correction grounds this take vertically even with Camera selected, or ''. Mirrors the checks in correction.run."""
+    if project is None:return ''
+    import json
+    from pathlib import Path
+    project=Path(project)
+    if options.get('mode','flat')!='flat':return 'Multi Level keeps the source elevation; grounding applies to Flat Ground only.'
+    if not options.get('foot_lock',True):return 'Camera grounding needs Foot correction; this take is grounded vertically.'
+    try:
+        from .scene_floor import scene_root
+        if scene_root(project) is not None:return 'People share one floor, so camera grounding is unavailable; takes are grounded vertically.'
+        sources=json.loads((project/'exmr_camera_sources.json').read_text(encoding='utf-8'))
+        static=json.loads(((project/sources['root']).resolve()/'exmr_camera.json').read_text(encoding='utf-8'))['identity']['static']
+    except (OSError,ValueError,KeyError,TypeError):
+        return 'Camera grounding needs an ExMR take with a saved camera; this take is grounded vertically.'
+    return '' if static else 'Moving camera: this take is grounded vertically, and the camera follows the corrected body instead.'
+
 
 class WrappedLabel(QLabel):
     """Reserve wrapped text height inside stacked, scrollable settings pages."""
@@ -494,6 +516,13 @@ def build_workspace(w):
     contact.addWidget(w.floor_height)
     w.floor_description=TooltipHelp('Higher values raise the correction floor. Use the Correction Floor checkbox to preview it; Apply Correction updates the motion.',w.floor_height,w.floor_height_label,w.auto_floor)
     w.floor_description.setObjectName('muted');w.floor_description.setWordWrap(True);contact.addWidget(w.floor_description)
+    from .correction_settings import GROUNDING
+    w.grounding_label=QLabel('Grounding');contact.addWidget(w.grounding_label)
+    w.correction_grounding=QComboBox()
+    for key in GROUNDING:w.correction_grounding.addItem(key.title(),key)
+    w.correction_grounding.setToolTip(tooltip_text(GROUNDING_HELP))
+    contact.addWidget(w.correction_grounding)
+    w.grounding_note=TooltipHelp('',w.correction_grounding,w.grounding_label);contact.addWidget(w.grounding_note)
     w.pelvis_offset_label=QLabel('Pelvis Height Offset (from Auto)');contact.addWidget(w.pelvis_offset_label)
     w.pelvis_offset=QDoubleSpinBox();w.pelvis_offset.setRange(-.25,.25);w.pelvis_offset.setDecimals(3)
     w.pelvis_offset.setSingleStep(.005);w.pelvis_offset.setSuffix(' m');w.pelvis_offset.setSpecialValueText('')
@@ -514,6 +543,7 @@ def build_workspace(w):
     w.auto_floor.toggled.connect(w.correction_settings_changed)
     w.floor_height.valueChanged.connect(w.correction_settings_changed)
     w.pelvis_offset.valueChanged.connect(w.correction_settings_changed)
+    w.correction_grounding.currentIndexChanged.connect(w.correction_settings_changed)
     w.update_correction_description()
     processing = group("Processing Resources", settings)
     processing.addWidget(QLabel('Resource Mode'))

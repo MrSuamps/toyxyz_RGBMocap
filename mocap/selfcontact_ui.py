@@ -19,7 +19,8 @@ TIMELINE_HELP = (
     "L/R pose: foot articulation per interval (Match 2D, Pointe, Flat, Flexed).\n"
     "Drag to add an interval with the row's current mode; right-click to change mode, strength or limits (dancer allows full pointe).\n"
     "L/R arm 2D, L/R leg 2D: limb placement, fit the limb to the video's 2D keypoints (ExMR); right-click for strength.\n"
-    "Smooth: calm rotation jitter, applied last; right-click for joints (a group or bones) and window frames (keep it small).\n\n"
+    "Smooth: calm rotation jitter, applied last; right-click for joints (a group or bones) and window frames (keep it small).\n"
+    "Overlapping intervals (different joints) stack in Smooth 2, 3...; drag in the + Smooth lane to add one.\n\n"
     "Δ orig: largest joint change per frame against the original motion (Show Original in the 3D view).\n"
     "Edits save at once and share Ctrl+Z / Ctrl+Y with the locks; Apply Correction applies them to the motion.")
 
