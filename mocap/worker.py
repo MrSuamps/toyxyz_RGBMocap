@@ -73,6 +73,7 @@ def fingerprint(stage, project, result="auto", _worker_hash=None, _legacy_routin
         sources.append(Path(__file__).with_name('mixamo_rig.py'))
         sources.append(Path(__file__).with_name('correction_settings.py'))
         sources.append(Path(__file__).with_name('foot_contacts.py'))
+        sources.extend(Path(__file__).with_name(name) for name in ('self_contact.py','self_contact_store.py'))
         sources.extend((ROOT/'third_party/KimodoMotionCorrection/bin').glob('*.pyd'))
     if stage in ('correct','export'):
         sources.append(Path(__file__).with_name('result_artifacts.py'))

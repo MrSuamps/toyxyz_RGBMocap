@@ -122,6 +122,11 @@ def run(project,emit,result):
             ranges,_,_=read_edit(project,source_kind,context)
             if ranges is not None:
                 save_edit(project,kind,ranges,dict(frames=n,fps=fps,sources={target.name:file_stat(target),'hmr4d_results.pt':file_stat(project/'hmr4d_results.pt')}))
+        from . import self_contact_store
+        if not self_contact_store.state_path(project,kind).exists():
+            tracks,_,_=self_contact_store.read(project,source_kind,dict(frames=n,fps=fps))
+            if tracks:
+                self_contact_store.save(project,kind,tracks,dict(frames=n,fps=fps,sources={target.name:file_stat(target),'hmr4d_results.pt':file_stat(project/'hmr4d_results.pt')}))
         written.append(kind)
     if input_signature(project)[0]!=signature:raise ValueError('HandFlow inputs changed during merge.')
     atomic_json(project/'handflow_report.json',dict(results=written,cached=cached,frames=n,body_and_wrists_unchanged=True,

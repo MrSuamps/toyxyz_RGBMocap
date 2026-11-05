@@ -320,6 +320,9 @@ def prepare(project, result, emit=lambda *a, **k: None, body=None):
                 # torso and wrist world orientations still must match source.
                 hand_enabled=bool(saved.get('options',{}).get('hand_lock',False))
                 preserved_joints=tuple(j for j in upper_joints if not hand_enabled or j not in (13,14,16,17,18,19))
+                # Declared self-contact arm rows are exempt; wrists stay world-preserved.
+                exempt=[(c['start'],c['end'],[preserved_joints.index(j) for j in c['joints'] if j in preserved_joints and j not in (20,21)])
+                        for c in saved.get('self_contact',{}).get('changed',[])]
                 for start in range(0,n,128):
                     stop=min(n,start+128)
                     pair=[]
@@ -330,7 +333,9 @@ def prepare(project, result, emit=lambda *a, **k: None, body=None):
                             if p>=0:matrices[:,j]=matrices[:,p]@matrices[:,j]
                         pair.append(matrices[:,preserved_joints])
                     relative=pair[0].swapaxes(-1,-2)@pair[1]
-                    source_upper_delta=max(source_upper_delta,float(np.rad2deg(Rotation.from_matrix(relative.reshape(-1,3,3)).magnitude()).max()))
+                    angles=np.rad2deg(Rotation.from_matrix(relative.reshape(-1,3,3)).magnitude()).reshape(stop-start,-1)
+                    for s,e,ids in exempt:angles[max(s-start,0):max(e-start,0),ids]=0
+                    source_upper_delta=max(source_upper_delta,float(angles.max()))
                 report['upper_body_rotation_max_deg'] = source_upper_delta
                 report['source_preserved_rotation_joints']=list(preserved_joints)
                 if source_upper_delta > 0.01:

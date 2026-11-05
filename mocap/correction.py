@@ -641,6 +641,12 @@ def run(project,emit,result):
                 report['contact_revision']=contact_revision
                 if shared:report['shared_floor']=shared
                 if contact_warning:report['warning']=' '.join(filter(None,(report['warning'],contact_warning)))
+                from .self_contact import from_store as self_contact,publish_smplx
+                self_report,self_before=self_contact(project,base,context,geometry.rest[:22],out_roots,out_quats,geometry.palm_offsets,fps,
+                    report['segments'],emit)
+                if self_report is not None:
+                    report['self_contact']=self_report
+                    report['warning']=' '.join(filter(None,(report['warning'],self_report['warning'])))
                 pose=array('pose',(n,22,3));translation=array('translation',(n,3))
                 after=array('after-sole',(n,4,3))
                 for start in range(0,n,128):
@@ -677,12 +683,19 @@ def run(project,emit,result):
                         'A non-contact foot penetrates the correction floor; check floor height and contact timing.')))
                 output=dict(params)
                 output['body_pose']=params['body_pose'].clone()
-                for joint in (1,2,4,5,7,8) + ((13,14,16,17,18,19,20,21) if report['hand_lock']['contacts'] else ()):
+                written=(1,2,4,5,7,8) + ((13,14,16,17,18,19,20,21) if report['hand_lock']['contacts'] else ())
+                for joint in written:
                     output['body_pose'][:,3*(joint-1):3*joint]=torch.from_numpy(np.asarray(pose[:,joint]).copy())
+                if self_before is not None:prior=publish_smplx(output,params,pose,self_before,self_report['changed'],written)
                 output['transl']=torch.from_numpy(np.asarray(translation).copy())
                 begin_update(project,kind,'correct')
                 save_tensor({'smpl_params_global':output,'source':base,'method':report['method']},project/RESULTS[kind][0])
                 report['output_stat']=file_stat(project/RESULTS[kind][0])
+                prior_file=project/f'{kind}_before_selfcontact.pt'
+                if self_before is not None:
+                    save_tensor({'smpl_params_global':{**output,'body_pose':prior},'source':base,'method':report['method']},prior_file)
+                    self_report['before_stat']=file_stat(prior_file)
+                else:prior_file.unlink(missing_ok=True)
                 del output
             finally:
                 for a in arrays:a.flush();a._mmap.close()

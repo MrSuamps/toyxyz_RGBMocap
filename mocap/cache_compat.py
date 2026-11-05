@@ -30,7 +30,12 @@ COMPATIBLE_CODE = {
         # HandFlow adds a full-finger branch. Legacy source tensors have no
         # 45-D hand fields, so their complete body/finger math is unchanged.
         'e83ef02aedfdf09fafa6bbb4d4d318fb6d3206ddb42325fc36ab8fa5b84ec659': '707e3e2e86c55aa5f468b0801ce02af637dbafec0fc0638f5c3771cadda42549',
+        # Self-contact rows are exempt from the upper-body audit only when a correction report declares them.
+        'a6d8e9a4dfd89d9b4f9103b23be2ad558e55e1831094954a6e2a03cb0f62940a': '195a056b9dfbf883fb517a75f9493a6641009b65a2267f63faa64a2b0e0d9fa2',
     },
+    # The self-contact pass runs only when a project has self-contact tracks; without them the
+    # corrected tensors are byte-identical.
+    'correction.py': {'7b25e1eb57ed810bdf995a918d7b7633e7e558c25f982ba273f7d64783105ec3': '12f1b1bde44627ecd0df187a28454c9db05f80693f679aa0de9932e4c353c469'},
 }
 
 

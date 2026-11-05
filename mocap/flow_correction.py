@@ -15,7 +15,8 @@ VERSION=1
 def code_identity():
     from .paths import ROOT
     return {name:sha256(ROOT/'mocap'/name) for name in
-        ('flow_correction.py','flow_floor.py','correction.py','multilevel_contacts.py','hand_lock.py','contact_trajectory.py','contact_arm_plan.py','palm_contact.py','contact_pose_plan.py','contact_temporal_root.py','anatomical_ik.py','correction_settings.py','foot_contacts.py','scene_floor.py')}
+        ('flow_correction.py','flow_floor.py','correction.py','multilevel_contacts.py','hand_lock.py','contact_trajectory.py','contact_arm_plan.py','palm_contact.py','contact_pose_plan.py','contact_temporal_root.py','anatomical_ik.py','correction_settings.py','foot_contacts.py','scene_floor.py',
+         'self_contact.py','self_contact_store.py')}
 
 
 def contact_probabilities(params,n):
@@ -111,6 +112,9 @@ def run(project,emit=lambda *a,**k:None,result='corrected_initial'):
     from .hand_lock import apply as apply_hands
     report['hand_lock']=apply_hands(geometry.rest[:22],roots,quats,out_root,out_quat,geometry.palm_offsets,fps,options['mode'],report['floor'],options['preset'],hand_ranges,options['hand_lock'],emit)
     report['warning']=' '.join(filter(None,(report['warning'],report['hand_lock']['warning'])))
+    from .self_contact import from_store as self_contact,publish_rot6d
+    self_report,self_before=self_contact(project,'initial',context,geometry.rest[:22],out_root,out_quat,geometry.palm_offsets,fps,report['segments'],emit)
+    if self_report is not None:report['self_contact']=self_report;report['warning']=' '.join(filter(None,(report['warning'],self_report['warning'])))
     after=np.empty_like(probes)
     for first in range(0,n,128):after[first:first+128]=geometry.sample(out_root[first:first+128],out_quat[first:first+128])[0]
     active,anchors,*_=prepare_contacts(probes,probabilities,fps,floor,options['preset'],ranges,options['mode'])
@@ -127,8 +131,10 @@ def run(project,emit=lambda *a,**k:None,result='corrected_initial'):
     # Copy source trunk, fingers and predictions. Arms are published only when
     # enabled hand contacts were solved; their wrist world frames are retained.
     if n>1:
-        for joint in ((1,2,4,5,7,8) if report['contacts'] else ()) + ((13,14,16,17,18,19,20,21) if report['hand_lock']['contacts'] else ()):
+        written=((1,2,4,5,7,8) if report['contacts'] else ()) + ((13,14,16,17,18,19,20,21) if report['hand_lock']['contacts'] else ())
+        for joint in written:
             output['rot6d'][0,:,joint]=torch.from_numpy(matrices[:,joint,:,:2].reshape(n,6).astype(np.float32))
+        if self_before is not None:prior=publish_rot6d(output,params,matrices,self_before,self_report['changed'],written)
         if report['contacts']:output['trans'][0]=torch.from_numpy((out_root-geometry.rest[0]).astype(np.float32))
     output['body_rot6d']=output['rot6d'][:,:,1:];output['root_rot6d']=output['rot6d'][:,:,0]
     # Derived upstream diagnostic fields are not valid after contact IK.
@@ -136,6 +142,11 @@ def run(project,emit=lambda *a,**k:None,result='corrected_initial'):
     output['source']='initial';output['method']=report['method'];validate_motion(output,n)
     segments=report.pop('segments');automatic=report.pop('automatic_ranges')
     save_tensor(project/(kind+'.pt'),output)
+    prior_file=project/(kind+'_before_selfcontact.pt')
+    if self_before is not None:
+        save_tensor(prior_file,{**output,'rot6d':prior,'body_rot6d':prior[:,:,1:],'root_rot6d':prior[:,:,0]})
+        self_report['before_stat']=file_stat(prior_file)
+    else:prior_file.unlink(missing_ok=True)
     archive=project/(kind+'_contacts.npz')
     # NPZ is published atomically; pending remains until all receipts commit.
     temporary=archive.with_suffix('.tmp.npz')

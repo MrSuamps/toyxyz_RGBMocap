@@ -25,7 +25,7 @@ These work before or after the command.
 | `--no-lock` | Do not take the app lock. Normally the CLI refuses to run while RGB MoCap, an install or an update is running. |
 | `--view` | When the command succeeds, open its project in the RGB MoCap GUI (its own window and console). If the GUI is already open, the CLI prints the folder to open with **File > Open Project...** instead. `batch` opens the last clip that succeeded. |
 
-`--help`, `--dry-run`, `models`, `review` and `fix` never take the lock, so they work while the app is open (`review` and `fix` only read projects and write to their own output folders).
+`--help`, `--dry-run`, `models`, `review` and `fix` never take the lock, so they work while the app is open (`review` and `fix` only read projects and write to their own output folders). `contacts list` and `contacts suggest` without `--accept` do not take it either.
 
 Exit codes: `0` ok, `1` failed, `2` invalid arguments, `3` missing models, `4` the app (or an install/update) is running,
 `130` cancelled with Ctrl+C. Ctrl+C stops the running worker and its child processes; completed stages are reused next time.
@@ -287,6 +287,39 @@ are relabelled and listed under `keypoint_swaps`.
 earlier pin is left out (noted on the issue), because `fix` rejects overlapping pins. Typical loop: `review`, run `fix`
 on the exported FBX with `suggested_fix.json`, then `review --motion fixed.fbx` to confirm the contact is resolved and
 no new jitter appeared at the eased frames.
+
+## Self-contacts
+
+```
+rgbmocap-cli.cmd contacts list    --project P [--model M]
+rgbmocap-cli.cmd contacts add     --project P --effector RightHand --target RightFoot --frames 345-420[,500-510]
+                                  [--distance M|auto] [--offset X,Y,Z|auto] [--reciprocal off|auto|always] [--grip off|auto] [--id ID] [--disabled]
+rgbmocap-cli.cmd contacts edit    --project P --id ID [--frames ...] [--add-frames ...] [--remove-frames ...] [--accept]
+                                  [--target BONE] [--enable|--disable] [--distance ...] [--offset ...] [--reciprocal ...] [--grip ...]
+rgbmocap-cli.cmd contacts remove  --project P --id ID | --all
+rgbmocap-cli.cmd contacts suggest --project P [--accept] [--min-severity high|medium|low] [--result KIND]
+```
+
+A self-contact track holds a hand (`--effector` `LeftHand` or `RightHand`) on another body bone (`--target`, any body
+bone except the same arm, for example `RightFoot`, `LeftLeg`, `Head` or the other hand) over frame intervals. `correct`
+applies the tracks of the selected result. The tracks are stored in the model project as
+`selfcontact_<base>_state.json` plus two alternating `selfcontact_<base>_edit0/1.json` payloads, next to the foot-lock
+edits and shared with the app. The project needs a corrected result first (`correct`).
+
+- `--frames` are inclusive result frames `A-B` (the numbers `review` reports), several separated by commas; files store
+  them zero-based and end-exclusive. `edit --frames` replaces the intervals, `--add-frames`/`--remove-frames` change them.
+- Per-track settings: `--distance` (palm-to-target metres, default auto), `--offset` (contact point in the target joint's
+  frame, metres, default auto), `--reciprocal` (move the target limb too: `off`, `auto` when the arm cannot reach,
+  `always`; default auto), `--grip` (`auto` turns the palm toward the target and wraps the fingers; default off).
+- One hand holds one target at a time: two enabled tracks of the same hand may not overlap in frames.
+- `suggest` runs the `review` missed-contact check (ExMR) on the uncorrected base result (`--result` to choose another)
+  and stores each issue as suggested (`automatic`) intervals on the track for that hand and target, creating it if
+  needed. Each run replaces all suggestions. `--accept` also adds them to the tracks' intervals, strongest issue first,
+  skipping frames another enabled track already holds with the same hand; `edit --id ID --accept` accepts one track.
+- `list` prints the tracks, intervals, suggestions, settings and, after `correct`, the last residuals per track.
+- Every change gives the tracks a new revision, so the corrected result and its exports become stale until `correct`
+  runs again (the command says so). `remove --all` deletes the files; a result corrected without self-contacts is then
+  current again. `--dry-run` validates a change without writing it.
 
 ## Notes
 

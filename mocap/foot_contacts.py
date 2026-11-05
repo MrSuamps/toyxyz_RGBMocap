@@ -39,11 +39,27 @@ def contact_state(project, base):
     return json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
 
 
-def contact_revision(project, base):
+def footlock_revision(project, base):
     return contact_state(project,base).get('revision')
 
 
+def with_self_contacts(project, base, revision):
+    # Without a self-contact file the value is exactly the foot-lock revision, so existing stale checks are unchanged.
+    from .self_contact_store import revision as self_contact_revision
+    extra=self_contact_revision(project,base)
+    return revision if extra is None else f'{revision or ""}|sc:{extra}'
+
+
+def contact_revision(project, base):
+    return with_self_contacts(project,base,footlock_revision(project,base))
+
+
 def read_edit(project, base, context):
+    ranges,revision,warning=read_footlock_edit(project,base,context)
+    return ranges,with_self_contacts(project,base,revision),warning
+
+
+def read_footlock_edit(project, base, context):
     state=contact_state(project,base)
     if not state.get('manual'):return None,state.get('revision'),''
     if any(state.get(key)!=context.get(key) for key in ('frames','fps','sources')):

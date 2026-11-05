@@ -23,7 +23,12 @@ def lock_needed(argv):
     # These only read projects (review/fix write to their own output folders), so they also work while the GUI is open.
     if '--no-lock' in argv or '-h' in argv or '--help' in argv or '--dry-run' in argv:
         return False
-    return next((value for value in argv if not value.startswith('-')), None) not in ('models', 'review', 'fix')
+    words = [value for value in argv if not value.startswith('-')]
+    if words[:1] == ['contacts']:
+        # Only listing and plain suggestions (review is read-only, `automatic` is advisory) run beside the GUI.
+        action = words[1] if len(words) > 1 else None
+        return not (action == 'list' or (action == 'suggest' and '--accept' not in argv))
+    return (words[0] if words else None) not in ('models', 'review', 'fix')
 
 
 def check_install():

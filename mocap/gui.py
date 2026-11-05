@@ -1172,13 +1172,15 @@ class MainWindow(PreviewExportWorkspace,PearWorkspace,PromptHMRWorkspace,MammaWo
         if self.project is None or str(self.project.resolve())!=record['project']:return
         info=self.contact_tracks.get(record['base'])
         if info is None:return
-        self.contact_tracks[record['base']]={**info,'revision':record['state']['revision'],'unsaved':False}
+        from .foot_contacts import with_self_contacts
+        revision=with_self_contacts(record['project'],record['base'],record['state']['revision'])
+        self.contact_tracks[record['base']]={**info,'revision':revision,'unsaved':False}
         for key,scene in self.scene_cache.items():
             if base_result(key[1])==record['base']:
                 take=scene.by_project.get(self.project)
                 if take:
                     take.set_contacts(info['ranges'])
-                    take.contact_revision=record['state']['revision']
+                    take.contact_revision=revision
         if sequence==self.contact_save_token:
             if self.preview_data is not None:self.apply_preview()
             self.status.setText('Contact-lock timing saved. Apply Correction to update the motion and FBX.')

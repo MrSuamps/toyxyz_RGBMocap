@@ -689,6 +689,9 @@ def build_parser():
     from . import review
     review.register(commands, common)
 
+    from . import contacts
+    contacts.register(commands, common)
+
     characters, error = characters_module()
     if characters is not None:
         try:

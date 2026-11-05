@@ -186,7 +186,7 @@ def motion_summary(joints):
 
 def load_contact_track(project,base,cancelled=lambda:False):
     """Sparse contact metadata, shared by single and multiple actor loaders."""
-    from .foot_contacts import read_edit,normalize_ranges
+    from .foot_contacts import read_edit,normalize_ranges,footlock_revision
     from .result_artifacts import pending_path
     if cancelled():raise LoadCancelled()
     stem='corrected_'+base
@@ -213,7 +213,7 @@ def load_contact_track(project,base,cancelled=lambda:False):
     generated+=hand_generated;automatic+=hand.get('automatic',[[],[]])
     edited,revision,warning=read_edit(project,base,context)
     if edited is not None and len(edited)==2:edited+=hand_generated
-    ranges=edited if edited is not None else (automatic if revision else generated)
+    ranges=edited if edited is not None else (automatic if footlock_revision(project,base) else generated)
     return {'ranges':ranges,'automatic':automatic,'context':context,'revision':revision,
         'mode':report.get('mode','flat'),
         'levels':[[[int(s),int(e),float(y)] for f,s,e,x,y,z in rows if int(f)==foot] for foot in range(2)],
