@@ -174,11 +174,29 @@ def sole_metrics(before,after,probabilities,active,anchors,segments,fps,preset,f
         short_contact_segments=int(sum(s['end']-s['start']<max(2,round(fps*.1)) for s in segments)))
 
 
-def prepare_contacts(probes, probabilities, fps, floor=None, preset='normal', contact_ranges=None,mode='flat'):
+def point_support(active,hold,geometry,height,points,fps):
+    """Frames where a held (pointe) foot alone supports the body; first closes its short confidence dropouts, in place.
+
+ExMR's static confidence drops on a toe-box support, splitting one stance into separately pinned anchors that the
+gap then slides between (17 cm in 8 frames). A dropout stays open if the toe box rises 3 cm, or moves 4 cm while the
+other foot also supports. A sole support cannot travel, so the caller keeps it on one anchor."""
+    n=len(active)
+    for foot in range(2):
+        for first,end in intervals(~active[:,foot]):
+            if first==0 or end==n or end-first>round(fps*.5):continue
+            if not (hold[first:end,foot].all() and geometry[first:end,foot].all()):continue
+            if height[first:end,foot].max()-min(height[first-1,foot],height[end,foot])>.03:continue
+            if active[first:end,1-foot].any() and np.linalg.norm(points[end,foot,[0,2]]-points[first-1,foot,[0,2]])>.04:continue
+            active[first:end,foot]=True
+    return hold&active&~active[:,::-1]
+
+
+def prepare_contacts(probes, probabilities, fps, floor=None, preset='normal', contact_ranges=None,mode='flat',hold=None):
     """Resolve contact phases and grounded sole anchors once, before windowing.
 
 Static confidence is not ground truth. Reject raised/moving feet, preserve
 airborne intervals, and split anchors when the source intentionally travels.
+`hold` (frames, 2): pointe feet; alone on the floor they are one stance (`point_support`). Automatic flat contacts only.
 """
     if preset not in PRESETS:raise ValueError('Unknown Motion Correction preset: '+str(preset))
     config=PRESETS[preset]
@@ -224,7 +242,11 @@ airborne intervals, and split anchors when the source intentionally travels.
     for foot in range(2):
         for first,end in intervals(active[:,foot]):
             if end-first<minimum:active[first:end,foot]=False
-    active[airborne_excursions(probes,fps)]=False
+    flight=airborne_excursions(probes,fps)
+    active[flight]=False
+    held=np.zeros((n,2),bool)
+    if hold is not None and contact_ranges is None:
+        held=point_support(active,np.asarray(hold,bool)&~flight[:,None],geometry,height,points,fps)
     if contact_ranges is not None:
         from .foot_contacts import normalize_ranges
         contact_ranges=normalize_ranges(contact_ranges,n)
@@ -263,13 +285,17 @@ airborne intervals, and split anchors when the source intentionally travels.
             start=first
             while start<end:
                 stop=start+1
-                while stop<end and (contact_ranges is not None or np.linalg.norm(point[stop,[0,2]]-point[start,[0,2]])<config['anchor_drift']):
+                while stop<end and (contact_ranges is not None or held[stop,foot] or
+                                    np.linalg.norm(point[stop,[0,2]]-point[start,[0,2]])<config['anchor_drift']):
                     stop+=1
                 # A one/two-sample tail is not a new stance. Starting an
                 # independent anchor there caused a snap while the timeline
                 # still showed one continuous contact. Keep timing unchanged.
                 if contact_ranges is None and end-stop<minimum:stop=end
                 path=rolling_anchor(probes[start:stop,2*foot:2*foot+2],weights[start:stop,foot],floor)
+                lone=np.flatnonzero(held[start:stop,foot])
+                # A pointe foot is pinned where it starts to stand alone, so the double-support spacing of the feet stays.
+                if len(lone):path[:,[0,2]]+=point[start+lone[0],[0,2]]-path[lone[0],[0,2]]
                 anchors[start:stop,foot]=path
                 segments.append({'foot':foot,'start':int(start),'end':int(stop),'anchor':path[0].tolist(),
                                  'anchor_end':path[-1].tolist()})
@@ -304,12 +330,12 @@ def static_camera_centre(project,source,pelvis):
     return np.asarray(centre,float) if np.isfinite(centre).all() else None
 
 
-def camera_grounding(rest,roots,quats,probes,probabilities,fps,floor,preset,contact_ranges,centre):
+def camera_grounding(rest,roots,quats,probes,probabilities,fps,floor,preset,contact_ranges,centre,hold=None):
     """Move the source root in X/Z so the flat grounding drop keeps the body where a static camera sees the person.
 
 Per frame, the X/Z move minimises the joints' summed angular displacement seen from `centre`, with the Y move fixed to
 the grounding drop. Modifies `roots` and `probes` in place; returns the report entry."""
-    drop=prepare_contacts(probes,probabilities,fps,floor,preset,contact_ranges)[3][:,1].astype(float)
+    drop=prepare_contacts(probes,probabilities,fps,floor,preset,contact_ranges,hold=hold)[3][:,1].astype(float)
     joints=fk(rest,np.asarray(roots,float),np.asarray(quats,float))[0]
     d=joints-centre;inverse=1/np.einsum('tjk,tjk->tj',d,d)
     # Sum over joints of (I - u u^T)/r^2 (u the unit ray, r its length): the angular displacement a translation causes.
@@ -325,7 +351,8 @@ the grounding drop. Modifies `roots` and `probes` in place; returns the report e
             'depth_change_m':[float(depth.min()),float(depth.max())]}
 
 
-def correct_arrays(rest, root, quat, probes, probabilities, fps=30., floor=None, core=CORE, output=None, emit=lambda *a,**k:None, preset='normal',contact_ranges=None,pelvis_offset=0.,mode='flat',foot_enabled=True):
+def correct_arrays(rest, root, quat, probes, probabilities, fps=30., floor=None, core=CORE, output=None, emit=lambda *a,**k:None, preset='normal',contact_ranges=None,pelvis_offset=0.,mode='flat',foot_enabled=True,
+                  hold=None):
     from .correction_settings import correction_options
     pelvis_offset=correction_options({'pelvis_offset':pelvis_offset})['pelvis_offset']
     n=len(root)
@@ -337,7 +364,7 @@ def correct_arrays(rest, root, quat, probes, probabilities, fps=30., floor=None,
     if any(np.linalg.norm(rest[b]-rest[a])<1e-6 for a,b in ((1,4),(4,7),(2,5),(5,8))):
         raise ValueError('Leg bone lengths must be nonzero')
     from .foot_contacts import segment_ranges
-    plan=prepare_contacts(probes,probabilities,fps,floor,preset,mode=mode)
+    plan=prepare_contacts(probes,probabilities,fps,floor,preset,mode=mode,hold=hold)
     automatic_ranges=segment_ranges(plan[5]) if foot_enabled else [[],[]]
     if not foot_enabled:contact_ranges=[[],[]]
     if contact_ranges is not None:
@@ -673,10 +700,11 @@ def run(project,emit,result):
                 # Articulated feet (pointe/flat/match) are source pose: the foot plan, grounding and leg IK all see them.
                 from .foot_articulation import from_store as articulate
                 feet=articulate(project,base,context,geometry,roots,quats,probes,fps,transform,emit)
+                hold=None if feet is None or not (feet.pointe>.5).any() else feet.pointe>.5
                 grounding=None
                 if options.get('grounding')=='camera':
                     centre=None if shared or options['mode']!='flat' or not options['foot_lock'] else static_camera_centre(project,source,geometry.rest[0])
-                    grounding=(camera_grounding(geometry.rest[:22],roots,quats,probes,probabilities,fps,floor,preset,contact_ranges,centre)
+                    grounding=(camera_grounding(geometry.rest[:22],roots,quats,probes,probabilities,fps,floor,preset,contact_ranges,centre,hold)
                                if centre is not None else {'warning':'Camera grounding needs one static ExMR camera, Flat Ground and foot lock; '
                                                                      'the body was grounded vertically.'})
                 for attempt in range(1 if feet is None else 1+feet.passes):
@@ -684,7 +712,7 @@ def run(project,emit,result):
                     if attempt and not feet.follow_shins(geometry,roots,quats,probes,out_roots,out_quats):break
                     _,_,report=correct_arrays(geometry.rest[:22],roots,quats,probes,probabilities,fps,floor,
                         output=(out_roots,out_quats),emit=emit,preset=preset,contact_ranges=contact_ranges,
-                        pelvis_offset=options['pelvis_offset'],mode=options['mode'],foot_enabled=options['foot_lock'])
+                        pelvis_offset=options['pelvis_offset'],mode=options['mode'],foot_enabled=options['foot_lock'],hold=hold)
                 if feet is not None:
                     report['foot_articulation']=feet.report
                     report['warning']=' '.join(filter(None,(report['warning'],feet.report['warning'])))
@@ -719,7 +747,7 @@ def run(project,emit,result):
                     after[start:end]=geometry.sample(out_roots[start:end],out_quats[start:end])[0]
                 if feet is not None:feet.finish(geometry,out_roots,out_quats,after)
                 before=probes
-                contact_plan=prepare_contacts(probes,probabilities,fps,floor,preset,contact_ranges,options['mode'])
+                contact_plan=prepare_contacts(probes,probabilities,fps,floor,preset,contact_ranges,options['mode'],hold)
                 active,anchors=contact_plan[:2]
                 from .contact_trajectory import support_weights
                 applied_weights=support_weights(probes,active,fps)

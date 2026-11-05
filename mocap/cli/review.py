@@ -826,8 +826,9 @@ def collect_issues(ctx, project, kind, pose=None):
     """All checks on one Context, ranked: (issues, floor, contacts, contacts_source). `pose` adds the anatomy checks."""
     floor = floor_level(ctx, project, kind)
     contacts, contacts_source = contact_mask(ctx, project, kind, floor)
-    issues = (check_missed_contacts(ctx) + check_pose(ctx) + check_foot_slide(ctx, contacts) + check_penetration(ctx, contacts, floor) +
-              check_jitter(ctx) + check_drift(ctx) + check_body_offset(ctx, project, kind))
+    from .foot_support import check_foot_slide as support_slide
+    issues = (check_missed_contacts(ctx) + check_pose(ctx) + support_slide(ctx, project, kind, contacts, floor, pose) +
+              check_penetration(ctx, contacts, floor) + check_jitter(ctx) + check_drift(ctx) + check_body_offset(ctx, project, kind))
     if pose is not None:
         from . import anatomy
         issues += anatomy.checks(ctx, pose)
