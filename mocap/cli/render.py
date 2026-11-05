@@ -48,8 +48,8 @@ def register(commands, common):
     p.add_argument('--project', required=True, metavar='P', help='workspace root, model project or person take')
     p.add_argument('--model', choices=MODELS, help='model inside a workspace root (default: its active model)')
     p.add_argument('--result', choices=sorted(RESULTS), metavar='KIND', help='result to render (default: the project selection)')
-    p.add_argument('--frames', metavar='A-B', help='video frames, inclusive (default: the self-contact intervals)')
-    p.add_argument('--step', type=int, default=1, metavar='N', help='render every Nth frame (default 1)')
+    p.add_argument('--frames', metavar='A-B|A,B,C', help='video frames, inclusive, or a list (default: the self-contact intervals)')
+    p.add_argument('--step', type=int, default=1, metavar='N', help='render every Nth frame of A-B (default 1)')
     p.add_argument('--views', default='camera,front,side,orbit', metavar='LIST', help=f'comma list of {", ".join(VIEWS)} (default: all)')
     p.add_argument('--compare', nargs='?', const='auto', choices=('auto', 'original', 'before-selfcontact'),
                    help='also draw the reference layer: original, before-selfcontact, or auto (before-selfcontact when current)')
@@ -215,13 +215,26 @@ class Layer:
     kind: str | None          # project result kind, for the GUI mesh check
 
 
+def frame_list(value, count):
+    """--frames A,B,C as sorted unique frames, or None for any other value."""
+    if not value or ',' not in str(value):
+        return None
+    try:
+        frames = sorted({int(part) for part in str(value).split(',') if part.strip()})
+    except ValueError:
+        raise CliError('--frames expects A-B or A,B,C video frame numbers', EXIT_USAGE) from None
+    if not frames or frames[0] < 0 or frames[-1] >= count:
+        raise CliError(f'--frames {value}: frames must lie in 0-{count - 1}', EXIT_USAGE)
+    return frames
+
+
 def parse_frames(value, count):
     if value is None:
         return None
     try:
         first, last = (int(part) for part in str(value).split('-', 1))
     except ValueError:
-        raise CliError('--frames expects A-B video frame numbers, e.g. 380-420', EXIT_USAGE) from None
+        raise CliError('--frames expects A-B or A,B,C video frame numbers, e.g. 380-420', EXIT_USAGE) from None
     if first < 0 or last < first or last >= count:
         raise CliError(f'--frames {value}: expected 0 <= A <= B <= {count - 1}', EXIT_USAGE)
     return first, last
@@ -437,12 +450,10 @@ class Renderer:
         states = [layer.state for layer in layers]
         self.forward = heading(states, frames)
         self.left = rotate_y(self.forward, 90.0)
-        # One distance for the whole run keeps the zoom steady in a movie.
-        extent = 0.0
-        for state in states:
-            joints = state['joints'][frames, :22]
-            centre = joints.mean(1, keepdims=True)
-            extent = max(extent, float(np.abs(joints - centre).max()) + 0.25)
+        # One distance for the whole run keeps the zoom steady in a movie. The front / side panels share one camera centred
+        # between the layers, so the extent is taken about that centre: a correction that moved the root still fits.
+        centre = np.mean([state['joints'][frames, :22].mean(1) for state in states], 0)[:, None]
+        extent = max(float(np.abs(state['joints'][frames, :22] - centre).max()) + 0.25 for state in states)
         self.distance = extent / np.tan(np.radians(FOV) / 2) * 1.05
         self.focus = focus
         self.cache = {}
@@ -494,9 +505,9 @@ class Renderer:
     def orbit_view(self, frame, ends):
         import numpy as np
         rows = []
-        result = self.layers[-1]
-        centre = 0.5 * (contact_point(result.state, frame, ends[0]) + contact_point(result.state, frame, ends[1]))
         for layer in self.layers:
+            # Each row centres on its own layer's contact: the reference may sit elsewhere when correction moved the root.
+            centre = 0.5 * (contact_point(layer.state, frame, ends[0]) + contact_point(layer.state, frame, ends[1]))
             tiles = []
             vertices, normals = self.mesh(layer, frame)
             for azimuth in ORBIT_AZIMUTHS:
@@ -593,13 +604,14 @@ def cmd_render(args, session):
     count = len(layers[-1].state['joints'])
     tracks, note = contact_tracks(project, kind, count, fps)
     note = ' '.join(filter(None, (compare_note, note)))
-    frames = parse_frames(args.frames, count)
+    listed = frame_list(args.frames, count)
+    frames = (listed[0], listed[-1]) if listed else parse_frames(args.frames, count)
     if frames is None:
         spans = [r for t in tracks for r in t['ranges']]
         if not spans:
-            raise CliError('No self-contact intervals to render; pass --frames A-B.', EXIT_USAGE)
+            raise CliError('No self-contact intervals to render; pass --frames A-B or A,B,C.', EXIT_USAGE)
         frames = max(0, min(a for a, _ in spans) - MARGIN_FRAMES), min(count - 1, max(b for _, b in spans) - 1 + MARGIN_FRAMES)
-    wanted = list(range(frames[0], frames[1] + 1, args.step))
+    wanted = listed or list(range(frames[0], frames[1] + 1, args.step))
     markers = list(tracks)
     focus = [(t.get('id') or f"{t['effector']}-{t['target']}", (t['effector'], t['target'])) for t in tracks]
     if args.focus:
@@ -667,7 +679,8 @@ def cmd_render(args, session):
             session.info(f'  frame {frame} ({number + 1}/{len(wanted)})')
     videos_written = [movie.close() for movie in movies.values()]
     seconds = round(time.monotonic() - clock, 2)
-    report = dict(version=1, command='render', project=str(project), model=model, result=kind, frames=[frames[0], frames[1]], step=args.step,
+    report = dict(version=1, command='render', project=str(project), model=model, result=kind, frames=[frames[0], frames[1]],
+                  **({'frame_list': listed} if listed else {'step': args.step}),
                   views=views, camera=camera_note, layers=[dict(label=l.label, role=l.role, kind=l.kind) for l in layers],
                   geometry=geometry(body) + '; not the bound display skin',
                   gui_mesh_max_error_m=checks, tracks=[dict(id=t.get('id'), effector=t['effector'], target=t['target'], ranges=t['ranges'])
@@ -692,23 +705,34 @@ SHEET_COLORS = ((205, 185, 165), (120, 175, 235), (140, 210, 140), (200, 150, 22
 GREEN, MAGENTA = (60, 220, 60), (230, 60, 230)
 
 
-def sheet_frames(value, ranges, count, automatic=()):
-    """Frames of a sheet: --frames A,B,C as given, A-B (or the contact's ranges, else its suggested ranges) as SHEET_FRAMES
-    evenly spaced frames; None without --frames for a contact that has neither."""
+def spread(frames, count=SHEET_FRAMES):
+    """`count` evenly spaced items of the sorted frames (all of them when fewer)."""
     import numpy as np
-    if value and ',' in value:
-        try:
-            frames = sorted({int(part) for part in value.split(',')})
-        except ValueError:
-            raise CliError('--frames expects A-B or A,B,C video frame numbers', EXIT_USAGE) from None
-        if frames[0] < 0 or frames[-1] >= count:
-            raise CliError(f'--frames {value}: frames must lie in 0-{count - 1}', EXIT_USAGE)
-        return frames
+    if len(frames) <= count:
+        return list(frames)
+    return [frames[int(round(k))] for k in np.linspace(0, len(frames) - 1, count)]
+
+
+def sheet_frames(value, ranges, count, automatic=()):
+    """(frames, outside) of one contact's sheet. The hold is the contact's ranges, else its suggested ranges (end-exclusive).
+    SHEET_FRAMES frames spread over the hold's frames, within --frames A-B when given; --frames A,B,C keeps the listed frames
+    inside the hold. When no requested frame is inside it, the requested frames are drawn and listed in `outside` (rows
+    marked out of the hold). None without --frames for a contact that has no hold."""
     spans = list(ranges) or list(automatic)
-    if not value and not spans:
-        return None
-    first, last = parse_frames(value, count) if value else (min(a for a, _ in spans), max(b for _, b in spans) - 1)
-    return sorted({int(round(x)) for x in np.linspace(first, last, SHEET_FRAMES)})
+    held = sorted({f for a, b in spans for f in range(max(int(a), 0), min(int(b), count))})
+    if not value:
+        return (spread(held), []) if held else None
+    listed = frame_list(value, count)
+    if listed is None:
+        first, last = parse_frames(value, count)
+        requested = list(range(first, last + 1))
+    else:
+        requested = listed
+    inside = sorted(set(requested) & set(held))
+    if inside:
+        return (inside if listed else spread(inside)), []
+    picked = listed or spread(requested)
+    return picked, picked
 
 
 def crop_camera(obs, frame, box, tile):
@@ -752,13 +776,30 @@ def sheet_columns(layers):
     return ['Video'] + [layer.label for layer in layers] + [f'{layer.label} - 3D' for layer in layers]
 
 
-def contact_sheet_image(body, layers, track, frames, cameras, videos, tile):
+def side_axis(obs, frame):
+    """Horizontal unit vector SHEET_SIDE_DEG from the camera's viewing direction on this frame."""
+    import numpy as np
+    forward = np.asarray(obs.rotation[frame]).T @ np.array([0.0, 0.0, 1.0])
+    forward[1] = 0
+    return rotate_y(forward / max(np.linalg.norm(forward), 1e-9), SHEET_SIDE_DEG)
+
+
+def hand_side(state, track, frames, obs):
+    """+1 or -1: which side_axis direction the hand sits on relative to its target over the frames, so the close view looks
+    at the hand rather than through the target."""
+    lean = sum(float(side_axis(obs, f) @ (contact_point(state, f, track['effector']) - contact_point(state, f, track['target']))) for f in frames)
+    return 1.0 if lean >= 0 else -1.0
+
+
+def contact_sheet_image(body, layers, track, frames, cameras, videos, tile, outside=()):
     """Rows = frames; columns = video crop, every layer over the crop, every layer in a close 3D view; numbers per tile.
 
-    `cameras`: one review Observation per layer; the crop follows the result (last) layer."""
+    `cameras`: one review Observation per layer; the crop follows the result (last) layer. Rows of `outside` frames are
+    marked as outside the contact's hold."""
     import cv2
     import numpy as np
     obs = cameras[-1]
+    sign = hand_side(layers[-1].state, track, frames, obs)
     from ..self_contact import Segments, arm_groups, parse_target, segment_names, segment_vertices
     _, side, part = parse_target(track['target'])
     h = 0 if track['effector'] == 'LeftHand' else 1
@@ -801,14 +842,15 @@ def contact_sheet_image(body, layers, track, frames, cameras, videos, tile):
                 cv2.arrowedLine(video, point(kp[9 + h, :2]), point(kp[base + 8, :2]), GREEN, 2, cv2.LINE_AA, tipLength=0.25)
                 kp_dir = kp[base + 8, :2] - kp[9 + h, :2]
             labels(video, [f'frame {frame}', 'green: video wrist->knuckle', f'score {min(kp[9 + h, 2], kp[base + 8, 2]):.2f}'], scale=0.45)
+        if frame in outside:
+            cv2.rectangle(video, (1, 1), (tile - 2, tile - 2), (40, 40, 255), 3)
+            labels(video, ['outside the hold'], (8, tile - 12), 0.5)
         overlays, views = [], []
-        centre3 = ends.mean(0)
-        forward = np.asarray(obs.rotation[frame]).T @ np.array([0.0, 0.0, 1.0])
-        forward[1] = 0
-        forward = forward / max(np.linalg.norm(forward), 1e-9)
-        eye = centre3 - rotate_y(forward, SHEET_SIDE_DEG) * SHEET_DISTANCE + np.array([0.0, 0.2, 0.0])
-        close = look_at(eye, centre3, tile, tile, 40.0)
+        offset = sign * side_axis(obs, frame) * SHEET_DISTANCE + np.array([0.0, 0.2, 0.0])
         for k, layer in enumerate(layers):
+            # Each close view centres on its own layer's contact: the reference may sit elsewhere when correction moved the root.
+            centre3 = 0.5 * (contact_point(layer.state, frame, track['effector']) + contact_point(layer.state, frame, track['target']))
+            close = look_at(centre3 + offset, centre3, tile, tile, 40.0)
             camera = crop_camera(cameras[k], frame, box, tile)
             vertices = body.vertices(layer.state, frame)
             normals = vertex_normals(vertices, body.faces)
@@ -826,7 +868,7 @@ def contact_sheet_image(body, layers, track, frames, cameras, videos, tile):
             labels(image, numbers, scale=0.45)
             overlays.append(image)
             view, _ = draw_body(close, vertices, limb_faces, vertex_normals(vertices, limb_faces), color)
-            labels(view, numbers[:2] + [f'3D, {SHEET_SIDE_DEG:.0f} deg from the camera, touching limbs only'], scale=0.45)
+            labels(view, numbers[:2] + [f'3D, {SHEET_SIDE_DEG:.0f} deg off camera, hand side, limbs only'], scale=0.45)
             views.append(view)
         rows.append(side_by_side([video] + overlays + views))
     header = np.full((34, rows[0].shape[1], 3), 255, np.uint8)
@@ -887,27 +929,33 @@ def cmd_sheet(args, session, project, model, kind, started):
                                             '(green arrow and angle) and sizes each crop from the model.')))
         session.info('Note: ' + note)
     plans = [(track, sheet_frames(args.frames, track['ranges'], count, track.get('automatic', ()))) for track in tracks]
-    skipped = [track.get('id') or f"{track['effector']}-{track['target']}" for track, frames in plans if frames is None]
-    plans = [(track, frames) for track, frames in plans if frames is not None]
+    track_name = lambda track: track.get('id') or f"{track['effector']}-{track['target']}"
+    skipped = [track_name(track) for track, frames in plans if frames is None]
+    plans = [(track, *frames) for track, frames in plans if frames is not None]
     if skipped:
         note = ' '.join(filter(None, (note, f"Skipped {', '.join(skipped)}: no frame ranges or suggestions (pass --frames).")))
         session.info('Note: ' + note)
+    outside = [track_name(track) for track, _, out_of_hold in plans if out_of_hold]
+    if outside:
+        note = ' '.join(filter(None, (note, f"No --frames inside the hold of {', '.join(outside)}: those rows are marked 'outside the hold'.")))
+        session.info('Note: ' + note)
     if not plans:
         raise CliError('No self-contact frame ranges to make a sheet for; pass --frames A-B.', EXIT_USAGE)
-    videos = read_frames(obs[0].video, {f for _, frames in plans for f in frames})
+    videos = read_frames(obs[0].video, {f for _, frames, _ in plans for f in frames})
     out.mkdir(parents=True, exist_ok=True)
     written = []
-    for track, frames in plans:
+    for track, frames, out_of_hold in plans:
         missing = [f for f in frames if f not in videos]
         if missing:
             raise CliError(f'The video has no frame {missing[0]}.')
-        image = contact_sheet_image(body, layers, track, frames, obs, videos, SHEET_TILE)
+        image = contact_sheet_image(body, layers, track, frames, obs, videos, SHEET_TILE, out_of_hold)
         path = out / f"sheet_{track.get('id') or 'contact'}_f{frames[0]:04d}-{frames[-1]:04d}.png"
         cv2.imwrite(str(path), image)
         written.append(str(path))
         session.info(f'  {path.name}')
     report = dict(version=1, command='render', sheet=True, project=str(project), result=kind, layers=[l.label for l in layers],
-                  frames={t.get('id'): f for t, f in plans}, images=written, note=note or None, camera=obs[-1].describe(),
+                  frames={t.get('id'): f for t, f, _ in plans}, outside_hold={t.get('id'): o for t, _, o in plans if o},
+                  images=written, note=note or None, camera=obs[-1].describe(),
                   geometry=geometry(body), seconds=round(time.monotonic() - started, 2))
     (out / 'sheet.json').write_text(json.dumps(report, indent=1), encoding='utf-8')
     session.say(f'Sheet: {len(written)} image(s) in {out}')

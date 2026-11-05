@@ -59,6 +59,9 @@ PENETRATION_HIGH_M = 0.025
 # A declared self-contact whose hand skin stays this far from the target skin floats.
 CONTACT_GAP_M = 0.015
 CONTACT_GAP_HIGH_M = 0.04
+# ...or whose hand stays inside the target skin deeper than this (below PENETRATION_M: a held contact should sit on the skin,
+# the solver keeps it within about 2 mm).
+CONTACT_INSIDE_M = 0.005
 SEGMENT_JOINT = dict(hand=(20, 21), forearm=(18, 19), upperarm=(16, 17), thigh=(1, 2), shin=(4, 5), foot=(7, 8))
 # A hand resting on the body that the model sank into it (contacts suggest): a penetration run of at least SUNK_SECONDS
 # reaching SUNK_DEPTH_M whose palm moves slowly in the target bone's frame. Measured on dance clips, resting hands move
@@ -213,6 +216,16 @@ def hinge_bend(joints, world, upper, middle, end, axis):
     return bend, interior(joints[:, upper], joints[:, middle], joints[:, end]), off
 
 
+def backward(bend, off):
+    """True where the lower bone turned toward the extension side of the hinge rather than out of the hinge plane.
+
+    With u the upper bone, f the flexion direction and h the hinge, the lower bone is v = cos(off) (cos(bend) u + sin(bend) f)
+    + sin(off) h: it points backward when -v.f >= |v.h|. A deeply flexed limb whose bend plane is turned off the hinge (a
+    twisted elbow, v.f ~ 0) reads bend ~ +-180 and is a sideways fold, not a hyperextension."""
+    off, bend = np.radians(off), np.radians(bend)
+    return -np.cos(off) * np.sin(bend) >= np.abs(np.sin(off))
+
+
 def wrist_frame(rest, side):
     """Rest forearm axis, palm normal and thumb direction (T-pose: palms down, thumbs forward)."""
     s = SIDES.index(side)
@@ -297,10 +310,10 @@ def check_limbs(pose, frames, fps):
         bend, angle, off = hinge_bend(pose.joints, pose.world, upper, middle, end, axis)
         label = name.replace('_', ' ')
         draw = dict(smpl=(upper, middle, end), series={f'{label} interior deg': angle, f'{label} bend deg': bend})
-        hyper = bend < -HYPEREXTENSION_DEG
+        hyper = (bend < -HYPEREXTENSION_DEG) & backward(bend, off)
         for a, b in runs(hyper):
             span = slice(a, b + 1)
-            worst = a + int(np.argmin(bend[span]))
+            worst = a + int(np.argmin(np.where(hyper[span], bend[span], np.inf)))
             peak, count = float(-bend[worst]), int(hyper[span].sum())
             severity = 'high' if peak >= 25 and count >= 5 else 'medium' if peak >= 12 else 'low'
             issues.append(make_issue('hyperextension', severity, count * peak, frames, a, b, worst, [name],
@@ -773,17 +786,34 @@ def check_sunk_hands(pose, frames, fps, rejected=None):
 
 
 def check_contact_gap(pose, frames):
-    """Declared self-contacts whose hand skin floats away from the target skin (the real surface gap, not a palm point)."""
+    """Declared self-contacts whose hand skin floats away from the target skin (the real surface gap, not a palm point), or
+    stays inside it."""
     tracks = contact_tracks(pose.mesh)
     if not tracks:
         return []
     measured = pose.mesh.measure([pair for _, pair in tracks])
     issues = []
     for track, pair in tracks:
-        _, _, gap = measured[pair]
+        depth, _, gap = measured[pair]
         active = np.zeros(len(frames), bool)
         for a, b in track['ranges']:
             active[max(a - frames[0], 0):max(b - frames[0], 0)] = True
+        inside = active & (depth > CONTACT_INSIDE_M)
+        for a, b in runs(inside, 2, 3):
+            span = slice(a, b + 1)
+            hit = inside[span]
+            worst = a + int(np.argmax(depth[span]))
+            count, median = int(hit.sum()), float(np.median(depth[span][hit]))
+            gaps = gap[span][hit]
+            gap_median = float(np.nanmedian(gaps)) if np.isfinite(gaps).any() else None
+            issues.append(make_issue('contact_gap', 'high' if median >= PENETRATION_M else 'medium', count * median * 100, frames, a, b, worst,
+                                     [pair[0], pair[1][0]],
+                                     dict(frames_flagged=count, inside_median_m=median, inside_max_m=float(depth[worst]), skin_gap_median_m=gap_median,
+                                          track=track.get('id'), inside=True),
+                                     f"{track['effector']} -> {track['target']} ({track.get('id')}): the hand stays {median * 100:.1f} cm inside the "
+                                     f"{pair[1][0].replace('_', ' ')} (up to {depth[worst] * 100:.1f} cm) on {count} contact frames",
+                                     'run `correct` with the track enabled (the solver holds the hand on the skin) and check the sheet',
+                                     dict(smpl=(segment_joint(pair[0]), segment_joint(pair[1][0])), series={'hand inside cm': depth * 100})))
         far = np.nan_to_num(gap, nan=1.0)
         flag = active & (far > CONTACT_GAP_M)
         for a, b in runs(flag, 2, 3):
@@ -809,7 +839,8 @@ def skin_summary(pose, frames):
     sliced = pose.rows(frames)
     tracks = contact_tracks(sliced.mesh)
     measured = sliced.mesh.measure([pair for _, pair in tracks]) if tracks else {}
-    out = dict(geometry='SMPL-X mesh, segments by dominant skinning weight', penetration_m=PENETRATION_M, high_m=PENETRATION_HIGH_M, contacts=[])
+    out = dict(geometry='SMPL-X mesh, segments by dominant skinning weight', penetration_m=PENETRATION_M, high_m=PENETRATION_HIGH_M,
+               contact_inside_m=CONTACT_INSIDE_M, contact_gap_m=CONTACT_GAP_M, contacts=[])
     for track, pair in tracks:
         depth, _, gap = measured[pair]
         active = np.zeros(len(frames), bool)

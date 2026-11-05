@@ -162,6 +162,20 @@ class ChecksTest(unittest.TestCase):
         self.assertEqual(fold[0]['severity'], 'high')
         self.assertAlmostEqual(fold[0]['metrics']['fold_depth_deg'], 80, places=5)
 
+    def test_sideways_fold_is_not_hyperextension(self):
+        # A deeply flexed elbow whose bend plane is turned off the hinge (twisted elbow) reads bend ~ -170 deg.
+        n = 20
+        local = identity(n)
+        local[:, 18] = rot([0, 1, 0], -8) @ rot([0, 0, 1], 150)
+        pose = pose_from_locals(local)
+        axis = next(limb[5] for limb in anatomy.limbs() if limb[0] == 'left_elbow')
+        bend, _, off = anatomy.hinge_bend(pose.joints, pose.world, 16, 18, 20, axis)
+        self.assertLess(bend.max(), -150)
+        self.assertFalse(anatomy.backward(bend, off).any())
+        issues = anatomy.check_limbs(pose, self.frames(n), 30.0)
+        self.assertEqual([i for i in issues if i['check'] == 'hyperextension'], [])
+        self.assertTrue(anatomy.backward(np.array([-10.0, -120.0]), np.array([3.0, 0.0])).all())
+
     def test_wrist_limit_and_twist(self):
         n = 20
         local = identity(n)

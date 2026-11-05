@@ -670,7 +670,62 @@ def check_foot_slide(ctx, contacts):
     return issues
 
 
-def check_penetration(ctx, contacts, floor):
+def surface_levels(ctx, project, kind, floor, sole):
+    """(N, 2) height of the surface under each foot, NaN where unknown: the correction's flat floor on every frame, or in
+    Multi Level each contact segment's own stance height (`<kind>_contacts.npz`). Without a correction, the soles' 2nd
+    percentile."""
+    import numpy as np
+    n = len(ctx.frames)
+    if floor.source == 'estimated':
+        return np.full((n, 2), float(np.percentile(sole.min(1), 2)))
+    if floor.mode != 'multi_level':
+        return np.full((n, 2), float(floor))
+    level = np.full((n, 2), np.nan)
+    path = project / f'{kind}_contacts.npz'
+    if path.is_file():
+        with np.load(path, allow_pickle=False) as data:
+            segments = np.asarray(data['segments'], np.float64)
+        # Rows: foot, start, end (exclusive), anchor x, y, z; the anchor height is where the stance's sole was held.
+        for row in segments if segments.ndim == 2 and segments.shape[1] >= 5 else ():
+            a, b = max(int(row[1]) - int(ctx.frames[0]), 0), min(int(row[2]) - int(ctx.frames[0]), n)
+            if a < b:
+                level[a:b, int(row[0])] = row[4]
+    return level
+
+
+def check_penetration(ctx, contacts, floor, project=None, kind=None, pose=None):
+    """Feet below the surface: the posed SMPL-X soles against the correction's floor (or Multi Level stance heights) when the
+    result has a mesh, else the ankle / toe joints against their resting height."""
+    import numpy as np
+    mesh = None if pose is None or pose.mesh is None or project is None else pose.rows(ctx.frames).mesh
+    if mesh is None:
+        return check_joint_penetration(ctx, contacts, floor)
+    from .foot_support import sole_heights
+    sole = sole_heights(mesh)
+    level = surface_levels(ctx, project, kind, floor, sole)
+    depth = np.nan_to_num(level - sole, nan=-np.inf)
+    stance = floor.mode == 'multi_level' and floor.source != 'estimated'
+    issues = []
+    for foot, side in enumerate(('Left', 'Right')):
+        flag = depth[:, foot] > PENETRATION
+        for a, b in runs(flag, GAP, 2):
+            span = slice(a, b + 1)
+            worst = a + int(np.argmax(depth[span, foot]))
+            peak, count = float(depth[worst, foot]), int(flag[span].sum())
+            surface = 'its Multi Level stance height' if stance else 'the floor'
+            issues.append(dict(
+                check='floor_penetration', severity=grade(peak, 0.05, 0.025), score=peak * 100 * count, **interval(ctx, a, b),
+                worst_frame=ctx.video(worst), joints=[f'{side.lower()}_sole'],
+                metrics=dict(frames_flagged=count, max_depth_m=peak, measured='SMPL-X sole (lowest foot skin vertex)',
+                             surface='stance' if stance else 'floor', surface_y_at_worst=float(level[worst, foot]),
+                             sole_y_at_worst=float(sole[worst, foot]), floor_y=float(floor)),
+                message=f'{side.lower()} sole goes {peak * 100:.1f} cm below {surface}',
+                fix=None, hint='raise the motion with `correct --pelvis-offset` or check the floor height (`correct --floor`)',
+                _draw=dict(smpl=(7, 10) if foot == 0 else (8, 11), series={'sole depth m': depth[:, foot]})))
+    return issues
+
+
+def check_joint_penetration(ctx, contacts, floor):
     import numpy as np
     issues = []
     for foot, side in enumerate(('Left', 'Right')):
@@ -806,9 +861,9 @@ def check_body_offset(ctx, project, kind):
 
 
 class Floor(float):
-    def __new__(cls, value, source):
+    def __new__(cls, value, source, mode='flat'):
         item = super().__new__(cls, value)
-        item.source = source
+        item.source, item.mode = source, mode
         return item
 
 
@@ -817,7 +872,8 @@ def floor_level(ctx, project, kind):
     path = project / f'{kind}_correction.json'
     if path.is_file():
         try:
-            return Floor(float(read_json(path)['floor']), path.name)
+            report = read_json(path)
+            return Floor(float(report['floor']), path.name, 'multi_level' if report.get('mode') == 'multi_level' else 'flat')
         except (OSError, ValueError, KeyError, TypeError):
             pass
     return Floor(float(np.percentile(ctx.joints[:, [10, 11], 1].min(1), 2)), 'estimated')
@@ -829,7 +885,8 @@ def collect_issues(ctx, project, kind, pose=None):
     contacts, contacts_source = contact_mask(ctx, project, kind, floor)
     from .foot_support import check_foot_slide as support_slide
     issues = (check_missed_contacts(ctx) + check_pose(ctx) + support_slide(ctx, project, kind, contacts, floor, pose) +
-              check_penetration(ctx, contacts, floor) + check_jitter(ctx) + check_drift(ctx) + check_body_offset(ctx, project, kind))
+              check_penetration(ctx, contacts, floor, project, kind, pose) + check_jitter(ctx) + check_drift(ctx) +
+              check_body_offset(ctx, project, kind))
     if pose is not None:
         from . import anatomy
         issues += anatomy.checks(ctx, pose)
@@ -1106,7 +1163,8 @@ def summary_markdown(report):
              f"- Project: `{report['project']}` ({report['model']}, result `{report['result']}`)",
              f"- Motion: `{report['motion']['source']}`",
              f"- Frames: video {report['frames'][0]}-{report['frames'][1]} (Blender {report['blender_frames'][0]}-{report['blender_frames'][1]}), "
-             f"{report['stats']['frames_evaluated']} evaluated; floor y = {report['floor']['y']:.3f} m ({report['floor']['source']}); "
+             f"{report['stats']['frames_evaluated']} evaluated; floor y = {report['floor']['y']:.3f} m ({report['floor']['source']}"
+             f"{', Multi Level: per-stance heights' if report['floor'].get('mode') == 'multi_level' else ''}); "
              f"contacts: {report['contacts_source']}",
              f"- Errors are in torso lengths (median torso {report['stats']['torso_px_median']:.0f} px), after removing the per-frame 2D offset.",
              f"- Projection: {report['camera']}.",
@@ -1268,7 +1326,7 @@ def cmd_review(args, session):
                     frames=len(motion.joints)),
         video=str(obs.video), fps=obs.fps, camera=obs.describe(), frames=[first, last], blender_frames=[first + FRAME_BASE, last + FRAME_BASE],
         frame_numbering='frames = video frames (0-based); blender_frames and fix frames = video frame + 1',
-        floor=dict(y=float(floor), source=floor.source), contacts_source=contacts_source,
+        floor=dict(y=float(floor), source=floor.source, mode=floor.mode), contacts_source=contacts_source,
         thresholds=dict(visible_score=VISIBLE, pose_torso=POSE_THRESHOLD, contact_2d_torso=CONTACT_2D, contact_3d_m=CONTACT_3D,
                         slide_mps=SLIDE_SPEED, penetration_m=PENETRATION, jitter=dict(factor=JITTER_FACTOR, min_mps2=JITTER_MIN,
                         local_factor=JITTER_LOCAL), drift_torso=DRIFT, body_offset=dict(torso=BODY_OFFSET, seconds=BODY_OFFSET_SECONDS),

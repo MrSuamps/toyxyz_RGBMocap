@@ -41,12 +41,11 @@ def toe_boxes(body, shapes):
     return boxes
 
 
-def tips(mesh, rows, boxes):
-    """(len(rows), 2, 3) toe-box tip per foot: mean XZ of the box, lowest Y (the correction's pointe support point)."""
+def posed_vertices(mesh, rows, ids):
+    """(len(rows), len(ids), 3) posed vertices `ids` of the mesh rows, the maths of `smplx_body.Body.vertices` on a subset."""
     import numpy as np
     body, state = mesh.body, mesh.state
     index = mesh.index[rows]
-    ids = np.concatenate(boxes)
     columns = (ids[:, None] * 3 + np.arange(3)).reshape(-1)
     shaped = body.template[ids][None] + np.einsum('vci,ni->nvc', body.shapedirs[ids], state['shapes'][index])
     features = (state['local'][index, 1:] - np.eye(3)).reshape(len(index), -1)
@@ -54,7 +53,28 @@ def tips(mesh, rows, boxes):
     world, transl = state['world'][index], state['transl'][index]
     offset = state['joints'][index] - transl[:, None] - np.einsum('njab,njb->nja', world, state['rest'][index])
     rotation = np.einsum('vj,njab->nvab', body.weights[ids], world)
-    vertices = np.einsum('nvab,nvb->nva', rotation, posed) + np.einsum('vj,nja->nva', body.weights[ids], offset) + transl[:, None]
+    return np.einsum('nvab,nvb->nva', rotation, posed) + np.einsum('vj,nja->nva', body.weights[ids], offset) + transl[:, None]
+
+
+def sole_heights(mesh, chunk=256):
+    """(rows, 2) lowest Y of the left / right foot skin (vertices dominated by the ankle or toe joint) on every mesh row."""
+    import numpy as np
+    dominant = mesh.body.weights.argmax(1)
+    feet = [np.flatnonzero(np.isin(dominant, joints)) for joints in ((7, 10), (8, 11))]
+    ids = np.concatenate(feet)
+    out = np.empty((len(mesh.index), 2))
+    for start in range(0, len(mesh.index), chunk):
+        rows = np.arange(start, min(start + chunk, len(mesh.index)))
+        y = posed_vertices(mesh, rows, ids)[..., 1]
+        out[rows, 0], out[rows, 1] = y[:, :len(feet[0])].min(1), y[:, len(feet[0]):].min(1)
+    return out
+
+
+def tips(mesh, rows, boxes):
+    """(len(rows), 2, 3) toe-box tip per foot: mean XZ of the box, lowest Y (the correction's pointe support point)."""
+    import numpy as np
+    index = mesh.index[rows]
+    vertices = posed_vertices(mesh, rows, np.concatenate(boxes))
     out, first = np.empty((len(index), 2, 3)), 0
     for side, box in enumerate(boxes):
         part = vertices[:, first:first + len(box)]

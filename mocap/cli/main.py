@@ -365,6 +365,25 @@ def saved_settings_from_result(kind, model):
     return dict(refine=htd and gvhmr, footmr=foot and gvhmr, handflow=has_handflow(kind) and gvhmr, correction=kind.startswith('corrected_'))
 
 
+def grounding_refusals(jobs):
+    """[(take, reason)] of corrected takes whose `<kind>_correction.json` shows camera grounding was not applied (correction
+    decides it: one static ExMR camera, Flat Ground, foot lock, not a people group; FlowHMR ignores it)."""
+    out = []
+    for stage, arguments in jobs:
+        if stage != 'correct':
+            continue
+        project, kind = Path(arguments[arguments.index('--project') + 1]), arguments[arguments.index('--result') + 1]
+        try:
+            entry = read_json(project / f'{kind}_correction.json').get('camera_grounding')
+        except (OSError, ValueError):
+            continue
+        if not isinstance(entry, dict):
+            out.append((project, "this model's correction does not use camera grounding; the body was grounded vertically."))
+        elif 'camera_centre' not in entry:
+            out.append((project, entry.get('warning') or 'camera grounding was not applied.'))
+    return out
+
+
 def cmd_correct(args, session):
     from ..motion_tools import RESULTS, base_result
     target = resolve_project(args.project, args.model)
@@ -431,6 +450,12 @@ def cmd_correct(args, session):
     else:
         session.info(f'Warning: character refresh unavailable ({error}); linked characters are not updated.')
     runner.run_jobs(list(jobs), env, quiet=session.quiet, project=anchor)
+    if options.get('grounding') == 'camera':
+        refused = grounding_refusals(jobs)
+        for project, reason in refused:
+            print(f'warning: --grounding camera not applied to {project}: {reason} The saved Grounding setting stays camera; '
+                  'pass --grounding vertical to clear it.', file=sys.stderr, flush=True)
+        summary['grounding_refused'] = [dict(project=str(project), reason=reason) for project, reason in refused]
     if characters is not None and plans:
         if args.no_character_refresh:
             session.info(f'{len(plans)} linked character(s) need retargeting (`character retarget`).')

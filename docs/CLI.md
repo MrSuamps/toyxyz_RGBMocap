@@ -296,11 +296,12 @@ are relabelled and listed under `keypoint_swaps`.
 | `missed_contact` | A wrist or hand is within 0.25 torso of a foot, the other hand, the head (0.25), a knee (0.20) or a hip (0.15) in 2D, but more than 0.15 m away in 3D (head 0.25 m, hip 0.22 m). Between the hands the one with the larger 2D wrist error is pinned onto the other (`effector`, `target` and the message name that pair). | Hand pin onto the nearest bone. If the arm is too short to reach, `chain` 3 plus a second pin moving the target limb to the hand. |
 | `pose_error` | An arm (elbow, wrist) or leg (knee, ankle) differs from the keypoints by more than 0.35 torso after alignment. | None (re-run reconstruction or edit by hand). |
 | `foot_slide` | During ground contact, the slower of ankle and toe moves horizontally faster than 0.15 m/s. | `world` pin on that foot. |
-| `floor_penetration` | The ankle or toe joint is more than 1 cm below its resting height above the floor during contact. | None (`correct --pelvis-offset` / `--floor`). |
+| `floor_penetration` | The posed SMPL-X sole (lowest foot skin vertex) is more than 1 cm below the correction's floor (high from 5 cm, medium from 2.5); in Multi Level below the stance height of each contact segment (`<kind>_contacts.npz`), on contact frames only; without a correction, below the soles' 2nd percentile. `--motion` FBX and `--no-anatomy` (no mesh) measure the ankle / toe joints against their resting height instead. | None (`correct --pelvis-offset` / `--floor`). |
+| `foot_orientation` | The 2D ankle-to-toe direction differs from the video by more than 30 deg; or the video foot looks pointed (in line with the shin within 20 deg, not foreshortened) while the model plantarflexes less than 50 deg and its projected foot disagrees: more than 15 deg off the video direction, or the video heel-to-toe line points more than 15 deg further down (heel raised). | Hint: a `match` or `pointe` foot articulation (`contacts feet add`). |
 | `jitter` | A joint's acceleration (pelvis-relative; the pelvis absolute) exceeds 8 times its median and 20 m/s^2, and 3 times its local median. | `smooth` on the limb's bones. |
 | `placement_drift` | The whole body sits more than 0.25 torso off the person in the video (informational). | None. |
 | `body_offset` | Corrected results: for at least 1 s the body sits more than 0.2 torso farther off the person than the uncorrected base result does, each through its own camera (medium from 0.3, high from 0.4 median excess). Metrics give both offsets, the direction (below / above / sideways) and `mode`, `max_root_y_offset_m` and `warning` from `<kind>_correction.json`. | None (check the GUI camera view; `correct --floor-mode multi_level` or `--floor`). |
-| `hyperextension` | An elbow or knee bends more than 5 deg the wrong way about its anatomical hinge (high from 25 deg). | None. |
+| `hyperextension` | An elbow or knee bends more than 5 deg the wrong way about its anatomical hinge (high from 25 deg). Only bends toward the extension side count: a limb folded out of its hinge plane (a twisted elbow reads about 180 deg) is left to `joint_twist`. | None. |
 | `locked_limb` | An elbow is held at 170 deg interior or straighter for 6+ frames (knee 178); high when locked at 177+ for 10+ frames, the typical IK reach failure. | None (move the target limb / reciprocal). |
 | `sudden_fold` | An elbow or knee dips more than 35 deg below the angles around it within 0.35 s (an easing fold; knees one level lower). | None. |
 | `wrist_limit` | The wrist leaves its range relative to the forearm (flexion 80, extension 70, radial 25, ulnar 40 deg). | None (grip). |
@@ -309,7 +310,7 @@ are relabelled and listed under `keypoint_swaps`.
 | `finger_pose` | A finger joint is more than 10 deg past its flexion / spread / twist range (SMPL-X hand pose relative to the flat hand). | None. |
 | `hand_orientation` | On frames with confident hand keypoints, the 2D wrist-to-middle-knuckle direction differs by more than 50 deg from the motion, or the thumb and pinky sides are swapped. | None. |
 | `self_penetration` | On the posed SMPL-X mesh, a hand or forearm is more than 1 cm inside a leg, the head, the torso or the other arm, or the legs pass through each other (high from 2.5 cm). | None (self-contact solver or limb placement; `contacts suggest` proposes a contact for a hand resting inside the body). |
-| `contact_gap` | During an enabled self-contact interval the hand skin floats more than 1.5 cm from the target skin (high from a 4 cm median). | None (`correct` with the track enabled). |
+| `contact_gap` | During an enabled self-contact interval the hand skin floats more than 1.5 cm from the target skin (high from a 4 cm median), or stays more than 0.5 cm inside it for 3+ frames (`metrics.inside`; below the 1 cm `self_penetration` threshold, high from a 1 cm median). | None (`correct` with the track enabled). |
 
 `suggested_fixes` contains the high and medium issues in rank order. A pin whose limb and ease window would overlap an
 earlier pin is left out (noted on the issue), because `fix` rejects overlapping pins. Typical loop: `review`, run `fix`
@@ -339,7 +340,7 @@ change, and `images\compare_delta_<layer>.png` (one column per frame, white tick
 ## Render bodies
 
 ```
-rgbmocap-cli.cmd render --project P [--model M] [--result KIND] [--frames A-B] [--step N] [--views camera,front,side,orbit]
+rgbmocap-cli.cmd render --project P [--model M] [--result KIND] [--frames A-B|A,B,C] [--step N] [--views camera,front,side,orbit]
                         [--compare [original|before-selfcontact]] [--focus BONE,BONE] [--out DIR] [--mp4] [--size PX]
 rgbmocap-cli.cmd render --project P --sheet [--frames A-B|A,B,C] [--compare original|before-selfcontact] [--add LABEL=FILE] [--out DIR]
 ```
@@ -350,8 +351,10 @@ needs no GPU. ExMR and GVHMR use SMPL-X with shape and pose correctives; FlowHMR
 shapes, no pose correctives, 16 betas. Views: `camera` over the video frame (ExMR: review's camera, one fixed camera for a
 static camera, per frame for a moving one following each layer's own correction; FlowHMR and GVHMR: the GUI camera view's
 saved camera, `flow_camera.npz` rotation about the placement's fixed centre or GVHMR's frame-0 paired camera, the same for
-every layer), `front` and `side` from the body's mean heading, and `orbit`, four close views around each self-contact
-(or `--focus`). `--compare` puts the reference layer (grey) beside the result (orange); without a value it picks
+every layer), `front` and `side` from the body's mean heading (one camera for all layers, centred between them and far
+enough for both, so a correction that moved the root still fits), and `orbit`, four close views around each
+self-contact (or `--focus`), each layer's row centred on its own contact. `--frames` takes `A-B` (every `--step`th
+frame) or a list `A,B,C`. `--compare` puts the reference layer (grey) beside the result (orange); without a value it picks
 `before-selfcontact` when that file is current (its stat matches `<kind>_correction.json` and the result is not stale),
 else `original`, with a note when an outdated file was skipped. A red line marks each self-contact with its palm-to-target
 distance. Without `--frames` the self-contact intervals plus 10 frames are rendered. Writes `<view>_f<frame>.png`,
@@ -363,10 +366,13 @@ GUI camera view projects with the same camera and skeleton); `front` / `side` ar
 
 `--sheet` writes one comparison image per enabled self-contact track instead: one row per frame, columns
 **Video** (a crop around the contact), **Before** and **After** drawn over the same crop, then each layer in a close 3D
-view of the touching limbs only (90 deg from the camera). Each tile states the hand's depth inside the target or the skin
-gap, the arm's depth inside the target, and the angle between the model's wrist-to-knuckle direction (magenta arrow)
-and the video's (green). `--frames A-B` (default: the track's ranges) gives four evenly spaced frames, `A,B,C` exactly
-those frames. Before is `--compare` (default `original`); `--add LABEL=FILE` adds another result file in the same params
+view of the touching limbs only (90 deg from the camera, from the side the hand is on, centred on each layer's own
+contact). Each tile states the hand's depth inside the target or the skin gap, the arm's depth inside the target, and the
+angle between the model's wrist-to-knuckle direction (magenta arrow) and the video's (green). Frames are taken per track
+from its hold (its ranges, else its suggested ranges): by default four frames spread over the hold's frames (not the gaps
+between ranges), with `--frames A-B` four of the hold's frames inside A-B, with `A,B,C` those of the listed frames inside
+the hold. When none of the requested frames is in a track's hold, its sheet shows them with the rows marked "outside the
+hold" (`sheet.json` `outside_hold`). Before is `--compare` (default `original`); `--add LABEL=FILE` adds another result file in the same params
 format (for example a saved grip-off result) as a column, repeatable. Writes `sheet_<id>_f<first>-<last>.png` and
 `sheet.json` into `--out` (default `<model project>\render\<result>-sheet-<time>\`). The video hand direction needs
 ExMR's COCO-63 keypoints: FlowHMR saves no 2D keypoints and GVHMR's are COCO-17 without hands, so for them the green
