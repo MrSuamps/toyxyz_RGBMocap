@@ -14,13 +14,22 @@ def code_path():
     return ROOT/'mocap/handflow.py'
 
 
+def code_current(record):
+    """Same code stat, or a reviewed source-only change of the code that wrote the record (cache_compat)."""
+    if record['code_stat']==file_stat(code_path()):return True
+    from .cache_compat import HANDFLOW_CODE_COMPAT
+    # Records written before the 'code' digest existed are keyed by the size of the code that wrote them.
+    approved=HANDFLOW_CODE_COMPAT.get(record['code'] if 'code' in record else record['code_stat'][0])
+    return approved is not None and sha256(code_path())==approved
+
+
 def result_current(project,kind):
     project=Path(project)
     if (project/'handflow_pending.json').exists():return False
     try:
         record=json.loads((project/(kind+'_handflow.json')).read_text(encoding='utf-8'))
         if record['version']!=VERSION or file_stat(project/RESULTS[kind][0])!=record['output_stat']:return False
-        if record['code_stat']!=file_stat(code_path()):return False
+        if not code_current(record):return False
         if not (project/(kind+'_sources.json')).is_file():return False
         from .motion_tools import result_is_current
         if not result_is_current(project,body_result(kind)):return False
@@ -112,7 +121,7 @@ def run(project,emit,result):
                  **{k:v for k,v in payload['inputs'].items()}}
         atomic_json(project/(kind+'_sources.json'),sources)
         atomic_json(project/(kind+'_handflow.json'),dict(version=VERSION,output_stat=file_stat(target),code_stat=file_stat(code_path()),
-            models=payload['models'],fps=fps,frames=n,body_and_wrists_unchanged=True,physical_finger_rotations=True,
+            code=sha256(code_path()),models=payload['models'],fps=fps,frames=n,body_and_wrists_unchanged=True,physical_finger_rotations=True,
             detection_coverage=valid.mean(0).tolist(),prediction_cached=cached,warning=' '.join(warnings)))
         # Existing manual foot timings remain meaningful: all body tensors above
         # are bit-identical. Copy valid edits only for a brand-new hand variant.

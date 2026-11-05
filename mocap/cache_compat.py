@@ -49,6 +49,13 @@ COMPATIBLE_CODE = {
     'correction_settings.py': {'83d0a23eafe9a40a6da6acaee3581be81b54a1e9f394c8a08f862aff7b46f51a': '430cf3e5b6d97ee6e1e6e051f63261b83070bcad86d2412ef242926d46374855'},
 }
 
+# handflow.py: copying self-contact rows to a new hand variant leaves the finger merge unchanged. Keys are the writer's 'code'
+# digest, or for older records the size of the writer (8286 = the release file, 9134 = the first self-contact copy).
+HANDFLOW_CODE_COMPAT = {
+    8286: '663a7c7cbb0dab67957489704c7e443d6fedaa19fdd35ac74b10e64f5652eaca',
+    9134: '663a7c7cbb0dab67957489704c7e443d6fedaa19fdd35ac74b10e64f5652eaca',
+}
+
 
 @lru_cache(maxsize=16)
 def _digest(path, stamp):
