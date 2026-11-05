@@ -91,8 +91,8 @@ ELBOW_TWIST_DEG = 80.
 # Elbow hinge axes in the shoulder (upper arm) frame, as limb_placement.CHAINS.
 ARM_HINGES = ((0., -1., 0.), (0., 1., 0.))
 # Hand search on a skin anchor (costs in degrees of wrist excess): hand roll candidates about the palm normal and arm swivel
-# candidates (deg), cost per degree of roll away from the solved hand and of roll change between frames (swivels use
-# SWIVEL_WEIGHT / SWIVEL_STEP_WEIGHT), the part of the forearm (from the elbow) checked against the target limb's capsules,
+# candidates (deg), cost per degree of roll away from the solved hand and of hand turn between frames (swivels use
+# SWIVEL_WEIGHT, steps ARM_STEP_WEIGHT below), the part of the forearm (from the elbow) checked against the target limb's capsules,
 # reach used of the straight arm, the 2D video hand- and upper-arm-direction weights (per degree), the video elbow position
 # weight (per torso length of 2D miss), the cost of fingers along the limb instead of across it, and the cost per metre of
 # capsule clearance short of ARM_CLEARANCE_M. A bent elbow seen end-on looks straight in the video: only the elbow position
@@ -101,6 +101,13 @@ HAND_ROLLS_DEG = np.arange(0., 360., 30.)
 HAND_SWIVELS_DEG = np.arange(-180., 180., 15.)
 HAND_ROLL_WEIGHT = .01
 HAND_ROLL_STEP_WEIGHT = .1
+# Steps between hand-search candidates are priced by the world rotation of the upper arm (ARM_STEP_WEIGHT per deg) and of
+# the hand (HAND_ROLL_STEP_WEIGHT), not by candidate index, whose reference turns with the solved arm. Past ARM_STEP_DEG_S
+# a step also costs ARM_SPEED_WEIGHT per deg squared: linear costs alone let the path swap elbow branches in one frame for
+# the price of a slow turn, and a cheap slow turn still swings a bent elbow half way round the shoulder-hand line.
+ARM_STEP_WEIGHT = .5
+ARM_STEP_DEG_S = 300.
+ARM_SPEED_WEIGHT = .5
 FOREARM_REACH = .75
 REACH_FRACTION = .995
 VIDEO_ROLL_WEIGHT = .3
@@ -409,10 +416,11 @@ def grip_geometry(rest, root, q, offsets, tj, point, segment=None):
 
 
 def viterbi(unary, transition):
-    """Index path minimising the summed per-frame costs (m, k) plus transition costs (k, k) between frames."""
+    """Index path minimising the summed per-frame costs (m, k) plus transition costs (k, k) between frames, or a callable
+    i -> (k, k) costs from row i - 1 to row i."""
     m, k = unary.shape; cost = unary[0].copy(); back = np.zeros((m, k), int)
     for i in range(1, m):
-        total = cost[:, None] + transition
+        total = cost[:, None] + (transition(i) if callable(transition) else transition)
         back[i] = total.argmin(0); cost = total[back[i], np.arange(k)] + unary[i]
     path = np.empty(m, int); path[-1] = int(cost.argmin())
     for i in range(m - 1, 0, -1):path[i - 1] = back[i, path[i]]
@@ -1183,6 +1191,21 @@ def hand_prior():
     return HAND_ROLL_WEIGHT * wrap_deg(HAND_ROLLS_DEG)[:, None] + SWIVEL_WEIGHT * wrap_deg(HAND_SWIVELS_DEG)[None]
 
 
+def hand_steps(upper, hand, fps):
+    """i -> (k * s, k * s) cost from every (roll, swivel) candidate on row i - 1 to every one on row i, from the world
+    rotations of the upper arm (m, k, s, 3, 3) and the hand (m, k, 3, 3) (see ARM_STEP_DEG_S)."""
+    m, k, s = upper.shape[:3]; arm = upper.reshape(m, k * s, 9); palm = hand.reshape(m, k, 9); limit = ARM_STEP_DEG_S / fps
+
+    def cost(a, b, weight):
+        step = np.rad2deg(np.arccos(np.clip((a @ b.T - 1) / 2, -1, 1)))
+        return weight * step + ARM_SPEED_WEIGHT * np.maximum(step - limit, 0) ** 2
+
+    def step(i):
+        turn = cost(palm[i - 1], palm[i], HAND_ROLL_STEP_WEIGHT)
+        return cost(arm[i - 1], arm[i], ARM_STEP_WEIGHT) + np.repeat(np.repeat(turn, s, 0), s, 1)
+    return step
+
+
 def palm_frames(rest, g, h, inward):
     """hands(ids, roll) -> (hand world rotations, long axes) of frames ids with the palm facing inward (m, 3), rolled by roll
     (rad, (len(ids),) or (len(ids), k)) about the palm normal from the wrist's current long axis."""
@@ -1230,8 +1253,9 @@ def hand_search(rest, skin, root, q, h, goal, inward, limb, offsets, fps, active
     around it, forearm / upper-arm capsules closer than ARM_CLEARANCE_M to the target limb's, a shortfall of reach, degrees
     away from the solved hand and elbow, and with video the 2D upper-arm direction and elbow position (video_hand: also the 2D
     hand direction).
-    Costs are evaluated on every other active frame and interpolated; a Viterbi path over (roll, swivel) keeps both
-    continuous. angles (roll, swivel rad (m,)) from an earlier call skip the search. Only active frames change.
+    Costs are evaluated on every other active frame and interpolated; a Viterbi path over (roll, swivel), stepping by the
+    world rotation of the upper arm and hand (hand_steps), keeps the arm on one elbow branch. angles (roll, swivel rad (m,))
+    from an earlier call skip the search. Only active frames change.
     Returns (quats, report, angles).
     """
     from .correction import fk
@@ -1267,9 +1291,10 @@ def hand_search(rest, skin, root, q, h, goal, inward, limb, offsets, fps, active
                 cost = cost + (VIDEO_ROLL_WEIGHT * confidence[:, None] * angle_2d(tip[:, :, 1] - tip[:, :, 0], (kp[:, 1] - kp[:, 0])[:, None]))[..., None]
         full = np.broadcast_to(prior, (m, k, s)).copy()
         full[ids] += np.stack([np.interp(ids, f, c) for c in cost.reshape(len(f), -1).T], 1).reshape(len(ids), k, s)
-        transition = HAND_ROLL_STEP_WEIGHT * wrap_deg(HAND_ROLLS_DEG[:, None] - HAND_ROLLS_DEG[None])[:, None, :, None] + \
-            SWIVEL_STEP_WEIGHT * wrap_deg(HAND_SWIVELS_DEG[:, None] - HAND_SWIVELS_DEG[None])[None, :, None]
-        pick_roll, pick_swivel = np.unravel_index(viterbi(full.reshape(m, -1), transition.reshape(k * s, k * s)), (k, s))
+        every, _ = hands(np.arange(m), np.broadcast_to(rolls, (m, k)))
+        upper = arm_pose(rest, j, g, elbow_local, h, np.broadcast_to((goal[:, None] - every @ offsets[h])[:, :, None], (m, k, s, 3)),
+                         np.broadcast_to(swivels, (m, k, s)))[0]
+        pick_roll, pick_swivel = np.unravel_index(viterbi(full.reshape(m, -1), hand_steps(upper, every, fps)), (k, s))
         sigma = max(.5, fps * .05)
         angles = tuple(gaussian_filter1d(np.unwrap(x), sigma, mode='nearest') for x in (rolls[pick_roll], swivels[pick_swivel]))
     elif angles is None:

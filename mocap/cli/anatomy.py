@@ -32,6 +32,14 @@ WRIST_LIMITS = dict(flexion=80.0, extension=70.0, radial=25.0, ulnar=40.0)
 TWIST_LIMITS = {'knee': 40.0, 'elbow': 80.0, 'wrist': 80.0}
 FOLD_DEG = 35.0                 # dip below both neighbouring maxima inside the window
 FOLD_SECONDS = 0.35
+# Joint flip: an elbow / knee swinging round its root-end line (swivel, measured while bent below FLIP_BENT_DEG interior),
+# the end twisting about the lower bone, or the upper / lower bone turning against the torso faster than FLIP_STEP_DEG per
+# 1/30 s, or swivel / twist netting FLIP_WINDOW_DEG within FLIP_WINDOW_SECONDS. Fast real punches and dance swings stay
+# under ~30 deg per frame and ~80 deg of swivel or twist per window; a branch flip of the IK sweeps 140-180.
+FLIP_STEP_DEG = 45.0
+FLIP_WINDOW_DEG = 120.0
+FLIP_WINDOW_SECONDS = 5 / 30
+FLIP_BENT_DEG = 150.0
 # Finger limits relative to the flat hand: (flexion min, flexion max, |abduction|, |twist|) for knuckles 1-3.
 FINGER_LIMITS = ((-30.0, 100.0, 30.0, 30.0), (-10.0, 115.0, 15.0, 25.0), (-15.0, 95.0, 15.0, 25.0))
 THUMB_LIMITS = (100.0, 45.0)    # swing, |twist|
@@ -40,7 +48,7 @@ HAND_VISIBLE = 0.5
 HAND_DIRECTION_DEG = 50.0
 HAND_EDGE_ON = 0.35             # |sin| of the wrist->knuckle vs knuckle-row angle below which the palm order is unreliable
 HAND_MIN_TORSO = 0.06
-PREFIX = dict(hyperextension='HX', locked_limb='LL', wrist_limit='WL', joint_twist='TW', sudden_fold='SF', finger_pose='FG',
+PREFIX = dict(hyperextension='HX', locked_limb='LL', wrist_limit='WL', joint_twist='TW', joint_flip='JF', sudden_fold='SF', finger_pose='FG',
               hand_orientation='HO', self_penetration='SP', contact_gap='CG')
 # Skin interpenetration (posed SMPL-X mesh, segments by skinning weight): depth of one segment's vertices inside another.
 PENETRATION_M = 0.01
@@ -343,6 +351,92 @@ def check_twist(pose, frames):
     return issues
 
 
+def limb_steps(pose):
+    """{limb: (joints, {measure: signed or unsigned degrees per frame step (N - 1,)})} for both arms and legs: the upper and
+    lower bone's rotation against the torso (spine3 for arms, pelvis for legs), the elbow / knee swivel about the root-end
+    line in the torso frame (0 while the limb is nearly straight) and the end's twist against the upper bone about the lower
+    bone. Swivel and twist are per-step increments, so they need no reference direction and never wrap."""
+    from scipy.spatial.transform import Rotation
+    out = {}
+    for side, arm, leg in zip(SIDES, ((16, 18, 20), (17, 19, 21)), ((1, 4, 7), (2, 5, 8))):
+        for kind, (a, b, c), base in (('arm', arm, 9), ('leg', leg, 0)):
+            torso = pose.world[:, base].transpose(0, 2, 1)
+            steps = {}
+            for name, joint in (('upper', a), ('lower', b)):
+                rel = torso @ pose.world[:, joint]
+                cosine = (np.einsum('nij,nij->n', rel[:-1], rel[1:]) - 1) / 2
+                steps[name] = np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+            p, e, w = (np.einsum('nij,nj->ni', torso, pose.joints[:, k]) for k in (a, b, c))
+            axis = unit(w - p)
+            perp = orthogonal(e - p, axis)
+            # Carry each frame's elbow direction onto the next frame's axis by the minimal rotation, then measure the turn about it.
+            cross = np.cross(axis[:-1], axis[1:])
+            turn = unit(cross) * np.arctan2(np.linalg.norm(cross, axis=-1), np.sum(axis[:-1] * axis[1:], -1))[:, None]
+            carried = Rotation.from_rotvec(turn).apply(perp[:-1])
+            swivel = np.degrees(np.arctan2(np.sum(np.cross(carried, perp[1:]) * axis[1:], -1), np.sum(carried * perp[1:], -1)))
+            bent = interior(pose.joints[:, a], pose.joints[:, b], pose.joints[:, c]) < FLIP_BENT_DEG
+            steps['swivel'] = np.where(bent[1:] & bent[:-1], swivel, 0.0)
+            # End vs upper bone angular step (upper frame), read in the lower bone's frame: elbow / knee flex and wrist / ankle
+            # swing are about axes across the lower bone, so only the twist lands on its rest axis.
+            upper = pose.world[:, a].transpose(0, 2, 1)
+            rel = upper @ pose.world[:, c]
+            step = Rotation.from_matrix(rel[1:] @ rel[:-1].transpose(0, 2, 1)).as_rotvec()
+            lower = (upper @ pose.world[:, b])[:-1]
+            steps['twist'] = np.degrees(np.einsum('nji,nj->ni', lower, step) @ unit(pose.rest[c] - pose.rest[b]))
+            out[f'{side}_{kind}'] = ((a, b, c), steps)
+    return out
+
+
+def check_joint_flip(pose, frames, fps):
+    """Arm / leg rotations that flip: per-step speed spikes and swivel / twist sweeps (FLIP_* thresholds, scaled to fps)."""
+    if len(pose.joints) < 3:
+        return []
+    step_limit = FLIP_STEP_DEG * 30.0 / fps
+    span = max(2, int(round(FLIP_WINDOW_SECONDS * fps)))
+    issues = []
+    for limb, (joints, steps) in limb_steps(pose).items():
+        n = len(pose.joints)
+        flag = np.zeros(n, bool)
+        per_step = np.zeros(n)
+        windowed = np.zeros(n)
+        for name, values in steps.items():
+            speed = np.abs(values)
+            flag[1:] |= speed > step_limit
+            per_step[1:] = np.maximum(per_step[1:], speed / step_limit)
+            if name in ('swivel', 'twist'):
+                total = np.r_[0.0, np.cumsum(values)]
+                net = np.abs(total[span:] - total[:-span])
+                for i in np.flatnonzero(net > FLIP_WINDOW_DEG):
+                    flag[i + 1:i + span + 1] = True
+                for i, value in enumerate(net):
+                    windowed[i + 1:i + span + 1] = np.maximum(windowed[i + 1:i + span + 1], value / FLIP_WINDOW_DEG)
+        score = np.maximum(per_step, windowed)
+        for a, b in runs(flag, 2, 1):
+            span_rows = slice(a, b + 1)
+            worst = a + int(np.argmax(score[span_rows]))
+            lo, hi = max(a - span, 1), min(b + span, n - 1)
+            metrics = dict(frames_flagged=int(flag[span_rows].sum()), window_frames=span, step_limit_deg=step_limit, window_limit_deg=FLIP_WINDOW_DEG)
+            for name, values in steps.items():
+                metrics[f'{name}_step_max_deg'] = float(np.abs(values[lo - 1:hi]).max())
+                if name in ('swivel', 'twist'):
+                    total = np.r_[0.0, np.cumsum(values[lo - 1:hi])]
+                    metrics[f'{name}_window_max_deg'] = float(np.abs(total[span:] - total[:-span]).max()) if len(total) > span else 0.0
+            peak = max(metrics['swivel_window_max_deg'], metrics['twist_window_max_deg'])
+            fastest = max(metrics[f'{name}_step_max_deg'] for name in steps)
+            severity = 'high' if peak >= 150 or fastest >= 1.5 * step_limit else 'medium'
+            side, kind = limb.split('_')
+            middle = 'elbow' if kind == 'arm' else 'knee'
+            seconds = span / fps
+            issues.append(make_issue('joint_flip', severity, float(score[worst]) * 100, frames, a, b, worst, [f'{side}_{middle}'], metrics,
+                                     f'{side} {kind} flips: the {middle} swings {metrics["swivel_window_max_deg"]:.0f} deg round its line and '
+                                     f'the {"hand" if kind == "arm" else "foot"} twists {metrics["twist_window_max_deg"]:.0f} deg within '
+                                     f'{seconds:.2f} s (fastest bone step {fastest:.0f} deg per frame)',
+                                     'an IK / contact solve changed elbow or knee branch; keep the branch continuous (re-run `correct`)',
+                                     dict(smpl=joints, series={f'{limb} swivel step deg': np.r_[0.0, steps['swivel']],
+                                                               f'{limb} twist step deg': np.r_[0.0, steps['twist']]})))
+    return issues
+
+
 def check_wrists(pose, frames):
     issues = []
     for s, side in enumerate(SIDES):
@@ -414,7 +508,8 @@ def check_fingers(pose, frames):
 def check_anatomy(pose, frames, fps):
     """All rotation checks on a pose sliced to `frames` (video frame per row)."""
     frames = np.asarray(frames)
-    return check_limbs(pose, frames, fps) + check_wrists(pose, frames) + check_twist(pose, frames) + check_fingers(pose, frames)
+    return (check_limbs(pose, frames, fps) + check_wrists(pose, frames) + check_twist(pose, frames) + check_joint_flip(pose, frames, fps) +
+            check_fingers(pose, frames))
 
 
 # Hand orientation vs the video ---------------------------------------------------------------------------------------

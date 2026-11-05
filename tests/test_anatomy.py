@@ -177,6 +177,31 @@ class ChecksTest(unittest.TestCase):
         self.assertEqual([(i['joints'], i['severity']) for i in twist], [(['right_wrist'], 'high')])
         self.assertAlmostEqual(abs(twist[0]['metrics']['twist_signed_at_worst_deg']), 120, places=5)
 
+    def swivelled(self, angles):
+        """Right elbow bent 90 deg, the whole arm turned by angles (deg per frame) about the shoulder-wrist line."""
+        local = identity(len(angles))
+        local[:, 19] = rot([0, 1, 0], 90)
+        axis = [-0.28, 0, 0.25]
+        local[:, 17] = [rot(axis, a) for a in angles]
+        return pose_from_locals(local)
+
+    def test_joint_flip(self):
+        frames = self.frames(40)
+        smooth = self.swivelled(np.linspace(0, 60, 40))
+        self.assertEqual(anatomy.check_joint_flip(smooth, frames, 30.0), [])
+        steps = anatomy.limb_steps(smooth)['right_arm'][1]
+        self.assertAlmostEqual(abs(float(steps['swivel'].sum())), 60, places=5)
+        self.assertLess(np.abs(steps['twist']).max(), 1e-6)
+        flip = self.swivelled(np.r_[np.zeros(20), np.linspace(0, 170, 5)[1:], np.full(16, 170.0)])
+        issues = anatomy.check_joint_flip(flip, frames, 30.0)
+        self.assertEqual([(i['joints'], i['severity']) for i in issues], [(['right_elbow'], 'high')])
+        self.assertAlmostEqual(issues[0]['metrics']['swivel_window_max_deg'], 170, places=4)
+        self.assertTrue(issues[0]['frames'][0] <= 121 <= issues[0]['frames'][1])
+        # 30 deg per frame is fast but real at 30 fps; at 60 fps the same steps are twice as fast.
+        quick = self.swivelled(np.r_[np.zeros(20), 30, 60, 90, np.full(17, 90.0)])
+        self.assertEqual(anatomy.check_joint_flip(quick, frames, 30.0), [])
+        self.assertEqual(len(anatomy.check_joint_flip(quick, frames, 60.0)), 1)
+
     def test_rank_prefixes(self):
         issues = [dict(check='wrist_limit', severity='medium', score=1), dict(check='locked_limb', severity='high', score=2),
                   dict(check='missed_contact', severity='high', score=5), dict(check='wrist_limit', severity='low', score=9)]

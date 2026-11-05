@@ -302,6 +302,7 @@ are relabelled and listed under `keypoint_swaps`.
 | `sudden_fold` | An elbow or knee dips more than 35 deg below the angles around it within 0.35 s (an easing fold; knees one level lower). | None. |
 | `wrist_limit` | The wrist leaves its range relative to the forearm (flexion 80, extension 70, radial 25, ulnar 40 deg). | None (grip). |
 | `joint_twist` | A knee (40 deg), elbow (80) or wrist (80) twists about its own bone: candy-wrap risk. | None. |
+| `joint_flip` | An arm or leg flips: the upper or lower bone turns more than 45 deg in one frame against the torso, or the elbow / knee swings (while bent below 150 deg) or the hand / foot twists about the lower bone by more than 45 deg in one frame or 120 deg within 5 frames (per 1/30 s; scaled to the clip's fps). High from 150 deg or 1.5 times the step limit. Typically an IK / contact solve changing the elbow branch. | None (re-run `correct`). |
 | `finger_pose` | A finger joint is more than 10 deg past its flexion / spread / twist range (SMPL-X hand pose relative to the flat hand). | None. |
 | `hand_orientation` | On frames with confident hand keypoints, the 2D wrist-to-middle-knuckle direction differs by more than 50 deg from the motion, or the thumb and pinky sides are swapped. | None. |
 | `self_penetration` | On the posed SMPL-X mesh, a hand or forearm is more than 1 cm inside a leg, the head, the torso or the other arm, or the legs pass through each other (high from 2.5 cm). | None (self-contact solver or limb placement). |

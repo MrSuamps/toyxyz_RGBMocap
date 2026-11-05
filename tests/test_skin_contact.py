@@ -160,6 +160,20 @@ class LoopTest(unittest.TestCase):
             reached = short < 1e-9
             np.testing.assert_allclose(W[reached], targets[reached], atol=1e-6)
 
+    def test_hand_steps_keep_the_elbow_branch(self):
+        # Two candidates per frame (one roll, two swivels): stay put, or turn the upper arm 180 deg over the clip.
+        m = 13; turn = np.linspace(0, np.pi, m)
+        upper = np.stack([np.broadcast_to(np.eye(3), (m, 3, 3)), Rotation.from_rotvec(turn[:, None] * [1., 0, 0]).as_matrix()], 1)[:, None]
+        step = sc.hand_steps(upper, np.broadcast_to(np.eye(3), (m, 1, 3, 3)), FPS)
+        fast = sc.ARM_STEP_WEIGHT * 15 + sc.ARM_SPEED_WEIGHT * (15 - sc.ARM_STEP_DEG_S / FPS) ** 2
+        np.testing.assert_allclose(step(1), [[0, fast], [0, fast]], atol=1e-6)
+        # The other branch, cheaper from frame 6 on, is not worth swinging the arm half way round.
+        unary = np.zeros((m, 2)); unary[:6, 1] = 50; unary[6:, 0] = 1
+        self.assertEqual(sc.viterbi(unary, step).tolist(), [0] * m)
+        per_frame = [1 if i >= 6 else 0 for i in range(m)]
+        self.assertEqual(sc.viterbi(unary, np.zeros((2, 2))).tolist(), per_frame)
+        self.assertEqual(sc.viterbi(unary, lambda i: np.zeros((2, 2))).tolist(), per_frame)
+
     def test_without_skin_no_loop_runs(self):
         root, q = clip()
         entry = sc.apply(REST, root, q, OFFSETS, FPS, [track()], [[], []])['tracks'][0]
