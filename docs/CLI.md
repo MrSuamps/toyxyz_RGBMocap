@@ -25,7 +25,7 @@ These work before or after the command.
 | `--no-lock` | Do not take the app lock. Normally the CLI refuses to run while RGB MoCap, an install or an update is running. |
 | `--view` | When the command succeeds, open its project in the RGB MoCap GUI (its own window and console). If the GUI is already open, the CLI prints the folder to open with **File > Open Project...** instead. `batch` opens the last clip that succeeded. |
 
-`--help`, `--dry-run`, `models`, `review` and `fix` never take the lock, so they work while the app is open (`review` and `fix` only read projects and write to their own output folders). `contacts list`, `contacts feet list` and `contacts suggest` without `--accept` do not take it either.
+`--help`, `--dry-run`, `models`, `review` and `fix` never take the lock, so they work while the app is open (`review` and `fix` only read projects and write to their own output folders). `contacts list`, `contacts feet list`, `contacts place list`, `contacts smooth list` and `contacts suggest` without `--accept` do not take it either.
 
 Exit codes: `0` ok, `1` failed, `2` invalid arguments, `3` missing models, `4` the app (or an install/update) is running,
 `130` cancelled with Ctrl+C. Ctrl+C stops the running worker and its child processes; completed stages are reused next time.
@@ -375,7 +375,7 @@ edits and shared with the app. The project needs a corrected result first (`corr
   skipping frames another enabled track already holds with the same hand; `edit --id ID --accept` accepts one track.
 - `list` prints the tracks, intervals, suggestions, settings and, after `correct`, the last residuals per track.
 - Every change gives the tracks a new revision, so the corrected result and its exports become stale until `correct`
-  runs again (the command says so). `remove --all` deletes the tracks (foot articulation is kept, see below); with nothing
+  runs again (the command says so). `remove --all` deletes the tracks (foot, placement and smoothing rows are kept, see below); with nothing
   left the files are deleted and a result corrected without self-contacts is then
   current again. `--dry-run` validates a change without writing it.
 
@@ -400,10 +400,40 @@ remove --all` keeps the tracks and `remove --all` keeps the foot entries, unless
 different length or frame rate: then `remove --all` deletes everything. `contacts list` also shows the entries and,
 after `correct`, any skipped or joint-limited intervals. FlowHMR correction does not apply foot articulation.
 
-The same files can also hold limb placement rows (`placement`: fit an arm or leg chain to the video's 2D keypoints,
-applied before the self-contacts) and pose smoothing rows (`smoothing`, applied last). `contacts` does not edit or list
-them yet; they are written with `mocap.self_contact_store.save_placement` / `save_smoothing`, and `remove --all` keeps
-them.
+### Limb placement and pose smoothing
+
+```
+rgbmocap-cli.cmd contacts place list    --project P [--model M]
+rgbmocap-cli.cmd contacts place add     --project P --chain LeftArm|RightArm|LeftLeg|RightLeg --frames A-B[,C-D]
+                                        [--strength S] [--id ID] [--disabled]
+rgbmocap-cli.cmd contacts place edit    --project P --id ID [--chain ...] [--frames ...] [--add-frames ...]
+                                        [--remove-frames ...] [--strength S] [--enable|--disable]
+rgbmocap-cli.cmd contacts place remove  --project P --id ID | --all
+
+rgbmocap-cli.cmd contacts smooth list   --project P [--model M]
+rgbmocap-cli.cmd contacts smooth add    --project P [--group arms|legs|spine|all-written | --joints BONE[,BONE]] --frames A-B[,C-D]
+                                        [--window N] [--id ID] [--disabled]
+rgbmocap-cli.cmd contacts smooth edit   --project P --id ID [--group ... | --joints ...] [--window N] [--frames ...]
+                                        [--add-frames ...] [--remove-frames ...] [--enable|--disable]
+rgbmocap-cli.cmd contacts smooth remove --project P --id ID | --all
+```
+
+A limb placement row ("match 2D") fits one arm or leg chain to the video's 2D keypoints over frame intervals; `correct`
+applies it after the hand lock and before the self-contacts, so contacts are solved on the placed limb. The upper joint
+rotates freely and the elbow or knee bends about its hinge; the hand or foot keeps its world rotation and depth stays near
+the source, since one view cannot measure it. `--strength` blends from the source limb (0) to the fitted one (1, default).
+One enabled row per chain and frame; ids default to e.g. `rl-place`. Placement needs ExMR 2D keypoints.
+
+A pose smoothing row calms rotation jitter of a bone group (`--group`, default `all-written`: the legs, plus the arms when
+the hand lock moved them) or a bone list (`--joints`, any body bone except `Hips`) over frame intervals; `correct` applies
+it last, after the self-contacts. `--window` is the Gaussian window in frames (3-61, default 5; keep it small). Leg joints
+stay put while their foot is locked. Enabled rows sharing a bone may not overlap; ids default to e.g. `smooth-arms`.
+
+Both use the same inclusive `--frames`, live in the same `selfcontact_<base>_*.json` files (`placement`, `smoothing`) and
+make the corrected result stale the same way. `place remove --all` / `smooth remove --all` remove only their own rows and
+`remove --all` keeps them (unless the files belong to other motion). `contacts list` shows them with, after `correct`,
+each interval's 2D error before and after placement, skipped intervals and the largest smoothing change. FlowHMR
+correction applies neither.
 
 ## Notes
 

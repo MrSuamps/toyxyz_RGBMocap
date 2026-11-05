@@ -17,7 +17,9 @@ TIMELINE_HELP = (
     "Hatched intervals are suggestions: double-click or right-click to accept them.\n"
     "Right-click: add a pair (+ Pair row), pair settings (distance, reciprocal, grip), disable, reset, remove.\n\n"
     "L/R pose: foot articulation per interval (Match 2D, Pointe, Flat, Flexed).\n"
-    "Drag to add an interval with the row's current mode; right-click to change mode, strength or limits (dancer allows full pointe).\n\n"
+    "Drag to add an interval with the row's current mode; right-click to change mode, strength or limits (dancer allows full pointe).\n"
+    "L/R arm 2D, L/R leg 2D: limb placement, fit the limb to the video's 2D keypoints (ExMR); right-click for strength.\n"
+    "Smooth: calm rotation jitter, applied last; right-click for joints (a group or bones) and window frames (keep it small).\n\n"
     "Δ orig: largest joint change per frame against the original motion (Show Original in the 3D view).\n"
     "Edits save at once and share Ctrl+Z / Ctrl+Y with the locks; Apply Correction applies them to the motion.")
 

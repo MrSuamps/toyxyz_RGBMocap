@@ -18,12 +18,24 @@ STALE_CLEARED = 'The corrected result is now stale: run `correct --project {proj
 DESCRIPTION = '''Self-contacts hold a hand (effector) on another body part (target) over frame intervals; `correct` applies them.
 Tracks live in <model project>/selfcontact_<base>_*.json, shared with the GUI. Frames on the command line are inclusive
 result frames A-B (the same numbers `review` reports), several separated by commas: 345-420,500-510.
-`contacts feet` edits foot articulation (pointe, flat, flexed, match per foot interval), stored in the same files.'''
+`contacts feet` edits foot articulation (pointe, flat, flexed, match per foot interval), `contacts place` limb placement
+(fit an arm or leg to the video's 2D keypoints) and `contacts smooth` pose smoothing, all stored in the same files.'''
 FEET_DESCRIPTION = '''Foot articulation poses one foot's ankle and toes over frame intervals; `correct` applies it before the foot locks.
 Modes: pointe (foot in line with the shin, support on the toe box), flat (sole level), flexed (dorsiflexed), match
 (fit the ankle to the video's 2D foot direction; ExMR only). One enabled mode per foot and frame. Frames are inclusive A-B.'''
 FOOT_MODES = ('pointe', 'flat', 'flexed', 'match')
 FEET_STALE = 'The corrected result is now stale: run `correct --project {project}` to apply the foot articulation.'
+PLACE_DESCRIPTION = '''Limb placement ("match 2D") fits one arm or leg chain to the video's 2D keypoints over frame intervals (ExMR);
+`correct` applies it after the hand lock and before the self-contacts, which are solved on the placed limb. The hand or
+foot keeps its world rotation; depth stays near the source. One enabled row per chain and frame. Frames are inclusive A-B.'''
+SMOOTH_DESCRIPTION = '''Pose smoothing calms rotation jitter of a joint group or bone list over frame intervals; `correct` applies it last,
+after the self-contacts. Groups: arms, legs, spine, all-written (what correction writes: the legs, plus the arms when the
+hand lock moved them). --window is the Gaussian window in frames (3-61, default 5; keep it small). Leg joints stay put
+while their foot is locked. Enabled rows sharing a bone may not overlap. Frames are inclusive A-B.'''
+# Pose row sections edited like `feet`: subcommand, singular noun, plural noun, stale message tail.
+ROWS = {'articulation': ('feet', 'foot articulation entry', 'foot articulation entries', 'the foot articulation'),
+        'placement': ('place', 'limb placement row', 'limb placement rows', 'the limb placement'),
+        'smoothing': ('smooth', 'pose smoothing row', 'pose smoothing rows', 'the pose smoothing')}
 
 
 def register(commands, common):
@@ -67,7 +79,8 @@ def register(commands, common):
     p = actions.add_parser('remove', parents=parents, help='remove a track, or all self-contacts')
     which = p.add_mutually_exclusive_group(required=True)
     which.add_argument('--id', metavar='ID')
-    which.add_argument('--all', action='store_true', help='remove every self-contact track (foot articulation is kept unless the files are for other motion)')
+    which.add_argument('--all', action='store_true',
+                       help='remove every self-contact track (foot, placement and smoothing rows are kept unless the files are for other motion)')
     p.set_defaults(handler=cmd_remove)
 
     p = actions.add_parser('suggest', parents=parents, help='run review\'s missed-contact check and store suggested intervals',
@@ -116,6 +129,49 @@ def register(commands, common):
     which.add_argument('--all', action='store_true', help='remove every foot articulation entry (self-contact tracks are kept)')
     p.set_defaults(handler=cmd_feet_remove)
 
+    def row_parsers(name, key, help_text, description, example):
+        """list/add/edit/remove parsers of one pose row section; returns the add and edit parsers for the section's settings."""
+        section = actions.add_parser(name, parents=[common], help=help_text, description=description,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+        sub = section.add_subparsers(dest=name + '_command', metavar='ACTION', required=True)
+        _, singular, plural, _ = ROWS[key]
+        sub.add_parser('list', parents=parents, help=f'show {plural}').set_defaults(handler=cmd_rows_list, rows=key)
+        add = sub.add_parser('add', parents=parents, help='add a row')
+        add.add_argument('--frames', required=True, metavar='A-B[,C-D]', help='inclusive frame intervals')
+        add.add_argument('--id', metavar='ID', help=f'row id (default from the row, e.g. {example})')
+        add.add_argument('--disabled', action='store_true', help='add the row switched off')
+        add.set_defaults(handler=cmd_rows_add, rows=key)
+        edit = sub.add_parser('edit', parents=parents, help='change a row')
+        edit.add_argument('--id', required=True, metavar='ID')
+        edit.add_argument('--frames', metavar='A-B[,C-D]', help='replace the intervals')
+        edit.add_argument('--add-frames', dest='add_frames', metavar='A-B[,C-D]', help='add intervals')
+        edit.add_argument('--remove-frames', dest='remove_frames', metavar='A-B[,C-D]', help='remove these frames from the intervals')
+        switch = edit.add_mutually_exclusive_group()
+        switch.add_argument('--enable', dest='enabled', action='store_const', const=True, help='switch the row on')
+        switch.add_argument('--disable', dest='enabled', action='store_const', const=False, help='switch the row off')
+        edit.set_defaults(handler=cmd_rows_edit, rows=key)
+        remove = sub.add_parser('remove', parents=parents, help=f'remove a row, or all {plural}')
+        which = remove.add_mutually_exclusive_group(required=True)
+        which.add_argument('--id', metavar='ID')
+        which.add_argument('--all', action='store_true', help=f'remove every {singular} (everything else is kept)')
+        remove.set_defaults(handler=cmd_rows_remove, rows=key)
+        return add, edit
+
+    add, edit = row_parsers('place', 'placement', 'list and edit limb placement (fit an arm or leg to the video\'s 2D keypoints)',
+                            PLACE_DESCRIPTION, 'rl-place')
+    for p in (add, edit):
+        group = p.add_argument_group('placement settings')
+        group.add_argument('--chain', required=p is add, type=chain, metavar='CHAIN', help='LeftArm, RightArm, LeftLeg or RightLeg')
+        group.add_argument('--strength', type=float, metavar='S', help='blend from the source limb (0) to the fitted one (1); default 1')
+
+    add, edit = row_parsers('smooth', 'smoothing', 'list and edit pose smoothing (calm rotation jitter)', SMOOTH_DESCRIPTION, 'smooth-arms')
+    for p in (add, edit):
+        p.add_argument('--window', type=int, metavar='N', help='Gaussian window in frames, 3-61; default 5')
+        joints = p.add_mutually_exclusive_group()
+        joints.add_argument('--joints', type=bone_list, metavar='BONE[,BONE]', help='bones to smooth, e.g. LeftArm,LeftForeArm (not Hips)')
+        joints.add_argument('--group', choices=('arms', 'legs', 'spine', 'all-written'),
+                            help='bone group to smooth (add default all-written: what correction writes)')
+
 
 # Parsing ------------------------------------------------------------------------------------------------------------
 
@@ -135,6 +191,19 @@ def foot(value):
         return names[str(value).casefold()]
     except KeyError:
         raise argparse.ArgumentTypeError(f'unknown foot {value!r}; use {" or ".join(FEET)}') from None
+
+
+def chain(value):
+    from ..self_contact_store import CHAINS
+    names = {name.casefold(): name for name in CHAINS}
+    try:
+        return names[str(value).casefold()]
+    except KeyError:
+        raise argparse.ArgumentTypeError(f'unknown chain {value!r}; use one of {", ".join(CHAINS)}') from None
+
+
+def bone_list(value):
+    return [bone(name) for name in str(value).replace(' ', '').split(',') if name]
 
 
 def parse_frames(value, frames, option='--frames'):
@@ -252,29 +321,36 @@ class Store:
             return tracks, None
         return tracks, store.save(self.project, self.base, tracks, self.context)
 
-    def read_feet(self, writing=False):
+    def read_rows(self, key, writing=False):
+        """(entries, revision, warning) of one pose row section: articulation, placement or smoothing."""
         from .. import self_contact_store as store
         try:
-            entries, revision, warning = store.read_articulation(self.project, self.base, self.context)
+            entries, revision, warning = getattr(store, 'read_' + key)(self.project, self.base, self.context)
             _, _, timing = store.read(self.project, self.base, self.context)
         except (OSError, ValueError) as error:
-            raise CliError(f'Cannot read the foot articulation: {error}') from None
+            raise CliError(f'Cannot read {ROWS[key][3]}: {error}') from None
         if writing and timing:
-            raise CliError((warning or timing) + ' Run `contacts remove --all` to start over (removes all saved tracks and foot articulation).')
+            raise CliError((warning or timing) + ' Run `contacts remove --all` to start over (removes all saved tracks and pose rows).')
         return entries, revision, warning
 
-    def save_feet(self, entries, session):
+    def save_rows(self, key, entries, session):
         from .. import self_contact_store as store
         try:
-            entries = store.normalize_articulation(entries, self.frames)
+            entries = getattr(store, 'normalize_' + key)(entries, self.frames)
         except ValueError as error:
             raise CliError(str(error), EXIT_USAGE) from None
         if session.dry_run:
             return entries, None
         try:
-            return entries, store.save_articulation(self.project, self.base, entries, self.context)
+            return entries, getattr(store, 'save_' + key)(self.project, self.base, entries, self.context)
         except (OSError, ValueError) as error:
-            raise CliError(f'Cannot save the foot articulation: {error}') from None
+            raise CliError(f'Cannot save {ROWS[key][3]}: {error}') from None
+
+    def read_feet(self, writing=False):
+        return self.read_rows('articulation', writing)
+
+    def save_feet(self, entries, session):
+        return self.save_rows('articulation', entries, session)
 
     def applied(self):
         from ..foot_contacts import contact_revision
@@ -306,6 +382,41 @@ def describe_foot(entry):
     return [f'{entry["id"]}: {entry["foot"]} {entry["mode"]}{state}',
             f'    frames {inclusive(entry["ranges"])}   suggested {inclusive(entry["automatic"])}',
             f'    strength {entry["strength"]:g}, profile {entry["profile"]}, source {entry["source"]}']
+
+
+def describe_row(key, entry):
+    if key == 'articulation':
+        return describe_foot(entry)
+    state = '' if entry['enabled'] else '  (disabled)'
+    settings = f'strength {entry["strength"]:g}' if key == 'placement' else f'window {entry["window_frames"]} frames'
+    return [f'{entry["id"]}: {row_what(key, entry)}{state}', f'    frames {inclusive(entry["ranges"])}   suggested {inclusive(entry["automatic"])}',
+            f'    {settings}, source {entry["source"]}']
+
+
+def row_what(key, entry):
+    if key == 'placement':
+        return entry['chain']
+    return entry['joints'] if isinstance(entry['joints'], str) else ','.join(entry['joints'])
+
+
+def row_note(key, row):
+    """One interval of the last correction report of a placement or smoothing row."""
+    note = f'{row["start"]}-{row["end"] - 1}'
+    if row.get('skipped'):
+        return note + f' skipped: {row["skipped"]}'
+    if key == 'placement':
+        before, after = (((row.get(k) or {}).get('limb') or {}).get('median') for k in ('error_before_torso', 'error_after_torso'))
+        if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+            note += f' 2D error {before:.2f} -> {after:.2f} torso (median)'
+        if row.get('foot_lock_conflict_frames'):
+            note += f', foot lock held {row["foot_lock_conflict_frames"]} frame(s)'
+        return note
+    change = row.get('rotation_change_max_deg')
+    if isinstance(change, dict) and change:
+        note += f' max change {max(change.values()):.1f} deg'
+    if row.get('leg_frames_held_by_foot_locks'):
+        note += f', {row["leg_frames_held_by_foot_locks"]} leg frame(s) held by foot locks'
+    return note
 
 
 def finish(store, session, action, tracks, revision, **extra):
@@ -350,11 +461,39 @@ def cmd_list(args, session):
                                if k != 'id' and isinstance(v, (int, float, str, bool)))
             session.say('    last residuals: ' + values)
     entries, articulated = list_feet(store, session)
+    placement, placed = list_rows(store, session, 'placement')
+    smoothing, smoothed = list_rows(store, session, 'smoothing')
     applied = store.applied()
     if revision is not None or not applied:
         session.say('Applied to the corrected result.' if applied else STALE.format(project=store.project))
     return 0, store.summary('list', tracks, revision=revision, applied=applied, warning=warning, residuals=residuals,
-                            articulation=[track_json(e) for e in entries], articulation_report=articulated)
+                            articulation=[track_json(e) for e in entries], articulation_report=articulated,
+                            placement=[track_json(e) for e in placement], placement_report=placed,
+                            smoothing=[track_json(e) for e in smoothing], smoothing_report=smoothed)
+
+
+def list_rows(store, session, key):
+    """Print one placement or smoothing section with its last correction notes; returns (entries, report block or None)."""
+    entries, _, warning = store.read_rows(key)
+    block = store.report.get(key)
+    by_id = {}
+    if isinstance(block, dict):
+        for row in block.get('entries') or []:
+            if isinstance(row, dict) and 'id' in row and isinstance(row.get('start'), int) and isinstance(row.get('end'), int):
+                by_id.setdefault(row['id'], []).append(row)
+    if warning:
+        session.say('warning: ' + warning)
+    if not entries:
+        return entries, block
+    _, singular, plural, _ = ROWS[key]
+    session.say(f'{len(entries)} {singular if len(entries) == 1 else plural} on corrected_{store.base} (frames inclusive):')
+    for entry in entries:
+        for line in describe_row(key, entry):
+            session.say(line)
+        notes = [row_note(key, row) for row in by_id.get(entry['id'], [])]
+        if notes:
+            session.say('    last correction: ' + '; '.join(notes))
+    return entries, block
 
 
 def list_feet(store, session):
@@ -445,9 +584,10 @@ def cmd_remove(args, session):
         # Saved data for another time base can be neither applied nor edited, so starting over removes every section.
         removed = (self_contact_store.remove_all if timing else self_contact_store.clear)(store.project, store.base)
         session.say('Removed all self-contacts.' if removed else 'There were no self-contacts.')
-        kept = [] if timing else store.read_feet()[0]
-        if kept:
-            session.say(f'Kept {len(kept)} foot articulation entr{"y" if len(kept) == 1 else "ies"}; `contacts feet remove --all` removes them.')
+        for key, (command, singular, plural, _) in ROWS.items():
+            kept = [] if timing else store.read_rows(key)[0]
+            if kept:
+                session.say(f'Kept {len(kept)} {singular if len(kept) == 1 else plural}; `contacts {command} remove --all` removes them.')
         stale = not store.applied()
         if stale:
             session.say(STALE_CLEARED.format(project=store.project))
@@ -620,3 +760,100 @@ def cmd_feet_remove(args, session):
     entries, revision = store.save_feet(kept, session)
     session.say(f'{"Would remove" if session.dry_run else "Removed"} ' + ('all foot articulation.' if args.all else f'foot articulation {args.id}.'))
     return finish_feet(store, session, 'remove', entries, revision, removed='all' if args.all else args.id)
+
+
+# Limb placement and pose smoothing ----------------------------------------------------------------------------------
+
+def find_row(key, entries, ident):
+    for entry in entries:
+        if entry['id'] == ident:
+            return entry
+    raise CliError(f'No {ROWS[key][1]} {ident!r}. Rows: {", ".join(e["id"] for e in entries) or "none"}')
+
+
+def row_settings(args, entry):
+    """Copy the given section settings into an entry: chain/strength (placement), joints/window (smoothing)."""
+    for key in ('chain', 'strength'):
+        if getattr(args, key, None) is not None:
+            entry[key] = getattr(args, key)
+    joints = getattr(args, 'joints', None) or getattr(args, 'group', None)
+    if joints is not None:
+        entry['joints'] = joints
+    if getattr(args, 'window', None) is not None:
+        entry['window_frames'] = args.window
+
+
+def finish_rows(store, session, key, action, entries, revision, **extra):
+    command, singular, plural, what = ROWS[key]
+    stale = not session.dry_run and not store.applied()
+    if session.dry_run:
+        session.say(f'Would save {len(entries)} {singular if len(entries) == 1 else plural} (dry run, nothing written):')
+    for entry in entries:
+        for line in describe_row(key, entry):
+            session.info(line)
+    if store.model == 'flowhmr' and entries:
+        session.say(f'note: FlowHMR correction does not apply {what} yet; the rows are kept for SMPL-X results.')
+    if stale:
+        session.say(STALE_CLEARED.format(project=store.project) if action == 'remove' else
+                    f'The corrected result is now stale: run `correct --project {store.project}` to apply {what}.')
+    return 0, store.summary(f'{command} {action}', store.read()[0], **{key: [track_json(e) for e in entries]}, revision=revision,
+                            stale=stale, dry_run=session.dry_run, **extra)
+
+
+def cmd_rows_list(args, session):
+    store = Store(args)
+    entries, block = list_rows(store, session, args.rows)
+    command, _, plural, what = ROWS[args.rows]
+    if not entries:
+        session.say(f'No {plural} on corrected_{store.base}.')
+    applied = store.applied()
+    if entries and not applied:
+        session.say(f'The corrected result is stale: run `correct --project {store.project}` to apply {what}.')
+    return 0, store.summary(f'{command} list', store.read()[0], **{args.rows: [track_json(e) for e in entries]}, applied=applied,
+                            **{args.rows + '_report': block})
+
+
+def cmd_rows_add(args, session):
+    store, key = Store(args), args.rows
+    entries, _, _ = store.read_rows(key, True)
+    entry = dict(ranges=parse_frames(args.frames, store.frames), enabled=not args.disabled, source='user')
+    if args.id:
+        entry['id'] = args.id
+    row_settings(args, entry)
+    before = {e['id'] for e in entries}
+    entries, revision = store.save_rows(key, entries + [entry], session)
+    added = next(e for e in entries if e['id'] not in before)
+    session.say(f'{"Would add" if session.dry_run else "Added"} {ROWS[key][1]} {added["id"]}: {row_what(key, added)}, frames {inclusive(added["ranges"])}')
+    return finish_rows(store, session, key, 'add', entries, revision, id=added['id'])
+
+
+def cmd_rows_edit(args, session):
+    store, key = Store(args), args.rows
+    entries, _, _ = store.read_rows(key, True)
+    entry = find_row(key, entries, args.id)
+    if args.frames is not None:
+        entry['ranges'] = parse_frames(args.frames, store.frames)
+    if args.add_frames is not None:
+        entry['ranges'] = merge(entry['ranges'] + parse_frames(args.add_frames, store.frames, '--add-frames'))
+    if args.remove_frames is not None:
+        entry['ranges'] = subtract(entry['ranges'], parse_frames(args.remove_frames, store.frames, '--remove-frames'))
+    if args.enabled is not None:
+        entry['enabled'] = args.enabled
+    row_settings(args, entry)
+    entries, revision = store.save_rows(key, entries, session)
+    session.say(f'{"Would update" if session.dry_run else "Updated"} {ROWS[key][1]} {args.id}.')
+    return finish_rows(store, session, key, 'edit', entries, revision, id=args.id)
+
+
+def cmd_rows_remove(args, session):
+    store, key = Store(args), args.rows
+    _, singular, plural, _ = ROWS[key]
+    entries, _, _ = store.read_rows(key, True)
+    if args.all and not entries:
+        session.say(f'There were no {plural}.')
+        return finish_rows(store, session, key, 'remove', [], None, removed='all')
+    if not args.all:
+        find_row(key, entries, args.id)
+    entries, revision = store.save_rows(key, [] if args.all else [e for e in entries if e['id'] != args.id], session)
+    session.say(f'{"Would remove" if session.dry_run else "Removed"} ' + (f'all {plural}.' if args.all else f'{singular} {args.id}.'))
+    return finish_rows(store, session, key, 'remove', entries, revision, removed='all' if args.all else args.id)

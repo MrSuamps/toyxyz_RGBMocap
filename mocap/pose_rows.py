@@ -1,4 +1,4 @@
-"""Pose rows: per-interval pose modes (foot articulation; later limb placement, smoothing) below the self-contact rows.
+"""Pose rows: per-interval pose modes (foot articulation, limb placement, smoothing) below the self-contact rows.
 
 A section is one entry list in the self-contact store payload. Entries group the intervals that share a mode and settings;
 one timeline row shows one value of the section's row field (e.g. one foot), and every interval in it carries the settings
@@ -19,7 +19,7 @@ class Mode:
 
 @dataclass(frozen=True)
 class Param:
-    """One per-interval setting. kind: float, int, choice, or list (comma-separated names, e.g. bones)."""
+    """One per-interval setting. kind: float, int, choice, or list (comma-separated names, e.g. bones, or one of presets)."""
     name: str
     label: str
     kind: str = 'float'
@@ -30,13 +30,14 @@ class Param:
     decimals: int = 2
     percent: bool = False
     presets: tuple = ()
+    suffix: str = ''
 
     def text(self, value):
         if self.kind == 'list':
-            return ','.join(value)
+            return value if isinstance(value, str) else ','.join(value)
         if self.percent:
             return f'{float(value) * 100:.0f}%'
-        return str(value)
+        return f'{value}{self.suffix}'
 
 
 @dataclass(frozen=True)
@@ -74,6 +75,18 @@ SECTIONS = (
              Param('profile', 'Limits', 'choice', ('default', 'dancer'))),
             dict(mode='match', strength=1., profile='default', enabled=True),
             'read_articulation', 'save_articulation', 'normalize_articulation'),
+    Section('placement', 'limb placement', 'chain',
+            (('LeftArm', 'L arm 2D'), ('RightArm', 'R arm 2D'), ('LeftLeg', 'L leg 2D'), ('RightLeg', 'R leg 2D')),
+            (Mode('place', 'Match 2D', '#e0a070', 'Fit the arm or leg to the video\'s 2D keypoints (ExMR); depth stays near the source, '
+                                                   'the hand or foot keeps its world rotation'),),
+            (Param('strength', 'Strength', percent=True, presets=(1., .75, .5, .25)),),
+            dict(strength=1., enabled=True), 'read_placement', 'save_placement', 'normalize_placement', mode_field=None),
+    Section('smoothing', 'pose smoothing', None, ((None, 'Smooth'),),
+            (Mode('smooth', 'Smooth', '#8fc7c0', 'Calm rotation jitter of the chosen joints; applied last, after the self-contacts'),),
+            (Param('joints', 'Joints', 'list', presets=('all-written', 'arms', 'legs', 'spine')),
+             Param('window_frames', 'Window', 'int', low=3, high=61, presets=(3, 5, 9, 15), suffix='f')),
+            dict(joints='all-written', window_frames=5, enabled=True), 'read_smoothing', 'save_smoothing', 'normalize_smoothing',
+            mode_field=None),
 )
 
 
@@ -175,7 +188,7 @@ class PoseRows:
             pieces = sorted((s, e) for entry in self._row_entries(entries, r) for s, e in entry['ranges'])
             for (s0, e0), (s1, e1) in zip(pieces, pieces[1:]):
                 if s1 < e0:
-                    raise ValueError(f'{self.row_label(r)} already has a pose on frames {s1 + 1}-{min(e0, e1)}')
+                    raise ValueError(f'{self.row_label(r)} already has an interval on frames {s1 + 1}-{min(e0, e1)}')
         self._undo.append(copy.deepcopy(self.entries))
         del self._undo[:-self.LIMIT]
         self._redo.clear()
@@ -343,8 +356,16 @@ class SettingsDialog:
                     widget.addItem(str(choice), choice)
                 widget.setCurrentIndex(max(0, widget.findData(value)))
                 readers[param.name] = widget.currentData
+            elif param.kind == 'list' and param.presets:
+                # A preset name (e.g. a bone group) or comma-separated names typed in.
+                widget = QComboBox()
+                widget.setEditable(True)
+                widget.addItems(list(param.presets))
+                widget.setCurrentText(param.text(value or ()))
+                readers[param.name] = lambda w=widget, p=param: (w.currentText().strip() if w.currentText().strip() in p.presets
+                                                                 else [v.strip() for v in w.currentText().split(',') if v.strip()])
             elif param.kind == 'list':
-                widget = QLineEdit(','.join(value or ()))
+                widget = QLineEdit(param.text(value or ()))
                 readers[param.name] = lambda w=widget: [v.strip() for v in w.text().split(',') if v.strip()]
             elif param.kind == 'int':
                 widget = QSpinBox()
@@ -589,5 +610,6 @@ class PoseRowEditor:
                 p.drawText(text_rect, Qt.AlignVCenter, message)
             elif not intervals:
                 p.setPen(QColor('#777777'))
-                hint = f'Drag to add {model.describe(model.draw_settings(r))}; right-click for modes and settings'
+                hint = f'Drag to add {model.describe(model.draw_settings(r))}; right-click for ' + ('modes and settings' if model.section.mode_field
+                                                                                                  else 'settings')
                 p.drawText(text_rect, Qt.AlignVCenter, hint)

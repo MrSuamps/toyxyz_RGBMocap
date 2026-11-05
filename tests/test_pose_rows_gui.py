@@ -200,12 +200,16 @@ class PoseTimelineTest(unittest.TestCase):
         self.assertEqual(self.left, FIRST_ROW + 2)
         self.assertEqual(self.slider.pose_row(self.left)[1], 0)
         self.assertEqual(self.slider.pose_row(self.left + 1)[1], 1)
-        self.assertIsNone(self.slider.pose_row(self.left + 2))
+        labels = [model.row_label(r) for model, r in self.slider.pose_row_models()]
+        self.assertEqual(labels, ['L pose', 'R pose', 'L arm 2D', 'R arm 2D', 'L leg 2D', 'R leg 2D', 'Smooth'])
+        self.assertEqual(self.slider.pose_row(self.left + 5)[0].section.key, 'placement')
+        self.assertEqual(self.slider.pose_row(self.left + 6), (self.slider.pose_models[2], 0))
+        self.assertIsNone(self.slider.pose_row(self.left + 7))
         self.assertEqual(self.slider._track(self.left), [(0, 100), (300, 421)])
         self.assertEqual(self.slider._track(FIRST_ROW + 1), [])  # '+ Pair' row
         self.slider.set_compare_delta([0.] * FRAMES)
-        self.assertEqual(self.slider.delta_row(), self.left + 2)
-        self.assertGreaterEqual(self.slider.minimumHeight(), 28 + (2 + self.left + 3) * self.slider.TRACK_HEIGHT)
+        self.assertEqual(self.slider.delta_row(), self.left + 7)
+        self.assertGreaterEqual(self.slider.minimumHeight(), 28 + (2 + self.left + 8) * self.slider.TRACK_HEIGHT)
         self.slider.set_self_contacts(None)
         self.assertEqual(self.slider.pose_models[0].entries, [])
         self.assertIsNone(self.slider._contact_row(self.mouse(QMouseEvent.MouseMove, FIRST_ROW + 1, 50)))
@@ -293,6 +297,139 @@ class PoseTimelineTest(unittest.TestCase):
         image.save(str(folder / 'timeline_pose_rows.png'))
 
 
+PLACEMENT, SMOOTHING = (next(s for s in SECTIONS if s.key == key) for key in ('placement', 'smoothing'))
+
+
+class PlacementSmoothingModelTest(unittest.TestCase):
+    def test_placement_rows_per_chain_with_strength(self):
+        from mocap.self_contact_store import normalize_placement
+        rows = PoseRows(PLACEMENT)
+        rows.load(normalize_placement([dict(chain='RightLeg', ranges=[[380, 421]])], FRAMES), FRAMES, ('project', 'initial'))
+        self.assertEqual([rows.row_label(r) for r in range(rows.row_count())], ['L arm 2D', 'R arm 2D', 'L leg 2D', 'R leg 2D'])
+        self.assertEqual(rows.ranges(3), [(380, 421)])
+        rows.set_draw_settings(0, strength=.5)
+        rows.set_interval(0, 0, None, (10, 30))
+        self.assertEqual([(e['id'], e['chain'], e['strength']) for e in rows.entries], [('rl-place', 'RightLeg', 1.), ('la-place', 'LeftArm', .5)])
+        self.assertEqual(rows.describe(rows.interval_settings(0, 0)), 'Match 2D 50%')
+        self.assertNotIn('mode', rows.entries[1])
+        self.assertEqual(normalize_placement(rows.payload(), FRAMES), rows.entries)
+
+    def test_smoothing_one_row_groups_and_bone_lists(self):
+        from mocap.self_contact_store import normalize_smoothing
+        rows = PoseRows(SMOOTHING)
+        rows.load([], FRAMES, ('project', 'initial'))
+        self.assertEqual((rows.row_count(), rows.row_label(0), rows.describe(rows.draw_settings(0))), (1, 'Smooth', 'Smooth'))
+        rows.set_interval(0, 0, None, (10, 30))
+        rows.set_draw_settings(0, joints='arms', window_frames=9)
+        rows.set_interval(0, 1, None, (40, 50))
+        rows.set_settings(0, 0, joints=['LeftArm', 'LeftForeArm'])
+        self.assertEqual([(e['id'], e['joints'], e['window_frames']) for e in rows.entries],
+                         [('smooth-arms', 'arms', 9), ('smooth-la', ['LeftArm', 'LeftForeArm'], 5)])
+        self.assertEqual(rows.describe(rows.interval_settings(0, 1)), 'Smooth arms 9f')
+        self.assertEqual(rows.describe(rows.interval_settings(0, 0)), 'Smooth LeftArm,LeftForeArm')
+        self.assertEqual(normalize_smoothing(rows.payload(), FRAMES), rows.entries)
+        with self.assertRaises(ValueError):
+            rows.set_settings(0, 0, joints=['Hips'])
+
+    def test_store_round_trip_keeps_other_sections(self):
+        from mocap import self_contact_store as store
+        from mocap.pose_rows import write_section
+        with tempfile.TemporaryDirectory() as folder:
+            store.save(folder, 'initial', [dict(effector='RightHand', target='RightFoot', ranges=[[345, 421]])], CONTEXT,
+                       articulation=[entry()])
+            write_section(folder, 'initial', 'placement', [dict(chain='LeftLeg', ranges=[[5, 9]])], CONTEXT)
+            write_section(folder, 'initial', 'smoothing', [dict(joints='spine', window_frames=7, ranges=[[100, 120]])], CONTEXT)
+            sections = read_sections(folder, 'initial', CONTEXT)
+            self.assertEqual(sorted(sections), ['articulation', 'placement', 'smoothing'])
+            self.assertEqual(sections['placement']['entries'][0]['ranges'], [(5, 9)])
+            self.assertEqual(sections['smoothing']['entries'][0]['window_frames'], 7)
+            self.assertEqual(len(sections['articulation']['entries']), 1)
+            self.assertEqual(len(store.read(folder, 'initial', CONTEXT)[0]), 1)
+
+    def test_settings_dialog_reads_group_or_typed_bones(self):
+        from PySide6.QtWidgets import QSpinBox
+        from mocap.pose_rows import SettingsDialog
+        typed = {}
+
+        def answer(dialog):
+            boxes = dialog.findChildren(QComboBox)
+            typed['items'] = [boxes[0].itemText(i) for i in range(boxes[0].count())]
+            boxes[0].setCurrentText(typed['text'])
+            dialog.findChildren(QSpinBox)[0].setValue(11)
+            return QDialog.Accepted
+        with mock.patch.object(QDialog, 'exec', answer):
+            typed['text'] = 'legs'
+            values = SettingsDialog.ask(None, SMOOTHING, dict(joints='arms', window_frames=5, enabled=True), 'Smooth')
+            self.assertEqual(values, dict(joints='legs', window_frames=11, enabled=True))
+            typed['text'] = 'LeftArm, LeftForeArm'
+            values = SettingsDialog.ask(None, SMOOTHING, dict(joints='arms', window_frames=5, enabled=True), 'Smooth')
+            self.assertEqual(values['joints'], ['LeftArm', 'LeftForeArm'])
+        self.assertEqual(typed['items'], ['all-written', 'arms', 'legs', 'spine'])
+
+
+class PlacementSmoothingTimelineTest(unittest.TestCase):
+    point, mouse, drag, menu = PoseTimelineTest.point, PoseTimelineTest.mouse, PoseTimelineTest.drag, PoseTimelineTest.menu
+
+    def setUp(self):
+        from mocap.self_contact_store import normalize_articulation, normalize_placement, normalize_smoothing
+        from mocap.timeline_editor import TimelineSlider
+        self.slider = TimelineSlider(Qt.Horizontal)
+        self.slider.resize(1100, 600)
+        self.slider.setRange(0, FRAMES - 1)
+        self.pose_saved = []
+        self.slider.pose_listener = lambda key, payload: self.pose_saved.append((key, payload))
+        self.slider.set_contacts([[(10, 40)], [(60, 90)], [], []], editable=True, identity=('p', 'initial'), token=1)
+        self.slider.contact_edit_enabled = True
+        self.slider.set_self_contacts([dict(effector='RightHand', target='RightFoot', ranges=[[345, 380]], grip='auto')], FRAMES,
+                                      ('p', 'initial'), editable=True)
+        sections = dict(articulation=[entry(ranges=[(0, 100), (300, 421)], profile='dancer'), entry(foot='RightFoot', mode='flat', ranges=[(120, 200)])],
+                        placement=[dict(chain='RightLeg', ranges=[[380, 421]]), dict(chain='LeftArm', strength=.6, ranges=[[150, 230]]),
+                                   dict(chain='RightArm', ranges=[], automatic=[[60, 110]])],
+                        smoothing=[dict(joints='arms', window_frames=7, ranges=[[200, 260]]), dict(joints='all-written', ranges=[[20, 60]])])
+        normalize = dict(articulation=normalize_articulation, placement=normalize_placement, smoothing=normalize_smoothing)
+        self.slider.set_pose_sections({k: dict(entries=normalize[k](v, FRAMES), warning='') for k, v in sections.items()}, FRAMES,
+                                      ('p', 'initial'))
+        self.first = self.slider.pose_first_row()
+
+    def tearDown(self):
+        self.slider.deleteLater()
+
+    def test_drag_on_smoothing_and_placement_rows_saves_their_sections(self):
+        smooth, left_leg = self.first + 6, self.first + 4
+        self.drag(smooth, 300, 320)
+        key, payload = self.pose_saved[-1]
+        self.assertEqual(key, 'smoothing')
+        self.assertEqual([e['ranges'] for e in payload if e['joints'] == 'all-written'], [[[20, 60], [300, 321]]])
+        self.drag(left_leg, 50, 70)
+        key, payload = self.pose_saved[-1]
+        self.assertEqual(key, 'placement')
+        self.assertIn(('LeftLeg', [[50, 71]]), [(e['chain'], e['ranges']) for e in payload])
+        self.slider.undo_contact()
+        self.assertEqual(self.slider._track(left_leg), [])
+
+    def test_menus_offer_settings_without_modes(self):
+        items = self.menu(self.first + 6, 220)
+        self.assertNotIn('Mode', items)
+        self.assertIn('Joints', items)
+        self.assertIn('Window', items)
+        self.menu(self.first + 6, 220, 'Joints', 'legs')
+        self.assertEqual(self.slider.pose_models[2].interval_settings(0, 1)['joints'], 'legs')
+        self.menu(self.first + 6, 220, 'Window', '15f')
+        self.assertEqual(self.pose_saved[-1][1][-1]['window_frames'], 15)
+        self.assertIn('Strength', self.menu(self.first + 2, 180))
+        self.menu(self.first + 3, 80, 'Accept This Suggestion')
+        self.assertEqual(self.slider._track(self.first + 3), [(60, 110)])
+
+    def test_screenshot(self):
+        self.slider.resize(1100, self.slider.minimumHeight())
+        self.slider.setValue(360)
+        image = self.slider.grab()
+        self.assertFalse(image.isNull())
+        folder = SHOTS or Path(tempfile.gettempdir())
+        folder.mkdir(parents=True, exist_ok=True)
+        image.save(str(folder / 'timeline_placement_smoothing_rows.png'))
+
+
 class PolishTest(unittest.TestCase):
     def test_labels_stack_without_overlap(self):
         from mocap.compare_overlay import layout_labels
@@ -319,7 +456,7 @@ class PolishTest(unittest.TestCase):
 
     def test_help_mentions_pose_and_self_contact_rows(self):
         from mocap.selfcontact_ui import TIMELINE_HELP
-        for text in ('Self-contact rows', 'L/R pose', 'Pointe', 'grip', 'Apply Correction'):
+        for text in ('Self-contact rows', 'L/R pose', 'Pointe', 'grip', 'Apply Correction', 'leg 2D', 'Smooth:'):
             self.assertIn(text, TIMELINE_HELP)
 
     def test_pair_dialog_offers_grip_off_and_auto(self):

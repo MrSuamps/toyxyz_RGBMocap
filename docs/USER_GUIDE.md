@@ -600,7 +600,8 @@ an estimate and can leave residual sliding or penetration.
 
 Self-contacts hold a hand on another body part (a hand holding a foot, hands
 together, a hand on the hip) over frame intervals. Foot pose rows set the foot's
-shape per interval. Both are edited on the timeline below the lock tracks, saved
+shape per interval, limb placement rows fit an arm or leg to the video and the
+smoothing row calms jitter. All are edited on the timeline below the lock tracks, saved
 in the project at once and applied by **Apply Correction** together with the
 locks. They appear once the result has been corrected (otherwise the timeline shows
 **Apply Correction to edit self-contacts**). The same data is edited from the
@@ -614,6 +615,8 @@ command line with `rgbmocap-cli contacts` (see [CLI.md](CLI.md)).
 | **Pair settings** | **Palm distance**: automatic or metres from palm to target. **Reciprocal**: Off (only the arm moves), Auto (also move the target limb when the arm cannot reach) or Always. **Grip**: Off (palm and fingers keep the captured pose; default) or Auto (turn the palm onto the target and curl the fingers). **Apply this pair**: off keeps the row but does not apply it. |
 | **Suggest Contacts** | Finds frames where a hand probably touches the body (the review missed-contact check; ExMR only, no AI models run) and shows them as hatched intervals marked Suggested. Double-click or right-click to accept. Each run replaces the previous suggestions. |
 | **L pose / R pose** | Foot articulation per interval: **Match 2D** (fit ankle and toes to the video's heel-toe direction), **Pointe** (foot in line with the shin, support on the toe tip), **Flat**, **Flexed**. Right-click to change mode, strength or limits (**dancer** allows full pointe). |
+| **L/R arm 2D, L/R leg 2D** | Limb placement per interval (**Match 2D**): fits the arm or leg to the video's 2D keypoints (ExMR), before the self-contacts. Depth stays near the original and the hand or foot keeps its rotation. Right-click to change the strength. |
+| **Smooth** | Pose smoothing per interval, applied last: calms rotation jitter of a joint group (**all-written**, **arms**, **legs**, **spine**) or bones typed in **Interval Settings...** (e.g. `LeftArm,LeftForeArm`). **Window** is in frames; keep it small. |
 | **Δ orig** | Largest joint change per frame against the original layer: green small, amber medium, red large, with the maximum at the right. |
 | **Show Original** / opacity | Draws the original layer as a translucent blue-tinted body and skeleton with the corrected body: the pose before self-contacts, or the uncorrected motion when there are none. The opacity box sets its strength. Display only. |
 | Contact lines and labels | During an active interval a line joins hand and target with discs in the row's colour. The label gives the residual after correction (green up to 2 cm, amber up to 4 cm, red above) or **pending: Apply Correction**, plus the joint gap. |
@@ -622,8 +625,7 @@ command line with `rgbmocap-cli contacts` (see [CLI.md](CLI.md)).
 Edits mark the corrected result as pending until **Apply Correction**. The original
 reconstruction is never modified. To get the motion without self-contacts back,
 disable the pairs (or remove the rows) and apply correction again; nothing else is
-lost. Limb placement and pose smoothing rows are stored in the same files but have
-no timeline rows yet; they are written by tools.
+lost.
 
 Data files in the model project, per result base (for example `initial`):
 
