@@ -175,6 +175,18 @@ class FingerTest(unittest.TestCase):
         np.testing.assert_allclose(full, sc.grip_shape(rest, 1), atol=1e-5)
         self.assertTrue(report['fingers'][0]['applied'])
 
+    def test_flat_shape_on_broad_targets(self):
+        rest = hand_rest(55)
+        flat = sc.grip_shape(rest, 1, True)
+        self.assertLess(Rotation.from_matrix(flat).magnitude().max(), np.deg2rad(5.1))
+        self.assertGreater(Rotation.from_matrix(sc.grip_shape(rest, 1)).magnitude().max(), np.deg2rad(30))
+        self.assertTrue({'Hips', 'Spine2', 'Head'} <= set(sc.FLAT_PARTS) and 'Leg' not in sc.FLAT_PARTS)
+        mean = np.random.default_rng(2).normal(0, .3, (55, 3))
+        params = {'right_hand_pose': torch.zeros(N, 45)}; output = dict(params); report = {'fingers': [dict(self.SPEC, shape='flat')]}
+        sc.publish_fingers_smplx(output, params, report, rest, mean)
+        full = Rotation.from_rotvec((output['right_hand_pose'].numpy()[40].reshape(15, 3) + mean[40:55]).astype(float)).as_matrix()
+        np.testing.assert_allclose(full, flat, atol=1e-5)
+
     def test_smplx_pca_hands_are_skipped(self):
         params = {'right_hand_pose': torch.zeros(N, 12)}; output = dict(params); report = {'fingers': [dict(self.SPEC)]}
         self.assertEqual(sc.publish_fingers_smplx(output, params, report, hand_rest(55), np.zeros((55, 3))), {})

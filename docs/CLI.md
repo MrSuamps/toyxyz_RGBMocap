@@ -404,7 +404,8 @@ edits and shared with the app. The project needs a corrected result first (`corr
 - Per-track settings: `--distance` (palm-to-target metres, default auto), `--offset` (contact point in the target joint's
   frame, metres, default auto; negative values may follow a space, `--offset -0.05,0,-0.14`), `--reciprocal` (move the
   target limb too: `off`, `auto` when the arm cannot reach, `always`; default auto), `--grip` (`auto` turns the palm toward
-  the target and wraps the fingers; default off), `--ease` (frames the hand blends in before and out after each interval,
+  the target and wraps the fingers around a limb, or lays them flat on the torso, neck or head as far as they stay out of
+  the skin; default off), `--ease` (frames the hand blends in before and out after each interval,
   0-120; default auto: 6 frames, more for a long travel, 1 frame per 3 cm).
 - One hand holds one target at a time: two enabled tracks of the same hand may not overlap in frames. Eases stay inside the
   gap to the same hand's neighbouring interval, so consecutive holds blend from one goal to the next within that gap.
@@ -412,8 +413,8 @@ edits and shared with the app. The project needs a corrected result first (`corr
   touches with its skin nearest the target (palm, back of the hand, knuckles or fingertips), at the target skin point
   nearest that; when confident video hand keypoints see the captured hand pointing more than 30 deg away, the palm is laid
   on the skin instead (as grip auto); on an arm or leg target that point is chosen where a hand wrapped across the limb
-  points like the video hand, on the side the camera sees. A hold whose hand skin already lies within 1.5 cm of the target skin (and less than
-  1 cm inside) on every frame is left as captured (`skipped` in `list`). On every path the wrist is kept inside its range
+  points like the video hand, on the side the camera sees. A hold whose hand skin already lies within 1.5 cm of the target skin (and at most
+  0.5 cm inside, review's `contact_gap` limits) on every frame is left as captured (`skipped` in `list`). On every path the wrist is kept inside its range
   and the elbow twist within 80 deg (the forearm takes part of the roll, the rest turns the hand as little as needed) and
   the elbow flexes at most 150 deg about its hinge: a goal nearer the shoulder leaves the hand short instead of folding the
   forearm through the upper arm. A hand that sinks into the target is pushed out along the measured penetration until the
@@ -482,8 +483,9 @@ rgbmocap-cli.cmd contacts smooth remove --project P --id ID | --all
 
 A limb placement row ("match 2D") fits one arm or leg chain to the video's 2D keypoints over frame intervals; `correct`
 applies it after the hand lock and before the self-contacts, so contacts are solved on the placed limb. The upper joint
-rotates freely and the elbow or knee bends about its hinge; the hand or foot keeps its world rotation and depth stays near
-the source, since one view cannot measure it. `--strength` blends from the source limb (0) to the fitted one (1, default).
+rotates freely and the elbow or knee bends about its hinge; the hand or foot keeps its world rotation (a `pointe` or `flexed`
+foot articulation instead turns with the placed shin, as it does with a reciprocally moved leg) and depth stays near the
+source, since one view cannot measure it. `--strength` blends from the source limb (0) to the fitted one (1, default).
 One enabled row per chain and frame; ids default to e.g. `rl-place`. Placement needs ExMR 2D keypoints.
 
 A pose smoothing row calms rotation jitter of a bone group (`--group`, default `all-written`: the legs, plus the arms when

@@ -726,10 +726,12 @@ def run(project,emit,result):
                 from .pose_smoothing import from_store as smooth
                 # Limbs are placed before self-contacts (contacts are solved on the placed limb) and smoothed last, so
                 # smoothing also reaches jitter the contact ease adds.
-                placed=place(project,base,context,geometry.rest[:22],out_roots,out_quats,fps,report['segments'],transform,emit)
+                # Shin-relative feet (pointe) turn with a placed or reciprocally moved shin.
+                follow=None if feet is None else feet.follow
+                placed=place(project,base,context,geometry.rest[:22],out_roots,out_quats,fps,report['segments'],transform,emit,follow)
                 from .self_contact import from_store as self_contact,publish_smplx,publish_fingers_smplx
                 self_report,self_before=self_contact(project,base,context,geometry.rest[:22],out_roots,out_quats,geometry.palm_offsets,fps,
-                    report['segments'],emit,body,transform)
+                    report['segments'],emit,body,transform,follow)
                 smoothed=smooth(project,base,context,out_quats,fps,report['segments'],bool(report['hand_lock']['contacts']),emit)
                 for name,extra in (('placement',placed),('self_contact',self_report),('smoothing',smoothed)):
                     if extra is not None:

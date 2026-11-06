@@ -294,6 +294,15 @@ class FingerCurlTest(unittest.TestCase):
         curl, curled = sc.finger_weights(skin, root.astype(float), q.astype(float), rows, 1, ['right_thigh'], np.ones(N))
         self.assertEqual(curl.shape, (N,)); self.assertTrue(((curl >= 0) & (curl <= 1)).all())
 
+    def test_flat_fingers_open_until_they_would_sink_in(self):
+        skin = synthetic_skin()
+        skin.groups['right_fingers'] = skin.groups['right_hand'][:8]
+        root, q = clip(); rows = np.arange(N)
+        far, _ = sc.finger_weights(skin, root.astype(float), q.astype(float), rows, 1, ['torso'], np.ones(N), True)
+        self.assertTrue(((far >= 0) & (far <= 1)).all())
+        # Fingers nowhere near the target open fully (the grip shape would only curl where they touch).
+        self.assertGreater(far.min(), .99)
+
 
 if __name__ == '__main__':
     unittest.main()

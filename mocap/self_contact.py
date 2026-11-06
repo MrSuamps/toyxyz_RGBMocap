@@ -43,6 +43,10 @@ THUMB = np.array([0., 0., 1.])
 # around a ~4 cm limb; the thumb row is CMC opposition, MCP and IP. Fingers curl toward it only until they touch the skin.
 FINGER_CURL_DEG = ((45., 60., 35.), (50., 65., 35.), (60., 65., 35.), (55., 65., 35.), (35., 25., 30.))
 CURL_STEPS = np.linspace(0., 1., 6)
+# Grip auto on a broad target (torso, neck, head) lays the fingers flat on the skin instead (FLAT_CURL_DEG, nearly straight),
+# as far as they go without sinking in: a hand on the hip or chest is open, not a fist.
+FLAT_PARTS = ('Hips', 'Spine', 'Spine1', 'Spine2', 'Neck', 'Head')
+FLAT_CURL_DEG = ((5., 5., 5.),) * 4 + ((0., 0., 0.),)
 FINGER_TOUCH_M = .004
 CHILD = {0: 3, 1: 4, 2: 5, 3: 6, 4: 7, 5: 8, 6: 9, 7: 10, 8: 11, 9: 12, 12: 15, 13: 16, 14: 17, 16: 18, 17: 19, 18: 20, 19: 21}
 # Grip from the video: coarse wrist-limit grid (flexion, radial, pronation samples) and Viterbi cost per degree of wrist
@@ -149,9 +153,9 @@ LIMB_PARTS = LEG_PARTS + ('Arm', 'ForeArm')
 # hand keypoints see the source hand pointing further than this away (median deg); then the palm is laid on the skin.
 KEEP_HAND_VIDEO_DEG = 30.
 # A hand whose skin already lies within these of the target skin on every frame of an automatic hold is left as captured
-# (review's contact_gap and self_penetration thresholds).
+# (review's contact_gap float and inside thresholds, anatomy.CONTACT_GAP_M and CONTACT_INSIDE_M).
 TOUCH_GAP_M = .015
-TOUCH_DEPTH_M = .01
+TOUCH_DEPTH_M = .005
 
 
 def quat_matrix(q):
@@ -1092,18 +1096,22 @@ def push_step(depth, direction, weights, fps):
     return direction * push_size(depth, weights, fps)[:, None]
 
 
-def finger_weights(skin, root, quat, rows, h, names, ease):
+def finger_weights(skin, root, quat, rows, h, names, ease, flat=False):
     """Per-frame curl toward the grip shape that closes the fingers onto the target skin and stops at contact.
 
     Only frames where the fingers float and touch the skin before penetrating curl; elsewhere they keep the source pose (0).
+    flat blends toward the flat shape instead, as far open as the fingers stay out of the skin.
     """
-    group = SIDES[h] + '_fingers'; shape = grip_shape(skin.rest, h)
+    group = SIDES[h] + '_fingers'; shape = grip_shape(skin.rest, h, flat)
     picked = np.flatnonzero(ease > 0)[::2]
     if not len(picked):return np.zeros(len(rows)), 0
     curl = np.zeros(len(picked)); done = np.zeros(len(picked), bool); previous = 0.
     for c in CURL_STEPS:
         fingers = {h: curl_fingers(skin.fingers(rows[picked], h), shape, np.full(len(picked), c))}
         depth, gap = hand_contact(skin, root[picked], quat[picked], rows[picked], h, names, fingers, group=group)[:2]
+        if flat:
+            # The hand was solved open: the most open step that stays out of the skin (the captured fist may sink in).
+            curl = np.where(depth <= PENETRATION_TOLERANCE_M, c, curl); continue
         stop = ~done & (depth > PENETRATION_TOLERANCE_M); touch = ~done & ~stop & (gap <= FINGER_TOUCH_M)
         if c > 0:curl[stop] = previous; curl[touch] = c
         done |= stop | touch; previous = c
@@ -1528,15 +1536,16 @@ def wrist_report(rest, h, start_g, final_g, changed):
     return out
 
 
-def grip_shape(rest, h):
-    """(15, 3, 3) local finger rotations of the grip in MANO order; rest holds the full SMPL-X (55) or SMPL-H (52) joints."""
+def grip_shape(rest, h, flat=False):
+    """(15, 3, 3) local finger rotations of the grip (flat: the open hand) in MANO order; rest holds the full SMPL-X (55) or SMPL-H
+    (52) joints."""
     first = (25 if len(rest) == 55 else 22) + 15 * h
     out = np.empty((15, 3, 3))
     for k in range(15):
         j = first + k; segment = k % 3
         direction = rest[j + 1] - rest[j] if segment < 2 else rest[j] - rest[j - 1]
         axis = unit(np.cross(direction, PALM_NORMAL))
-        out[k] = Rotation.from_rotvec(axis * np.deg2rad(FINGER_CURL_DEG[k // 3][segment])).as_matrix()
+        out[k] = Rotation.from_rotvec(axis * np.deg2rad((FLAT_CURL_DEG if flat else FINGER_CURL_DEG)[k // 3][segment])).as_matrix()
     return out
 
 
@@ -1547,9 +1556,10 @@ def curl_fingers(current, target, weights):
     return quat_matrix(slerp(q0, q1, np.repeat(weights[:, None], 15, 1)))
 
 
-def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_ranges, skin=None, video=None, room=None):
+def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_ranges, skin=None, video=None, room=None, follow=None):
     from .correction import fk, PARENTS
     from .contact_arm_plan import source_reach_gap
+    from .foot_articulation import follow_shin
     started = time.perf_counter(); n = len(roots); a, b = interval
     h = 0 if track['effector'] == 'LeftHand' else 1
     tj, side, part = parse_target(track['target'])
@@ -1623,7 +1633,7 @@ def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_range
     deficit = deficit_of(work, jj, gg, pp, goal)
     entry['reach_deficit_max_m'] = float(deficit[inside].max())
     reciprocal = track['reciprocal'] == 'always' or (track['reciprocal'] == 'auto' and bool((deficit[inside] > 0).any()))
-    joints = list(ARMS[h]); distal = [ARMS[h][3]]; hands = [h]; arm_goals = {h: goal}
+    joints = list(ARMS[h]); distal = [ARMS[h][3]]; hands = [h]; arm_goals = {h: goal}; shin_follow = None
     if reciprocal and part in LEG_PARTS:
         leg = side; hip, knee, ankle = LEGS[leg]
         locked = np.zeros(hi - lo, bool)
@@ -1641,6 +1651,9 @@ def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_range
         entry['reciprocal'] = dict(joint=('Left' if leg == 0 else 'Right') + 'Foot', requested_shift_max_m=float(need.max()),
                                    ankle_shift_max_m=float(shift.max()), moved_frames=int((shift > 1e-6).sum()), foot_lock_conflict_frames=int(conflict.sum()))
         arm_goals = {h: goal}
+        if follow is not None and (follow[lo:hi, leg] > 0).any():
+            # A shin-relative foot (pointe) turns with the moved shin instead of keeping its world rotation.
+            shin_follow = np.asarray(follow[lo:hi, leg], float); entry['reciprocal']['foot_follow_frames'] = int((shin_follow > 0).sum())
     elif reciprocal and part == 'Hand':
         other = tj - 20; distance = DISTANCE['Hand'] if track['distance'] == 'auto' else float(track['distance'])
         middle = (pp[:, h] + pp[:, other]) / 2; line = pp[:, h] - pp[:, other]
@@ -1676,6 +1689,10 @@ def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_range
     # Penetration loop: after each solve the posed skin is checked and the goal pushed out of the target by the depth.
     size = np.zeros(hi - lo); push = np.zeros((hi - lo, 3)); share = .5 if len(hands) == 2 else 1.; history = []; hand_angles = None
     pushed = np.zeros((hi - lo, 3)); settle = np.zeros((hi - lo, 3)); limits = None
+    # A flat grip is solved with the open hand, so its palm (not the captured fist's knuckles) settles on the skin.
+    flat = track['grip'] == 'auto' and part in FLAT_PARTS and bool(names) and skin.hands is not None
+    if flat:
+        captured = skin.hands[lo:hi, 15 * h:15 * h + 15].copy(); skin.hands[lo:hi, 15 * h:15 * h + 15] = grip_shape(skin.rest, h, True)
     rounds = PUSH_ITERATIONS + ANCHOR_EXTRA_ROUNDS + (0 if palm_turn else PUSH_EXTRA_ROUNDS)
     for attempt in range(rounds + 1 if names else 1):
         moved = dict(arm_goals); moved[h] = arm_goals[h] + push * share
@@ -1708,6 +1725,7 @@ def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_range
             solved, swivel, swivel_frames = clear_arm(rest, skin, root, solved, rows, h, clear_names, arms, fps, None if palm_turn else video)
             if fit or palm_turn:solved = limit_wrist_rows(rest, root, solved, h, fps)
         final = blend(rest, root, start, solved, weights, sorted(set(joints)), distal, [ARMS[h][3]] if limits is not None else [])
+        if shin_follow is not None:final = follow_shin(rest, root, start, final, LEGS[side][1], LEGS[side][2], shin_follow * (weights > 0))
         j0, g0 = fk(rest, root, start); js, _ = fk(rest, root, solved)
         # Slerping twisted elbow frames can straighten or fold past both ends; never end beyond the limits or the source.
         straight = {k: np.maximum(ELBOW_MAX_DEG, interior(*(j0[:, ARMS[k][i]] for i in (1, 2, 3)))) for k in hands}
@@ -1755,9 +1773,11 @@ def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_range
                              skin_gap_median_m=float(np.nanmedian(gap[inside])) if np.isfinite(gap[inside]).any() else None,
                              skin_gap_max_m=float(np.nanmax(gap[inside])) if np.isfinite(gap[inside]).any() else None,
                              far_frames=int(np.isnan(gap[inside]).sum()))
+        if flat:skin.hands[lo:hi, 15 * h:15 * h + 15] = captured
         if track['grip'] == 'auto':
-            curl, curled = finger_weights(skin, root, final, rows, h, names, weights)
-            grip['fingers'] = dict(hand=h, window=[int(lo), int(hi)], weights=curl.tolist(), curled_frames=curled)
+            flat = part in FLAT_PARTS
+            curl, curled = finger_weights(skin, root, final, rows, h, names, weights, flat)
+            grip['fingers'] = dict(hand=h, window=[int(lo), int(hi)], weights=curl.tolist(), curled_frames=curled, shape='flat' if flat else 'grip')
     jf, gf = fk(rest, root, final); pf, _, _ = palms(rest, root, final, offsets)
     bf, ff = frame_of(jf, gf, pf)
     pin = (arm_goals[h] if part == 'Hand' and len(hands) == 2 else bf + np.einsum('tij,j->ti', ff, offset) + hand_shift(gf)) + push * share
@@ -1809,7 +1829,7 @@ def ease_room(work, index, n):
     return (min([a - e for s, e in others if e <= a], default=n), min([s - b for s, e in others if s >= b], default=n))
 
 
-def apply(rest, out_roots, out_quats, offsets, fps, tracks, foot_ranges, emit=lambda *a, **k: None, skin=None, video=None):
+def apply(rest, out_roots, out_quats, offsets, fps, tracks, foot_ranges, emit=lambda *a, **k: None, skin=None, video=None, follow=None):
     """Solve enabled tracks in order on the corrected pose, mutating out_quats; None when nothing is enabled.
 
     skin (Skin) enables skin goals and the penetration loop; video (HandVideo) lets grip 'auto' turn the wrist to the video hand.
@@ -1820,7 +1840,7 @@ def apply(rest, out_roots, out_quats, offsets, fps, tracks, foot_ranges, emit=la
     entries = []; changed = []; warnings = []; wrists = []; fingers = []
     for index, (track, interval) in enumerate(work):
         room = ease_room(work, index, len(out_roots))
-        update, entry = solve_interval(rest, out_roots, out_quats, offsets, fps, track, interval, foot_ranges, skin, video, room)
+        update, entry = solve_interval(rest, out_roots, out_quats, offsets, fps, track, interval, foot_ranges, skin, video, room, follow)
         entries.append(entry)
         if update is not None:
             s, e, joints, values = update
@@ -1845,7 +1865,8 @@ def apply(rest, out_roots, out_quats, offsets, fps, tracks, foot_ranges, emit=la
                 wrist_changed=wrists, fingers=fingers, warning=' '.join(['Self-contact: ' + w for w in warnings]))
 
 
-def from_store(project, base, context, rest, out_roots, out_quats, offsets, fps, segments, emit=lambda *a, **k: None, body=None, transform=None):
+def from_store(project, base, context, rest, out_roots, out_quats, offsets, fps, segments, emit=lambda *a, **k: None, body=None, transform=None,
+               follow=None):
     """correction.run hook: (report or None, pre-self-contact quats or None). No store file = (None, None).
 
     body is the correction's SMPL-X model (loaded here when None); transform maps the result frame to the correction frame.
@@ -1858,7 +1879,8 @@ def from_store(project, base, context, rest, out_roots, out_quats, offsets, fps,
     enabled = [t for t in tracks if t.get('enabled', True) and t['ranges']]
     skin, note = load_skin(project, base, rest, body) if enabled else (None, None)
     video = load_video(project, transform) if skin is not None else None
-    report = apply(rest, out_roots, out_quats, offsets, fps, tracks, foot_ranges, emit, skin, video) or dict(method=METHOD, tracks=[], changed=[], warning='')
+    report = apply(rest, out_roots, out_quats, offsets, fps, tracks, foot_ranges, emit, skin, video, follow) or dict(
+        method=METHOD, tracks=[], changed=[], warning='')
     report['revision'] = revision
     report['skin'] = dict(available=skin is not None, video=video is not None, note=note)
     report['warning'] = ' '.join(filter(None, (report['warning'], warning)))
@@ -1947,7 +1969,7 @@ def publish_fingers_smplx(output, params, report, rest, mean):
         ids = torch.from_numpy(ids)
         hand_mean = np.asarray(mean, float)[25 + 15 * h:40 + 15 * h]
         current = Rotation.from_rotvec((output[field][ids].double().numpy().reshape(-1, 15, 3) + hand_mean).reshape(-1, 3)).as_matrix().reshape(-1, 15, 3, 3)
-        curled = curl_fingers(current, grip_shape(rest, h), weights)
+        curled = curl_fingers(current, grip_shape(rest, h, spec.get('shape') == 'flat'), weights)
         values = Rotation.from_matrix(curled.reshape(-1, 3, 3)).as_rotvec().reshape(-1, 15, 3) - hand_mean
         output[field][ids] = torch.from_numpy(values.reshape(-1, 45).astype(np.float32))
         note_fingers(spec, True, current, curled)
@@ -1975,6 +1997,6 @@ def publish_fingers_rot6d(output, report, rest):
             continue
         ids = torch.from_numpy(ids); joints = slice(22 + 15 * h, 37 + 15 * h)
         current = rot6d_matrix(rot6d[0, ids, joints].double().numpy())
-        curled = curl_fingers(current, grip_shape(rest, h), weights)
+        curled = curl_fingers(current, grip_shape(rest, h, spec.get('shape') == 'flat'), weights)
         rot6d[0, ids, joints] = torch.from_numpy(curled[..., :2].reshape(len(ids), 15, 6).astype(np.float32))
         note_fingers(spec, True, current, curled)

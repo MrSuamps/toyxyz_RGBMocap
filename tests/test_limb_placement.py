@@ -143,6 +143,38 @@ class SolverTest(unittest.TestCase):
         self.assertEqual(e['swapped_frames'], 3)
         self.assertLess(e['error_after_torso']['limb']['max'], .05)
 
+    def test_pointe_foot_turns_with_the_placed_shin(self):
+        root, q = source_clip(); before = q.copy()
+        follow = np.zeros((N, 2)); follow[:, 1] = 1.
+        report = lp.apply(REST, root, q, FPS, [entry()], camera(root, truth(q, 60)), ([], []), follow=follow)
+        mask = changed_mask(report); rows = mask.any(1)
+        # Full follow keeps the ankle's rotation relative to the shin (local), so the foot leaves its world rotation.
+        self.assertLess(np.abs(q[rows, 8] - before[rows, 8]).max(), 1e-5)
+        _, w0 = fk(REST, root.astype(float), before.astype(float)); _, w1 = fk(REST, root.astype(float), q.astype(float))
+        self.assertGreater(np.abs(w0[rows, 8] - w1[rows, 8]).max(), .1)
+        self.assertTrue(all(c['world'] == [2, 5, 8] for c in report['changed']))
+        self.assertEqual(report['entries'][0]['foot_follow_frames'], int(rows.sum()))
+        # A follow weight on the other foot only leaves the placed leg's foot at its world rotation.
+        root, q = source_clip(); before = q.copy(); other = np.zeros((N, 2)); other[:, 0] = 1.
+        lp.apply(REST, root, q, FPS, [entry()], camera(root, truth(q, 60)), ([], []), follow=other)
+        _, w2 = fk(REST, root.astype(float), q.astype(float))
+        self.assertLess(np.abs(w0[:, 8] - w2[:, 8]).max(), 1e-5)
+
+    def test_follow_shin_weights(self):
+        from mocap.foot_articulation import follow_shin
+        root, q = source_clip(); moved = q.copy()
+        moved[:, 5] = quat(np.tile([np.deg2rad(70), 0, 0], (N, 1)))
+        _, w0 = fk(REST, root.astype(float), q.astype(float)); _, wm = fk(REST, root.astype(float), moved.astype(float))
+        moved[:, 8] = lp.matrix_quat(wm[:, 5].swapaxes(-1, -2) @ w0[:, 8])
+        weight = np.zeros(N); weight[10:] = .5; weight[40:] = 1.
+        out = follow_shin(REST, root, q, moved, 5, 8, weight)
+        self.assertTrue(np.array_equal(out[:10], moved[:10]))
+        self.assertLess(np.abs(out[40:, 8] - q[40:, 8]).max(), 1e-6)
+        _, wo = fk(REST, root.astype(float), out.astype(float))
+        from mocap.self_contact import rotation_angle
+        half = rotation_angle(w0[20:40, 8], wo[20:40, 8])
+        self.assertTrue(np.allclose(half, 20., atol=.5))
+
     def test_arm_chain_keeps_wrist_world_and_declares_upper_joints(self):
         root, q = source_clip()
         target = q.copy(); target[:, 17] = quat(np.tile([0, 0, np.deg2rad(50)], (N, 1)))

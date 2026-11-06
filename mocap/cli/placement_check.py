@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 LIMB_OF_CHAIN = {'LeftArm': 'left_arm', 'RightArm': 'right_arm', 'LeftLeg': 'left_leg', 'RightLeg': 'right_leg'}
+CHAIN_JOINTS = {'LeftArm': (16, 18, 20), 'RightArm': (17, 19, 21), 'LeftLeg': (1, 4, 7), 'RightLeg': (2, 5, 8)}   # SMPL
 KEPT_TORSO = 0.1               # final median may exceed the solved median by this before the interval counts as undone
 
 
@@ -28,21 +29,32 @@ def limb_series(ctx):
     return {limb: np.fmax.reduce(ctx.err[:, list(members)], axis=1) for limb, members in LIMBS.items()}
 
 
-def placement_report(project, kind):
+def correction_block(project, kind, name):
     path = Path(project) / f'{kind}_correction.json'
     if not path.is_file():
         return None
     try:
         from .pipeline import read_json
-        return read_json(path).get('placement')
+        return read_json(path).get(name)
     except (OSError, ValueError, AttributeError):
         return None
+
+
+def placement_report(project, kind):
+    return correction_block(project, kind, 'placement')
+
+
+def contact_moved(changed, chain, start, end):
+    """True when a self-contact changed joints of the placed chain inside [start, end) (it is solved on the placed limb)."""
+    joints = set(CHAIN_JOINTS.get(chain, ()))
+    return any(joints & set(row.get('joints', ())) and row.get('start', 0) < end and row.get('end', 0) > start for row in changed or ())
 
 
 def statistics(ctx, project, kind):
     """{'limbs': {limb: stats}, 'intervals': [...]} for the reviewed frames; intervals only when the result has placement rows."""
     series = limb_series(ctx)
     out = dict(limbs={limb: describe(values) for limb, values in series.items()}, intervals=[])
+    changed = (correction_block(project, kind, 'self_contact') or {}).get('changed')
     for entry in (placement_report(project, kind) or {}).get('entries', []):
         row = dict(id=entry.get('id'), chain=entry.get('chain'), frames=[entry.get('start'), (entry.get('end') or 1) - 1])
         if 'skipped' in entry:
@@ -57,7 +69,8 @@ def statistics(ctx, project, kind):
         kept = None
         if final['median'] is not None and solved.get('median') is not None:
             kept = final['median'] <= solved['median'] + KEPT_TORSO
-        out['intervals'].append(dict(row, before=before, solved=solved, final=final, kept=kept))
+        moved = kept is False and contact_moved(changed, entry['chain'], entry['start'], entry['end'])
+        out['intervals'].append(dict(row, before=before, solved=solved, final=final, kept=kept, moved_by_contact=moved))
     return out
 
 
@@ -73,6 +86,7 @@ def summary_lines(block):
         if 'skipped' in row:
             lines.append(f"| {row['id']} | {row['chain']} | {frames} | skipped: {row['skipped']} | | | |")
             continue
-        kept = '-' if row['kept'] is None else ('yes' if row['kept'] else 'NO: a later pass moved the limb off the video')
+        kept = ('-' if row['kept'] is None else 'yes' if row['kept'] else 'moved by a self-contact on this limb (check the sheet)'
+                if row.get('moved_by_contact') else 'NO: a later pass moved the limb off the video')
         lines.append(f"| {row['id']} | {row['chain']} | {frames} | {fmt(row['before'])} | {fmt(row['solved'])} | {fmt(row['final'])} | {kept} |")
     return lines

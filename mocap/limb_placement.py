@@ -275,8 +275,11 @@ def stats(values):
     return dict(median=float(np.median(values)), p90=float(np.percentile(values, 90)), max=float(values.max()), samples=int(len(values)))
 
 
-def solve_interval(rest, roots, quats, fps, entry, interval, camera, foot_ranges):
-    """Place one chain on one interval; returns ([(start, end, joints, values)] row runs or None, report entry)."""
+def solve_interval(rest, roots, quats, fps, entry, interval, camera, foot_ranges, follow=None):
+    """Place one chain on one interval; returns ([(start, end, joints, values)] row runs or None, report entry).
+
+    follow (n, 2) weights turn shin-relative feet (foot articulation pointe/flexed) with a placed shin instead of keeping their
+    world rotation."""
     started = time.perf_counter(); n = len(roots); a, b = interval
     chain = entry['chain']; (_, upper, middle, end), _, _ = CHAINS[chain]
     report = dict(id=entry['id'], chain=chain, strength=entry['strength'], start=int(a), end=int(b))
@@ -324,6 +327,11 @@ def solve_interval(rest, roots, quats, fps, entry, interval, camera, foot_ranges
         rows = np.flatnonzero(changed)
         _, world0 = fk(rest, root[rows], start[rows]); _, world1 = fk(rest, root[rows], final[rows])
         final[rows, end] = matrix_quat(world1[:, middle].swapaxes(-1, -2) @ world0[:, end])
+        turn = np.zeros(hi - lo) if follow is None or not chain.endswith('Leg') else np.where(changed, follow[lo:hi, side], 0.)
+        if (turn > 0).any():
+            from .foot_articulation import follow_shin
+            final = follow_shin(rest, root, start, final, middle, end, turn)
+            report['foot_follow_frames'] = int((turn > 0).sum())
     report.update(window=[int(w_lo), int(w_hi)], ease_frames=ease, solver=dict(cost=float(result.cost), evaluations=int(result.nfev),
                   status=int(result.status)), confident_fraction=float((frame_conf[inside] > .5).mean()),
                   swapped_frames=int(swapped[inside].sum()), foot_lock_conflict_frames=conflict)
@@ -352,7 +360,7 @@ def solve_interval(rest, roots, quats, fps, entry, interval, camera, foot_ranges
     return [(lo + s, lo + e, [upper, middle, end], final[s:e]) for s, e in runs(np.flatnonzero(changed))], report
 
 
-def apply(rest, out_roots, out_quats, fps, entries, camera, foot_ranges, emit=lambda *a, **k: None):
+def apply(rest, out_roots, out_quats, fps, entries, camera, foot_ranges, emit=lambda *a, **k: None, follow=None):
     """Place enabled rows in order, mutating out_quats; None when nothing is enabled."""
     work = [(e, r) for e in entries if e.get('enabled', True) for r in e['ranges']]
     if not work:
@@ -364,12 +372,13 @@ def apply(rest, out_roots, out_quats, fps, entries, camera, foot_ranges, emit=la
             reports.append(dict(id=entry['id'], chain=entry['chain'], start=int(interval[0]), end=int(interval[1]),
                                 skipped='placement needs ExMR 2D keypoints and cameras'))
         else:
-            updates, report = solve_interval(rest, out_roots, out_quats, fps, entry, interval, camera, foot_ranges)
+            updates, report = solve_interval(rest, out_roots, out_quats, fps, entry, interval, camera, foot_ranges, follow)
             reports.append(report)
             for s, e, joints, values in updates or ():
                 out_quats[s:e, joints] = values[:, joints].astype(out_quats.dtype)
-                # world lists the joints whose world rotation changes: the hand or foot keeps its own.
-                changed.append(dict(joints=[int(j) for j in joints], world=[int(j) for j in joints[:2]], start=int(s), end=int(e)))
+                # world lists the joints whose world rotation changes: the hand or foot keeps its own unless it follows the shin.
+                world = joints if report.get('foot_follow_frames') else joints[:2]
+                changed.append(dict(joints=[int(j) for j in joints], world=[int(j) for j in world], start=int(s), end=int(e)))
             if report.get('foot_lock_conflict_frames'):
                 warnings.append('%s %d-%d: a foot lock kept the leg still on %d frames.' % (
                     entry['chain'], interval[0], interval[1] - 1, report['foot_lock_conflict_frames']))
@@ -380,8 +389,9 @@ def apply(rest, out_roots, out_quats, fps, entries, camera, foot_ranges, emit=la
                 warning=' '.join('Limb placement: ' + w for w in warnings))
 
 
-def from_store(project, base, context, rest, out_roots, out_quats, fps, segments, transform=None, emit=lambda *a, **k: None):
-    """correction.run hook after the hand lock; None (nothing touched) without placement rows."""
+def from_store(project, base, context, rest, out_roots, out_quats, fps, segments, transform=None, emit=lambda *a, **k: None, follow=None):
+    """correction.run hook after the hand lock; None (nothing touched) without placement rows. follow: foot articulation
+    shin-follow weights (n, 2) or None."""
     from .self_contact_store import read_placement
     entries, revision, warning = read_placement(project, base, context)
     if not entries and not warning:
@@ -395,7 +405,7 @@ def from_store(project, base, context, rest, out_roots, out_quats, fps, segments
         except (OSError, KeyError, ValueError, RuntimeError, TypeError):
             camera = None
     foot_ranges = [[(s['start'], s['end']) for s in segments if s['foot'] == f] for f in (0, 1)]
-    report = apply(rest, out_roots, out_quats, fps, entries, camera, foot_ranges, emit) or dict(method=METHOD, entries=[], changed=[], warning='')
+    report = apply(rest, out_roots, out_quats, fps, entries, camera, foot_ranges, emit, follow) or dict(method=METHOD, entries=[], changed=[], warning='')
     report['revision'] = revision
     report['warning'] = ' '.join(filter(None, (report['warning'], warning)))
     return report

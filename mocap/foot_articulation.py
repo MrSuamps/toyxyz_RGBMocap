@@ -428,6 +428,21 @@ class Articulation:
             output['body_pose'][s:e, 3 * (toe - 1):3 * toe] = torch.from_numpy(np.asarray(pose[s:e, toe]).copy())
 
 
+def follow_shin(rest, root, before, after, knee, ankle, weight):
+    """after (quats) with the ankle turned by weight along its shin's change from before: 0 keeps the ankle's world rotation, 1
+    its rotation relative to the shin (a pointe foot stays in line). Rows of weight 0 are returned unchanged."""
+    from .correction import fk
+    out = np.array(after, copy=True); rows = np.flatnonzero(np.asarray(weight) > 0)
+    if not len(rows):
+        return out
+    _, w0 = fk(rest, np.asarray(root, float)[rows], np.asarray(before, float)[rows])
+    _, w1 = fk(rest, np.asarray(root, float)[rows], np.asarray(after, float)[rows])
+    delta = Rotation.from_matrix(w0[:, knee].swapaxes(-1, -2) @ w1[:, knee]).as_rotvec()
+    world = w0[:, knee] @ turn(np.asarray(weight, float)[rows, None] * delta, quat_matrix(np.asarray(before, float)[rows, ankle]))
+    out[rows, ankle] = matrix_quat(w1[:, knee].swapaxes(-1, -2) @ world).astype(out.dtype)
+    return out
+
+
 def runs(rows):
     """Contiguous (first, end) runs of sorted row indices."""
     rows = np.asarray(rows)
