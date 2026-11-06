@@ -124,9 +124,9 @@ needing retargeting and re-retargeted afterwards, as in the app; `--no-character
 
 The flat floor model shifts the root so each support frame lands on one floor height. When that grounding shift spans
 more than 0.15 m (the source world's floor drifts or tilts), `<kind>_correction.json` `warning` says so: the body may
-move off the video person (review `body_offset`); Multi Level keeps the source elevation. For a moving ExMR camera, the
-GUI camera gizmos and the Blender export camera follow the root change correction made, so the body keeps its place in
-view. `--grounding camera` (single static-camera ExMR take, Flat Ground; saved with the settings and shown as the app's
+move off the video person (review `body_offset`); Multi Level keeps the source elevation. The ExMR camera follows the
+root change correction made (moving: per frame, in the GUI Camera Preview, gizmos and the Blender export; static: the
+one fixed camera is built from the shifted pairings), so the body keeps its place in view. `--grounding camera` (single static-camera ExMR take, Flat Ground; saved with the settings and shown as the app's
 **Grounding** setting) also moves the root toward or away from the GUI's fixed camera, smoothed over 2 s, so the drop keeps
 the body on the person; `<kind>_correction.json` `camera_grounding` gives the depth change. Elsewhere (moving camera, people
 group, Multi Level, foot lock off, other models) the take is grounded vertically and `warning` says so (FlowHMR correction
@@ -280,9 +280,10 @@ that result's correction files when present. Report frames and `--frames` are vi
 and fix frames are video frame + 1. Only ExMR projects are supported for now.
 
 Method: the camera follows the project's ExMR camera mode (`exmr_camera.json`; `report.json` `camera` names the one
-used). A static camera is one fixed camera, the GUI camera view's: the frame-0 pairing of the original in-camera and
-world roots. So ExMR's world drift (up to 0.25 m) shows as placement offset in the original result, and Motion Correction
-removing it does not. A moving camera is paired per frame with the original roots, and for a corrected result its
+used). A static camera is one fixed camera, the GUI camera view's: the median centre and mean rotation of the per-frame
+pairings of the original in-camera and world roots, so one outlier frame cannot move it. For a corrected result the
+pairings first move by the root change correction made, so removing ExMR's world drift keeps the body on the person;
+the original result still shows that drift as placement offset. A moving camera is paired per frame with the original roots, and for a corrected result its
 centres move by the root change correction made (as the Blender export camera), so a corrected result keeps the
 original's place in view. Projects without a saved camera mode keep the per-frame pairing. For pose checks, the
 per-frame 2D offset (median of the confident shoulder keypoints, hips weighted low) is removed first and reported

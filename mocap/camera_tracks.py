@@ -27,7 +27,8 @@ def valid_rotations(r):
     if r.ndim!=3 or r.shape[1:]!=(3,3) or not len(r) or not np.isfinite(r).all():raise ValueError('Invalid camera rotations.')
     if not np.allclose(r.swapaxes(-1,-2)@r,np.eye(3),atol=2e-4) or not np.allclose(np.linalg.det(r),1,atol=2e-4):raise ValueError('Camera rotations are not rigid.')
 
-def record(name,k,size,matrices,start,fps,description,displacement=None):
+def record(name,k,size,matrices,start,fps,description,displacement=None,overlay=None):
+    """`overlay`: per-frame world-to-camera the video overlay projects with instead of `matrices` (moving ExMR take)."""
     k=np.asarray(k,float);m=np.asarray(matrices,float)
     if m.shape==(4,4):m=m[None]
     valid_rotations(m[:,:3,:3])
@@ -35,7 +36,9 @@ def record(name,k,size,matrices,start,fps,description,displacement=None):
     if (k.shape!=(3,3) or not np.isfinite(k).all() or min(k[0,0],k[1,1])<=0
             or not np.allclose(k[2],[0,0,1]) or abs(np.linalg.det(k))<1e-9):raise ValueError('Invalid camera intrinsics.')
     if len(size)!=2 or not np.isfinite(size).all() or min(size)<=0 or not np.isfinite(start) or not np.isfinite(fps) or fps<=0:raise ValueError('Invalid camera timing or image size.')
-    return dict(name=name,K=k,size=tuple(size),matrices=m,start=float(start),fps=float(fps),description=description,displacement=displacement)
+    if overlay is not None and (np.shape(overlay)!=m.shape or not np.isfinite(overlay).all()):raise ValueError('Invalid overlay camera track.')
+    return dict(name=name,K=k,size=tuple(size),matrices=m,start=float(start),fps=float(fps),description=description,displacement=displacement,
+                overlay=overlay)
 
 def at(camera,time,translation_scale=0.):
     m=camera['matrices'];index=round((time-camera['start'])*camera['fps'])
@@ -44,6 +47,13 @@ def at(camera,time,translation_scale=0.):
     if translation_scale and camera['displacement'] is not None:
         result=result.copy();result[:3,3]-=result[:3,:3]@(camera['displacement'][index]*translation_scale)
     return result
+
+def projection(camera,time):
+    """World-to-camera the video overlay and Camera Preview project with: the per-frame paired overlay track when there is one."""
+    if camera.get('overlay') is None:return at(camera,time,0)
+    m=camera['overlay'];index=round((time-camera['start'])*camera['fps'])
+    if len(m)>1 and not 0<=index<len(m):return None
+    return m[max(0,min(len(m)-1,index))]
 
 def centers(camera,scale=0.):
     m=camera['matrices'];ids=np.unique(np.linspace(0,len(m)-1,min(len(m),256),dtype=int))
@@ -70,7 +80,7 @@ def paired_reference(project,cancelled,cache,kind=None):
     if not artifacts_current(project,'initial'):raise ValueError('Original motion preview is stale. Use Prepare Preview.')
     key=str(project)+('|'+kind if kind else '')
     prior=cache.get(key) if cache is not None else None
-    if prior and prior.get('schema')==2 and all(file_stat(project/name)==stamp for name,stamp in prior['sources'].items()):return prior
+    if prior and prior.get('schema')==3 and all(file_stat(project/name)==stamp for name,stamp in prior['sources'].items()):return prior
     environment=dict(os.environ,CUDA_VISIBLE_DEVICES='',OMP_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1',MKL_NUM_THREADS='1')
     command=worker_command('camera_reference','--project',str(project),*(('--kind',kind) if kind else ()))
     process=subprocess.Popen(command,stdout=subprocess.PIPE,stderr=subprocess.PIPE,
@@ -85,10 +95,15 @@ def paired_reference(project,cancelled,cache,kind=None):
         if process.returncode:raise ValueError('Saved original camera is unavailable. Use Prepare Preview; check the original motion and body data.')
         if len(output)>MAX_BYTES:raise ValueError('Saved camera metadata exceeds the preview limit.')
         value=json.loads(output.decode('utf-8'))
-        if value.get('centers') is not None:
-            value['centers']=np.asarray(value['centers'],float)
-            if value['centers'].ndim!=2 or value['centers'].shape[1]!=3 or value['centers'].nbytes>MAX_BYTES or not np.isfinite(value['centers']).all():
-                raise ValueError('Invalid estimated camera centers.')
+        for name in ('centers','paired_centers'):
+            if value.get(name) is not None:
+                value[name]=np.asarray(value[name],float)
+                if value[name].ndim!=2 or value[name].shape[1]!=3 or value[name].nbytes>MAX_BYTES or not np.isfinite(value[name]).all():
+                    raise ValueError('Invalid estimated camera centers.')
+        if value.get('paired_rotations') is not None:
+            value['paired_rotations']=np.asarray(value['paired_rotations'],float);valid_rotations(value['paired_rotations'])
+            if value.get('paired_centers') is None or len(value['paired_centers'])!=len(value['paired_rotations']):
+                raise ValueError('Invalid paired camera path.')
         if cache is not None:
             if len(cache)>=8:cache.pop(next(iter(cache)))
             cache[key]=value
@@ -133,7 +148,7 @@ def load(project,group=None,cancelled=lambda:False,reference_cache=None,kind=Non
         from .scene_export import context
         placement=context(group,project);transform=validate_transform(placement['transform'])
         tracked(group/'people_scene.json')
-    base=reference@np.linalg.inv(transform);items=[];note='';warning='';static_camera=False
+    base=reference@np.linalg.inv(transform);items=[];note='';warning='';static_camera=False;overlay=None
     if model=='mamma':
         from .mamma_body import WORLD_ROTATION
         root=group or project;meta=read(tracked(root/'project.json'))
@@ -182,6 +197,9 @@ def load(project,group=None,cancelled=lambda:False,reference_cache=None,kind=Non
             note='ExMR camera rotation; fixed camera position.'
             policy=read(tracked(root/'exmr_camera.json'))
             static_camera=bool(policy['identity']['static'])
+            if static_camera:
+                note=('ExMR static camera: median of all frame pairings'+(', following the root change of Motion Correction' if camera.get('follows') else '')
+                      +'; fixed camera position.')
             if not policy['identity']['static']:
                 anchor=project if group is None else (group/read(group/'people_scene.json')['anchor']).resolve()
                 if group is not None and not anchor.is_relative_to(group):raise ValueError('Invalid camera reference take.')
@@ -193,13 +211,20 @@ def load(project,group=None,cancelled=lambda:False,reference_cache=None,kind=Non
                 if (points is not None and len(points)==len(r) and abs(path['start']-meta['start'])<1e-6 and path['fps']==meta['fps']):
                     # Relative to the original frame-0 centre, so a followed correction also moves frame 0.
                     displacement=points-np.asarray(path.get('origin') or points[0],float)
+                    paired=path.get('paired_rotations')
+                    # One take's own pairing; a shared scene keeps every actor on the anchor's rotation track.
+                    if group is None and paired is not None and len(paired)==len(r):
+                        overlay=np.tile(np.eye(4),(len(r),1,1));overlay[:,:3,:3]=paired
+                        overlay[:,:3,3]=-np.einsum('tij,tj->ti',paired,path['paired_centers'])
                     note=('Estimated ExMR camera movement from original paired world/camera roots'
                           +(', following the root change of Motion Correction' if path.get('follows') else '')
-                          +'. Approximate, not measured motion. Gizmos only; video overlays keep the calibrated reference.')
+                          +('. Video overlays and Camera Preview pair the camera per frame, as review, render and Blender export'
+                            if overlay is not None else '. Gizmos only; video overlays keep the calibrated reference')
+                          +'. Approximate, not measured motion.')
                 else:warning='Camera movement reference is unavailable or incomplete; showing rotation only.'
         m=np.tile(np.eye(4),(len(rotations),1,1));m[:,:3,:3]=rotations
         center=-base[:3,:3].T@base[:3,3];m[:,:3,3]=-np.einsum('tij,j->ti',rotations,center)
-        items=[record('Camera 1',camera['K'],[state['width'],state['height']],m,meta['start'],meta['fps'],note,displacement)]
+        items=[record('Camera 1',camera['K'],[state['width'],state['height']],m,meta['start'],meta['fps'],note,displacement,overlay)]
     else:
         items=[record('Camera 1',camera['K'],[state['width'],state['height']],base,state['start'],state['fps'],'Saved reference camera; no dynamic camera track exposed')]
         note='Saved reference camera only; no dynamic camera translation is available.'

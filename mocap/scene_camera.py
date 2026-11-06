@@ -50,6 +50,7 @@ def read_camera(project):
     if not path.exists():return None
     record=json.loads(path.read_text(encoding='utf-8'))
     if record.get('version')!=VERSION or record.get('sources')!=camera_sources(project):return None
+    if record.get('source_model')=='exmr' and record.get('pairing')!=scene_pairing(project):return None
     from .paths import MODELS
     if record.get('source_model')=='mamma':
         from .mamma_body import body_path
@@ -69,6 +70,49 @@ def paired_camera(world_rotation,cam_rotation,world_translation,cam_translation,
     result[:3,:3]=cam_rotation@world_rotation.T
     result[:3,3]=cam_translation+pelvis-result[:3,:3]@(world_translation+pelvis)
     return validate_transform(result)
+
+
+def paired_centres(world_rotation,cam_rotation,world_translation,cam_translation,pelvis):
+    """(F,3) world camera centre of paired_camera per frame: t_w + p - R^T (t_c + p)."""
+    rotation=np.asarray(cam_rotation,float)@np.asarray(world_rotation,float).swapaxes(-1,-2)
+    return np.asarray(world_translation,float)+pelvis-np.einsum('fji,fj->fi',rotation,np.asarray(cam_translation,float)+pelvis)
+
+
+def static_centre(centres,shift=None):
+    """One static camera centre from per-frame paired centres (F,3): their median after `shift` (F,3), the root change a
+    correction made. The pairings drift with the source world; a correction that removes that drift from the body takes the
+    camera with it."""
+    centres=np.asarray(centres,float)
+    return np.median(centres if shift is None else centres+np.asarray(shift,float),0)
+
+
+def static_paired_camera(world_rotation,cam_rotation,world_translation,cam_translation,pelvis,shift=None):
+    """One world-to-camera for a static camera from per-frame paired_camera inputs ((F,3,3), (F,3,3), (F,3), (F,3), (3,)).
+
+    The median camera centre (static_centre; `shift` as there) and the chordal-mean rotation of all frames: one outlier
+    pairing (frame 0 was the camera and can sit 0.3 m off the others) cannot move it."""
+    world_rotation,cam_rotation=np.asarray(world_rotation,float),np.asarray(cam_rotation,float)
+    world_translation,cam_translation=np.asarray(world_translation,float),np.asarray(cam_translation,float)
+    rotation=cam_rotation@world_rotation.swapaxes(-1,-2)
+    centre=static_centre(paired_centres(world_rotation,cam_rotation,world_translation,cam_translation,pelvis),shift)
+    u,_,vt=np.linalg.svd(rotation.sum(0))
+    mean=u@np.diag([1.,1.,np.linalg.det(u@vt)])@vt
+    result=np.eye(4);result[:3,:3]=mean;result[:3,3]=-mean@centre
+    return validate_transform(result)
+
+
+def exmr_static(project):
+    """True / False for a take with a saved ExMR camera policy (static / moving), None without one."""
+    try:
+        sources=json.loads((Path(project)/'exmr_camera_sources.json').read_text(encoding='utf-8'))
+        policy=json.loads(((Path(project)/sources['root']).resolve()/'exmr_camera.json').read_text(encoding='utf-8'))
+        return bool(policy['identity']['static'])
+    except (OSError,ValueError,KeyError,TypeError):return None
+
+
+def scene_pairing(project):
+    """The `pairing` an ExMR take's scene camera receipt must record; None keeps the frame-0 receipt (moving camera)."""
+    return 'median' if exmr_static(project) else None
 
 
 def take_projects(root,state):
@@ -130,9 +174,14 @@ def prepare_cameras(root):
                 finally:joints.close()
                 info=json.loads((project/'initial_mesh.json').read_text(encoding='utf-8'))
                 model_stamp=[info['model_size'],info['model_mtime_ns']]
-            rotation=lambda params:Rotation.from_rotvec(params['global_orient'][0].numpy()).as_matrix()
-            transform=paired_camera(rotation(world),rotation(incam),world['transl'][0].numpy(),incam['transl'][0].numpy(),pelvis)
             exmr=record.get('source_model')=='exmr'
+            pairing=scene_pairing(project) if exmr else None
+            if pairing:
+                rotation=lambda params:Rotation.from_rotvec(params['global_orient'].numpy()).as_matrix()
+                transform=static_paired_camera(rotation(world),rotation(incam),world['transl'].numpy(),incam['transl'].numpy(),pelvis)
+            else:
+                rotation=lambda params:Rotation.from_rotvec(params['global_orient'][0].numpy()).as_matrix()
+                transform=paired_camera(rotation(world),rotation(incam),world['transl'][0].numpy(),incam['transl'][0].numpy(),pelvis)
             if exmr:
                 shared=json.loads((project/'exmr_camera_sources.json').read_text(encoding='utf-8'))
                 # All takes use the same full-scene camera orientation, including
@@ -154,7 +203,9 @@ def prepare_cameras(root):
                 del refined
             if camera_sources(project)!=sources:raise ValueError('Motion changed during scene camera preparation; retry.')
             atomic_json(project/'scene_camera.json',dict(version=VERSION,sources=sources,model=model_stamp,
-                world_to_camera=transform.tolist(),K=K,htd_compatible=htd,source_model='exmr' if exmr else 'gvhmr',method='Paired root with SMPL-X pelvis pivot'+('; one scene camera' if exmr else '')))
+                world_to_camera=transform.tolist(),K=K,htd_compatible=htd,source_model='exmr' if exmr else 'gvhmr',
+                method='Paired root with SMPL-X pelvis pivot'+('; median of all frames' if pairing else '')+('; one scene camera' if exmr else ''),
+                **({'pairing':pairing} if pairing else {})))
             del record,world,incam
     anchor_path=root/'people_scene.json'
     previous=json.loads(anchor_path.read_text(encoding='utf-8')) if anchor_path.exists() else {}

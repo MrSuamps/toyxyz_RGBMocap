@@ -365,7 +365,10 @@ reuse `camera_tracks.load` and the isolated original-reference loader; never
 re-estimate the camera from a corrected body. An animated single-take moving
 ExMR camera is instead the per-frame original world/camera root pairing used by
 `review`/`render` (centres following the correction's root change), because the
-rotation track alone tilts the body off the person. Export only the requested take
+rotation track alone tilts the body off the person. A static ExMR camera has one
+definition for every consumer (`scene_camera.static_paired_camera` via
+`camera_reference.exmr_view`): median centre and mean rotation of all per-frame
+pairings, shifted by a corrected result's root change. Export only the requested take
 interval, transport the skeleton once through its existing shared placement, and
 use cameras already in that common world without applying the placement twice.
 Optional camera tracking, movement scale and background refinement affect only

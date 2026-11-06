@@ -108,11 +108,19 @@ class Observation:
     paired: object = None       # (F, 3) moving camera: translations paired with the original root
 
     def follow(self, project, kind):
-        """This take seen through the camera of `kind`; a moving camera moves with the root change correction made (as the GUI export)."""
+        """This take seen through the camera of `kind`: a moving camera moves with the root change correction made (as the GUI export),
+        a fixed one is the static camera built for `kind` (camera_reference.exmr_view)."""
         import dataclasses
         import numpy as np
-        if self.camera != 'moving' or kind == self.follows:
+        if kind == self.follows or self.camera not in ('moving', 'fixed'):
             return self
+        if self.camera == 'fixed':
+            view = exmr_camera_policy(project, kind=kind)
+            if view is None or isinstance(view, str):
+                return self
+            return dataclasses.replace(self, rotation=np.broadcast_to(view[0], self.rotation.shape).copy(),
+                                       translation=np.broadcast_to(view[1], self.translation.shape).copy(),
+                                       follows=kind if kind and kind.startswith('corrected_') else None)
         delta = correction_root_delta(project, kind, len(self.paired)) if kind else None
         if delta is None:
             return dataclasses.replace(self, translation=self.paired, follows=None)
@@ -165,37 +173,24 @@ def load_exmr(project, kind=None):
         from ..project_storage import source_video
         video = Path(source_video(project))
     fps = float(read_json(project / 'project.json').get('fps', 30))
-    policy = exmr_camera_policy(project, rotation[0], translation[0])
+    policy = exmr_camera_policy(project, kind=kind)
     if policy == 'moving':
         return Observation(keypoints, rotation, translation, K, video, fps, 'moving', None, translation).follow(project, kind)
     if policy is not None:
         fixed_rotation, fixed_translation = policy
         rotation = np.broadcast_to(fixed_rotation, rotation.shape).copy()
         translation = np.broadcast_to(fixed_translation, translation.shape).copy()
-        return Observation(keypoints, rotation, translation, K, video, fps, 'fixed')
+        return Observation(keypoints, rotation, translation, K, video, fps, 'fixed', kind if kind and kind.startswith('corrected_') else None)
     return Observation(keypoints, rotation, translation, K, video, fps)
 
 
-def exmr_camera_policy(project, rotation0, translation0):
+def exmr_camera_policy(project, kind=None):
     """'moving', the static camera (R, t) the GUI camera view projects with, or None without a saved camera policy.
 
-    As camera_tracks.load: the take's frame-0 pairing turned into the scene camera frame, at a fixed centre, with the ExMR
-    camera rotation (constant for a static camera)."""
-    import numpy as np
-    try:
-        sources = read_json(project / 'exmr_camera_sources.json')
-        root = (project / sources['root']).resolve()
-        if not read_json(root / 'exmr_camera.json')['identity']['static']:
-            return 'moving'
-        r = np.asarray(np.load(root / 'exmr_camera.npy', allow_pickle=False)[int(sources['first'])], np.float64)
-        reference = np.asarray(sources['reference_rotation'], np.float64)
-        align = reference @ np.asarray(sources['first_rotation'], np.float64).T
-    except (OSError, ValueError, KeyError, IndexError, TypeError):
-        return None
-    base_rotation, base_translation = align @ rotation0, align @ translation0
-    centre = -base_rotation.T @ base_translation
-    rotation = r @ reference.T @ base_rotation
-    return rotation, -rotation @ centre
+    The one static camera every consumer shares (camera_reference.exmr_view: median of all frame pairings, following the root
+    change of corrected result `kind`)."""
+    from ..camera_reference import exmr_view
+    return exmr_view(project, kind)
 
 
 def correction_root_delta(project, kind, count):

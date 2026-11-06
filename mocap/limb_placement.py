@@ -7,6 +7,7 @@ Depth is not observable in one view: a prior keeps the middle and end joints nea
 """
 import math
 import time
+from pathlib import Path
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 from scipy.optimize import least_squares
@@ -101,10 +102,26 @@ class Camera:
         self.transform = np.eye(4) if transform is None else np.asarray(transform, float)
 
     @classmethod
-    def load(cls, project, pelvis, transform=None):
+    def load(cls, project, pelvis, transform=None, roots=None):
+        """The cameras review projects with: a static ExMR take's one fixed camera (camera_reference.exmr_view), else per-frame
+        pairings. Both follow the change of `roots` (correction frame) from the original root, as review's camera follows the
+        corrected result's."""
+        from .camera_reference import exmr_view
         from .foot_articulation import Views
         views = Views.load(project, pelvis, transform)
-        return cls(views.keypoints, views.rotation, views.translation, views.K, views.transform)
+        rotation, translation = views.rotation, views.translation
+        delta = None
+        if roots is not None:
+            with np.load(Path(project) / 'initial_joints.npz', allow_pickle=False) as data:
+                original = np.asarray(data['joints'][:, 0], float)
+            local = (np.asarray(roots, float) - views.transform[:3, 3]) @ views.transform[:3, :3]
+            delta = local - original if local.shape == original.shape == translation.shape else None
+        view = exmr_view(project, shift=delta)
+        if isinstance(view, tuple):
+            rotation = np.broadcast_to(view[0], rotation.shape).copy(); translation = np.broadcast_to(view[1], translation.shape).copy()
+        elif view == 'moving' and delta is not None:
+            translation = translation - np.einsum('fij,fj->fi', rotation, delta)
+        return cls(views.keypoints, rotation, translation, views.K, views.transform)
 
     def camera(self, points, frames):
         local = (np.asarray(points, float) - self.transform[:3, 3]) @ self.transform[:3, :3]
@@ -372,7 +389,7 @@ def from_store(project, base, context, rest, out_roots, out_quats, fps, segments
     camera = None
     if any(e['enabled'] for e in entries):
         try:
-            camera = Camera.load(project, np.asarray(rest, float)[0], transform)
+            camera = Camera.load(project, np.asarray(rest, float)[0], transform, out_roots)
             if len(camera.keypoints) != len(out_roots):
                 camera = None
         except (OSError, KeyError, ValueError, RuntimeError, TypeError):

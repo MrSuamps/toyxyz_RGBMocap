@@ -31,18 +31,21 @@ class ReviewCameraTest(unittest.TestCase):
     def tearDown(self):
         self.folder.cleanup()
 
-    def test_static_camera_is_the_frame_zero_pairing(self):
-        write_camera(self.project, True)
-        rotation, translation = review.exmr_camera_policy(self.project, self.rotation[0], self.translation[0])
-        np.testing.assert_allclose(rotation, self.rotation[0])
-        np.testing.assert_allclose(translation, self.translation[0])
+    def test_static_camera_is_the_shared_static_camera(self):
+        from mocap.camera_reference import exmr_view
+        from test_static_camera import write_take
+        camera, centre, *_ = write_take(self.project)
+        rotation, translation = review.exmr_camera_policy(self.project)
+        np.testing.assert_array_equal(rotation, exmr_view(self.project)[0])
+        np.testing.assert_allclose(rotation, camera, atol=1e-9)
+        np.testing.assert_allclose(-rotation.T @ translation, centre, atol=1e-9)
 
     def test_missing_policy_keeps_per_frame_cameras(self):
-        self.assertIsNone(review.exmr_camera_policy(self.project, self.rotation[0], self.translation[0]))
+        self.assertIsNone(review.exmr_camera_policy(self.project))
 
     def test_moving_camera_follows_the_corrected_root(self):
         write_camera(self.project, False)
-        self.assertEqual(review.exmr_camera_policy(self.project, self.rotation[0], self.translation[0]), 'moving')
+        self.assertEqual(review.exmr_camera_policy(self.project), 'moving')
         joints = np.random.default_rng(1).normal(size=(4, 22, 3))
         corrected = joints.copy()
         corrected[:, :, 1] -= np.linspace(0, 0.4, 4)[:, None]

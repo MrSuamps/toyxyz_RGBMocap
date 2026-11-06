@@ -6,7 +6,7 @@ from PySide6.QtCore import QThread,Signal,Qt,QPointF
 from PySide6.QtGui import QPainter,QPen,QColor
 from PySide6.QtWidgets import QDoubleSpinBox
 from .viewer import VideoView
-from .camera_tracks import at,load,centers
+from .camera_tracks import at,load,centers,projection
 
 BACKGROUND_HELP='Refine saved camera rotation using background features. Only validated corrections up to 2 degrees are applied. Unreliable samples retain the original camera. CPU processing; no motion re-inference or camera-position correction. Off keeps the original tracking.'
 
@@ -90,7 +90,10 @@ class CameraCanvas(VideoView):
         cameras=tool.data['cameras'];camera=cameras[min(max(0,ci),len(cameras)-1)]
         # Approximate displacement is a camera-gizmo aid, not a replacement for
         # the saved projection used to inspect the source/correction overlay.
-        matrix=at(camera,view.scene_time,0)
+        # A moving ExMR take projects through its per-frame pairing, as review and the Blender export; Refine Camera
+        # Rotation keeps its refined rotation track (as the export does).
+        refined='background_report' in tool.data or tool.data.get('background_pending')
+        matrix=at(camera,view.scene_time,0) if refined else projection(camera,view.scene_time)
         self.pair=(camera,matrix,list(actors(view)) if ready else []);self.pair_index=view.index if ready else None
         self.frame=source.frame;self.source_size=source.source_size;self.index=source.index;self.update();source.update()
     def paintEvent(self,event):

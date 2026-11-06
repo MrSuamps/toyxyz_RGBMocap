@@ -317,17 +317,14 @@ airborne intervals, and split anchors when the source intentionally travels.
 
 
 def static_camera_centre(project,source,pelvis):
-    """World centre of the one fixed camera the GUI camera view uses for a static ExMR take (frame-0 pairing), else None."""
-    try:
-        sources=json.loads((project/'exmr_camera_sources.json').read_text(encoding='utf-8'))
-        policy=json.loads(((project/sources['root']).resolve()/'exmr_camera.json').read_text(encoding='utf-8'))
-        if not policy['identity']['static']:return None
-        world,incam=source['smpl_params_global'],source['smpl_params_incam']
-    except (OSError,ValueError,KeyError,TypeError):return None
-    rotation=lambda params:Rotation.from_rotvec(params['global_orient'][0].numpy()).as_matrix()
-    paired=rotation(incam)@rotation(world).T
-    centre=world['transl'][0].numpy()+pelvis-paired.T@(incam['transl'][0].numpy()+pelvis)
-    return np.asarray(centre,float) if np.isfinite(centre).all() else None
+    """World centre of the one fixed camera every consumer projects a static ExMR take with (scene_camera.static_paired_camera), else None."""
+    from .scene_camera import exmr_static,static_paired_camera
+    from .camera_reference import source_pairing_inputs
+    if not exmr_static(project):return None
+    try:matrix=static_paired_camera(*source_pairing_inputs(source),pelvis)
+    except (KeyError,TypeError,ValueError):return None
+    centre=-matrix[:3,:3].T@matrix[:3,3]
+    return centre if np.isfinite(centre).all() else None
 
 
 def camera_grounding(rest,roots,quats,probes,probabilities,fps,floor,preset,contact_ranges,centre,hold=None):
