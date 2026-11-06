@@ -48,8 +48,8 @@ def register(commands, common):
     p.add_argument('--project', required=True, metavar='P', help='workspace root, model project or person take')
     p.add_argument('--model', choices=MODELS, help='model inside a workspace root (default: its active model)')
     p.add_argument('--result', choices=sorted(RESULTS), metavar='KIND', help='result to render (default: the project selection)')
-    p.add_argument('--frames', metavar='A-B|A,B,C', help='video frames, inclusive, or a list (default: the self-contact intervals)')
-    p.add_argument('--step', type=int, default=1, metavar='N', help='render every Nth frame of A-B (default 1)')
+    p.add_argument('--frames', metavar='A-B|A,B,C', help='video frames: comma list of N and inclusive A-B, e.g. 0-40,88 (default: the self-contact intervals)')
+    p.add_argument('--step', type=int, default=1, metavar='N', help='render every Nth frame of each A-B (default 1)')
     p.add_argument('--views', default='camera,front,side,orbit', metavar='LIST', help=f'comma list of {", ".join(VIEWS)} (default: all)')
     p.add_argument('--compare', nargs='?', const='auto', choices=('auto', 'original', 'before-selfcontact'),
                    help='also draw the reference layer: original, before-selfcontact, or auto (before-selfcontact when current)')
@@ -59,7 +59,7 @@ def register(commands, common):
     p.add_argument('--size', type=int, default=LONG_SIDE, metavar='PX', help=f'long side of the camera view in pixels (default {LONG_SIDE})')
     p.add_argument('--sheet', action='store_true',
                    help='one comparison sheet per self-contact instead: per frame the video crop, then every layer over the same crop and '
-                        'in a close 3D view, with penetration depth and skin gap (--frames A-B or A,B,C; --compare defaults to original)')
+                        'in a close 3D view, with penetration depth and skin gap (--frames N, A-B or a list of them; --compare defaults to original)')
     p.add_argument('--add', action='append', default=[], metavar='LABEL=FILE',
                    help='--sheet: another result file (same params format, e.g. a saved grip-off result) as a column; repeatable')
     p.set_defaults(handler=cmd_render)
@@ -215,29 +215,34 @@ class Layer:
     kind: str | None          # project result kind, for the GUI mesh check
 
 
-def frame_list(value, count):
-    """--frames A,B,C as sorted unique frames, or None for any other value."""
-    if not value or ',' not in str(value):
-        return None
-    try:
-        frames = sorted({int(part) for part in str(value).split(',') if part.strip()})
-    except ValueError:
-        raise CliError('--frames expects A-B or A,B,C video frame numbers', EXIT_USAGE) from None
-    if not frames or frames[0] < 0 or frames[-1] >= count:
-        raise CliError(f'--frames {value}: frames must lie in 0-{count - 1}', EXIT_USAGE)
-    return frames
-
-
-def parse_frames(value, count):
+def frame_items(value, count):
+    """--frames 'N' / 'A-B' items of a comma list as inclusive (first, last) pairs in the given order, or None without --frames."""
     if value is None:
         return None
-    try:
-        first, last = (int(part) for part in str(value).split('-', 1))
-    except ValueError:
-        raise CliError('--frames expects A-B or A,B,C video frame numbers, e.g. 380-420', EXIT_USAGE) from None
-    if first < 0 or last < first or last >= count:
-        raise CliError(f'--frames {value}: expected 0 <= A <= B <= {count - 1}', EXIT_USAGE)
-    return first, last
+    items = []
+    for part in str(value).replace(' ', '').split(','):
+        if not part:
+            continue
+        try:
+            bounds = [int(x) for x in part.split('-')]
+            if len(bounds) > 2:
+                raise ValueError
+        except ValueError:
+            raise CliError('--frames expects N, A-B or a comma list of them (video frame numbers), e.g. 380-420 or 0-40,88-108', EXIT_USAGE) from None
+        first, last = bounds[0], bounds[-1]
+        if first < 0 or last < first or last >= count:
+            raise CliError(f'--frames {part}: expected 0 <= A <= B <= {count - 1}', EXIT_USAGE)
+        items.append((first, last))
+    if not items:
+        raise CliError('--frames expects at least one video frame, e.g. 380-420 or 0-40,88-108', EXIT_USAGE)
+    return items
+
+
+def frame_list(value, count, step=1):
+    """--frames given as a comma list: its sorted unique frames, every `step`th inside each A-B; None for any other value."""
+    if not value or ',' not in str(value):
+        return None
+    return sorted({f for first, last in frame_items(value, count) for f in range(first, last + 1, step)})
 
 
 def contact_tracks(project, kind, frames, fps):
@@ -604,8 +609,9 @@ def cmd_render(args, session):
     count = len(layers[-1].state['joints'])
     tracks, note = contact_tracks(project, kind, count, fps)
     note = ' '.join(filter(None, (compare_note, note)))
-    listed = frame_list(args.frames, count)
-    frames = (listed[0], listed[-1]) if listed else parse_frames(args.frames, count)
+    items = frame_items(args.frames, count)
+    listed = frame_list(args.frames, count, args.step)
+    frames = (listed[0], listed[-1]) if listed else items and items[0]
     if frames is None:
         spans = [r for t in tracks for r in t['ranges']]
         if not spans:
@@ -680,7 +686,7 @@ def cmd_render(args, session):
     videos_written = [movie.close() for movie in movies.values()]
     seconds = round(time.monotonic() - clock, 2)
     report = dict(version=1, command='render', project=str(project), model=model, result=kind, frames=[frames[0], frames[1]],
-                  **({'frame_list': listed} if listed else {'step': args.step}),
+                  **({'frame_list': listed} if listed else {}), **({'step': args.step} if not listed or any(a < b for a, b in items) else {}),
                   views=views, camera=camera_note, layers=[dict(label=l.label, role=l.role, kind=l.kind) for l in layers],
                   geometry=geometry(body) + '; not the bound display skin',
                   gui_mesh_max_error_m=checks, tracks=[dict(id=t.get('id'), effector=t['effector'], target=t['target'], ranges=t['ranges'])
@@ -714,25 +720,30 @@ def spread(frames, count=SHEET_FRAMES):
 
 
 def sheet_frames(value, ranges, count, automatic=()):
-    """(frames, outside) of one contact's sheet. The hold is the contact's ranges, else its suggested ranges (end-exclusive).
-    SHEET_FRAMES frames spread over the hold's frames, within --frames A-B when given; --frames A,B,C keeps the listed frames
-    inside the hold. When no requested frame is inside it, the requested frames are drawn and listed in `outside` (rows
-    marked out of the hold). None without --frames for a contact that has no hold."""
+    """(frames, outside) of sheet_selection."""
+    selection = sheet_selection(value, ranges, count, automatic)
+    return selection and selection[:2]
+
+
+def sheet_selection(value, ranges, count, automatic=()):
+    """(frames, outside, dropped) of one contact's sheet. The hold is the contact's ranges, else its suggested ranges (end-exclusive).
+    SHEET_FRAMES frames spread over the hold's frames; with --frames each A-B item adds SHEET_FRAMES of the hold's frames inside
+    it and each N item adds N when it is inside the hold. When no requested frame is inside it, the requested frames (N, or
+    SHEET_FRAMES spread over A-B) are drawn and listed in `outside` (rows marked out of the hold); otherwise those outside the
+    hold are left out and listed in `dropped`. None without --frames for a contact that has no hold."""
     spans = list(ranges) or list(automatic)
     held = sorted({f for a, b in spans for f in range(max(int(a), 0), min(int(b), count))})
     if not value:
-        return (spread(held), []) if held else None
-    listed = frame_list(value, count)
-    if listed is None:
-        first, last = parse_frames(value, count)
+        return (spread(held), [], []) if held else None
+    hold = set(held)
+    picked, rest = set(), set()
+    for first, last in frame_items(value, count):
         requested = list(range(first, last + 1))
-    else:
-        requested = listed
-    inside = sorted(set(requested) & set(held))
-    if inside:
-        return (inside if listed else spread(inside)), []
-    picked = listed or spread(requested)
-    return picked, picked
+        inside = [f for f in requested if f in hold]
+        (picked if inside else rest).update(spread(inside or requested))
+    if picked:
+        return sorted(picked), [], sorted(rest)
+    return sorted(rest), sorted(rest), []
 
 
 def crop_camera(obs, frame, box, tile):
@@ -928,23 +939,26 @@ def cmd_sheet(args, session, project, model, kind, started):
         note = ' '.join(filter(None, (note, f'{model} saves no COCO-63 hand keypoints, so the sheet leaves out the video hand direction '
                                             '(green arrow and angle) and sizes each crop from the model.')))
         session.info('Note: ' + note)
-    plans = [(track, sheet_frames(args.frames, track['ranges'], count, track.get('automatic', ()))) for track in tracks]
+    plans = [(track, sheet_selection(args.frames, track['ranges'], count, track.get('automatic', ()))) for track in tracks]
     track_name = lambda track: track.get('id') or f"{track['effector']}-{track['target']}"
     skipped = [track_name(track) for track, frames in plans if frames is None]
     plans = [(track, *frames) for track, frames in plans if frames is not None]
     if skipped:
         note = ' '.join(filter(None, (note, f"Skipped {', '.join(skipped)}: no frame ranges or suggestions (pass --frames).")))
         session.info('Note: ' + note)
-    outside = [track_name(track) for track, _, out_of_hold in plans if out_of_hold]
+    outside = [track_name(track) for track, _, out_of_hold, _ in plans if out_of_hold]
     if outside:
         note = ' '.join(filter(None, (note, f"No --frames inside the hold of {', '.join(outside)}: those rows are marked 'outside the hold'.")))
         session.info('Note: ' + note)
+    for track, _, _, dropped in plans:
+        if dropped:
+            session.info(f"Note: {track_name(track)}: left out --frames {', '.join(map(str, dropped))} (outside its hold; sheet.json dropped_outside_hold).")
     if not plans:
         raise CliError('No self-contact frame ranges to make a sheet for; pass --frames A-B.', EXIT_USAGE)
-    videos = read_frames(obs[0].video, {f for _, frames, _ in plans for f in frames})
+    videos = read_frames(obs[0].video, {f for _, frames, _, _ in plans for f in frames})
     out.mkdir(parents=True, exist_ok=True)
     written = []
-    for track, frames, out_of_hold in plans:
+    for track, frames, out_of_hold, _ in plans:
         missing = [f for f in frames if f not in videos]
         if missing:
             raise CliError(f'The video has no frame {missing[0]}.')
@@ -954,7 +968,8 @@ def cmd_sheet(args, session, project, model, kind, started):
         written.append(str(path))
         session.info(f'  {path.name}')
     report = dict(version=1, command='render', sheet=True, project=str(project), result=kind, layers=[l.label for l in layers],
-                  frames={t.get('id'): f for t, f, _ in plans}, outside_hold={t.get('id'): o for t, _, o in plans if o},
+                  frames={t.get('id'): f for t, f, _, _ in plans}, outside_hold={t.get('id'): o for t, _, o, _ in plans if o},
+                  dropped_outside_hold={t.get('id'): d for t, _, _, d in plans if d},
                   images=written, note=note or None, camera=obs[-1].describe(),
                   geometry=geometry(body), seconds=round(time.monotonic() - started, 2))
     (out / 'sheet.json').write_text(json.dumps(report, indent=1), encoding='utf-8')

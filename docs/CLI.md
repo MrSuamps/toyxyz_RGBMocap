@@ -341,9 +341,9 @@ change, and `images\compare_delta_<layer>.png` (one column per frame, white tick
 ## Render bodies
 
 ```
-rgbmocap-cli.cmd render --project P [--model M] [--result KIND] [--frames A-B|A,B,C] [--step N] [--views camera,front,side,orbit]
+rgbmocap-cli.cmd render --project P [--model M] [--result KIND] [--frames A-B,C,...] [--step N] [--views camera,front,side,orbit]
                         [--compare [original|before-selfcontact]] [--focus BONE,BONE] [--out DIR] [--mp4] [--size PX]
-rgbmocap-cli.cmd render --project P --sheet [--frames A-B|A,B,C] [--compare original|before-selfcontact] [--add LABEL=FILE] [--out DIR]
+rgbmocap-cli.cmd render --project P --sheet [--frames A-B,C,...] [--compare original|before-selfcontact] [--add LABEL=FILE] [--out DIR]
 ```
 
 Draws the model's own mesh (the GUI Mesh view geometry, never the bound display skin) with a software rasteriser, so it
@@ -354,8 +354,9 @@ static camera, per frame for a moving one following each layer's own correction;
 saved camera, `flow_camera.npz` rotation about the placement's fixed centre or GVHMR's frame-0 paired camera, the same for
 every layer), `front` and `side` from the body's mean heading (one camera for all layers, centred between them and far
 enough for both, so a correction that moved the root still fits), and `orbit`, four close views around each
-self-contact (or `--focus`), each layer's row centred on its own contact. `--frames` takes `A-B` (every `--step`th
-frame) or a list `A,B,C`. `--compare` puts the reference layer (grey) beside the result (orange); without a value it picks
+self-contact (or `--focus`), each layer's row centred on its own contact. `--frames` takes a comma list of frames `N` and
+inclusive ranges `A-B`, for example `380-420`, `0,23,99` or `0-40,88-108`; `--step` renders every Nth frame inside each
+range. `--compare` puts the reference layer (grey) beside the result (orange); without a value it picks
 `before-selfcontact` when that file is current (its stat matches `<kind>_correction.json` and the result is not stale),
 else `original`, with a note when an outdated file was skipped. A red line marks each self-contact with its palm-to-target
 distance. Without `--frames` the self-contact intervals plus 10 frames are rendered. Writes `<view>_f<frame>.png`,
@@ -371,9 +372,11 @@ view of the touching limbs only (90 deg from the camera, from the side the hand 
 contact). Each tile states the hand's depth inside the target or the skin gap, the arm's depth inside the target, and the
 angle between the model's wrist-to-knuckle direction (magenta arrow) and the video's (green). Frames are taken per track
 from its hold (its ranges, else its suggested ranges): by default four frames spread over the hold's frames (not the gaps
-between ranges), with `--frames A-B` four of the hold's frames inside A-B, with `A,B,C` those of the listed frames inside
-the hold. When none of the requested frames is in a track's hold, its sheet shows them with the rows marked "outside the
-hold" (`sheet.json` `outside_hold`). Before is `--compare` (default `original`); `--add LABEL=FILE` adds another result file in the same params
+between ranges); with `--frames` each `A-B` adds four of the hold's frames inside A-B and each `N` adds N when it is in the
+hold (`--step` is not used). When none of the requested frames is in a track's hold, its sheet shows them (each `N`, four
+spread over each `A-B`) with the rows marked "outside the hold" (`sheet.json` `outside_hold`). Otherwise those outside the
+hold are left out of that sheet: one console note per track names them, and `sheet.json` `dropped_outside_hold` lists them
+per track. Before is `--compare` (default `original`); `--add LABEL=FILE` adds another result file in the same params
 format (for example a saved grip-off result) as a column, repeatable. Writes `sheet_<id>_f<first>-<last>.png` and
 `sheet.json` into `--out` (default `<model project>\render\<result>-sheet-<time>\`). The video hand direction needs
 ExMR's COCO-63 keypoints: FlowHMR saves no 2D keypoints and GVHMR's are COCO-17 without hands, so for them the green
