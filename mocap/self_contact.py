@@ -135,11 +135,16 @@ CAPSULE_COST_PER_M = 3000.
 CAPSULE_BONES = {'thigh': ((1, 4), (2, 5)), 'shin': ((4, 7), (5, 8)), 'foot': ((7, 10), (8, 11)), 'upperarm': ((16, 18), (17, 19)),
                  'forearm': ((18, 20), (19, 21)), 'torso': (0, 12), 'head': (12, 15)}
 # Contact anchor: candidate radius around the target joint, weight of the source-palm distance when the video sees the hand,
-# the cost (m) of a candidate facing straight away from the camera, and the weight of its rest distance to the target joint.
+# the cost (m) of a candidate facing straight away from the camera (a hand the video sees is not behind the limb), and the
+# weight of its rest distance to the target joint.
 ANCHOR_RADIUS_M = .15
 ANCHOR_SOURCE_WEIGHT = .25
-ANCHOR_VISIBLE_M = .03
+ANCHOR_VISIBLE_M = .1
 ANCHOR_JOINT_WEIGHT = .1
+# A palm laid on a held limb wraps its fingers across it (HAND_WRAP_WEIGHT): per degree between that wrapped hand and the
+# video wrist->knuckle direction a limb candidate costs this (m), so the anchor is one where the hand can point as in the video.
+ANCHOR_WRAP_M_PER_DEG = .001
+LIMB_PARTS = LEG_PARTS + ('Arm', 'ForeArm')
 # Grip off keeps the hand's world rotation and touches with its nearest skin (palm, back, knuckles) unless confident video
 # hand keypoints see the source hand pointing further than this away (median deg); then the palm is laid on the skin.
 KEEP_HAND_VIDEO_DEG = 30.
@@ -974,7 +979,8 @@ def skin_anchor(skin, rest, root, quat, rows, h, tj, part, side, palm, video=Non
     Candidates are skin vertices of the target segments within ANCHOR_RADIUS_M of the target joint; each costs its median
     distance to the source palm (ANCHOR_SOURCE_WEIGHT of it when the video sees the hand), plus, on frames with hand
     keypoints, the aligned 2D distance of the palm placed there to the video palm and a cost for facing away from the
-    camera (a hand seen in the video is on the visible side). Returns (joint, local offset (3,), local normal (3,), report).
+    camera (a hand seen in the video is on the visible side); on a limb also the angle of a hand wrapped across it there to
+    the video hand (anchor_wrap_deg). Returns (joint, local offset (3,), local normal (3,), report).
     """
     from .correction import fk
     names = segment_names(part, side)[:2]
@@ -991,7 +997,7 @@ def skin_anchor(skin, rest, root, quat, rows, h, tj, part, side, palm, video=Non
     points = np.concatenate(points, 1); normals = np.concatenate(normals, 1)
     goal = points + normals * SKIN_STANDOFF_M
     source = np.median(np.linalg.norm(goal - palm[pick, None], axis=-1), 0)
-    seen = np.zeros(len(pick), bool); video_cost = visible_cost = np.zeros(len(owners))
+    seen = np.zeros(len(pick), bool); video_cost = visible_cost = wrap = np.zeros(len(owners))
     if video is not None:
         j, _ = fk(rest, root[pick], quat[pick])
         centre, confidence, offset, torso = video_palms(video, h, rows[pick], j)
@@ -1005,8 +1011,14 @@ def skin_anchor(skin, rest, root, quat, rows, h, tj, part, side, palm, video=Non
         cam = np.einsum('tij,tpj->tpi', video.rotation[r], (goal[seen] - video.transform[:3, 3]) @ R) + video.translation[r][:, None]
         facing = -(np.einsum('tij,tpj->tpi', video.rotation[r], normals[seen] @ R) * unit(cam)).sum(-1)
         visible_cost = w @ (np.maximum(-facing, 0) * ANCHOR_VISIBLE_M)
+        if part in LIMB_PARTS:
+            from .correction import PARENTS
+            bones = [int(np.argmax(skin.weights[skin.groups[name][i], :22])) for name, i in owners]
+            ends = np.array([(k, CHILD[k]) if k in CHILD else (PARENTS[k], k) for k in bones])
+            limb = j[seen][:, ends[:, 1]] - j[seen][:, ends[:, 0]]
+            wrap = anchor_wrap_deg(video, h, r, w, goal[seen], normals[seen], limb)
     near = np.linalg.norm(np.concatenate([skin.shaped[skin.groups[name][[i]]] for name, i in owners]) - skin.rest[tj], axis=1)
-    cost = (ANCHOR_SOURCE_WEIGHT if seen.any() else 1.) * source + video_cost + visible_cost + ANCHOR_JOINT_WEIGHT * near
+    cost = (ANCHOR_SOURCE_WEIGHT if seen.any() else 1.) * source + video_cost + visible_cost + ANCHOR_WRAP_M_PER_DEG * wrap + ANCHOR_JOINT_WEIGHT * near
     best = int(np.argmin(cost)); name, vertex = owners[best]
     global_id = skin.groups[name][vertex]
     joint = int(np.argmax(skin.weights[global_id, :22]))
@@ -1021,7 +1033,19 @@ def skin_anchor(skin, rest, root, quat, rows, h, tj, part, side, palm, video=Non
                   video_frames=int(seen.sum()), cost_m=dict(total=float(cost[best]), source=float(source[best]),
                   video=float(np.asarray(video_cost)[best]) if seen.any() else None,
                   visible=float(np.asarray(visible_cost)[best]) if seen.any() else None))
+    if seen.any() and part in LIMB_PARTS:report.update(wrap_deg=float(wrap[best]))
     return joint, np.median(local, 0), local_normal, report
+
+
+def anchor_wrap_deg(video, h, rows, weights, goal, normals, limb):
+    """Per candidate (p,): weighted mean over frames rows (m,) of the 2D angle (deg, 0-90, either finger direction) between a
+    hand wrapped across the limb at goal (fingers along normal x limb; goal, normals, limb (m, p, 3)) and the video wrist ->
+    middle-knuckle direction. A wrapped hand seen end-on (projected under a quarter of the video hand) counts 90."""
+    kp = video.hand(h, rows)[0]; d = kp[:, 1] - kp[:, 0]
+    tip = video.project(goal + unit(np.cross(normals, limb)) * .08, rows) - video.project(goal, rows)
+    angle = angle_2d(tip, d[:, None]); angle = np.minimum(angle, 180 - angle)
+    short = np.linalg.norm(tip, axis=-1) < .25 * np.linalg.norm(d, axis=-1)[:, None]
+    return weights @ np.where(short, 90., angle)
 
 
 def hand_touch(skin, rest, root, quat, rows, h, part, side, offsets, video=None, step=2):

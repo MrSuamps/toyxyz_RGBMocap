@@ -411,7 +411,8 @@ edits and shared with the app. The project needs a corrected result first (`corr
 - How `correct` solves a track: with grip off and an automatic contact point the hand keeps its captured world rotation and
   touches with its skin nearest the target (palm, back of the hand, knuckles or fingertips), at the target skin point
   nearest that; when confident video hand keypoints see the captured hand pointing more than 30 deg away, the palm is laid
-  on the skin instead (as grip auto). A hold whose hand skin already lies within 1.5 cm of the target skin (and less than
+  on the skin instead (as grip auto); on an arm or leg target that point is chosen where a hand wrapped across the limb
+  points like the video hand, on the side the camera sees. A hold whose hand skin already lies within 1.5 cm of the target skin (and less than
   1 cm inside) on every frame is left as captured (`skipped` in `list`). On every path the wrist is kept inside its range
   and the elbow twist within 80 deg (the forearm takes part of the roll, the rest turns the hand as little as needed) and
   the elbow flexes at most 150 deg about its hinge: a goal nearer the shoulder leaves the hand short instead of folding the
