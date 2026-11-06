@@ -356,16 +356,31 @@ def check_limbs(pose, frames, fps):
     return issues
 
 
+def elbow_twist(local, rest, shoulder, elbow, wrist, axis):
+    """Signed elbow twist (degrees) about the rest forearm after undoing the flexion about the hinge (`axis` in the upper arm
+    frame, `mixamo_rig.HINGES`). The SMPL rest forearm lies ~20 deg off the hinge plane, so a plain swing-twist split reads a
+    pure 150 deg bend as 50-105 deg of twist."""
+    from scipy.spatial.transform import Rotation
+    u, t = unit(rest[elbow] - rest[shoulder]), unit(rest[wrist] - rest[elbow])
+    a = orthogonal(np.asarray(axis, np.float64), u)
+    v = np.asarray(local, np.float64) @ t
+    flex = np.arctan2(np.cross(u, v) @ a, v @ u) - np.arctan2(np.cross(u, t) @ a, t @ u)
+    unbent = Rotation.from_rotvec(-flex[..., None] * a).as_matrix() @ local
+    return swing_twist(unbent, t)[1]
+
+
 def joint_twists(pose):
-    """{name: (kind, joint, signed twist degrees)} for hips, knees, shoulders, elbows (about their child segment) and wrists
-    (about the forearm)."""
+    """{name: (kind, joint, signed twist degrees)} for hips, knees, shoulders (about their child segment), elbows (about the
+    forearm, flexion removed) and wrists (about the forearm)."""
+    from ..mixamo_rig import HINGES
+    hinge = {middle: axis for _, middle, _, axis in HINGES}
     out = {}
     for side, (hip, knee, ankle), (shoulder, elbow, wrist) in zip(SIDES, ((1, 4, 7), (2, 5, 8)), ((16, 18, 20), (17, 19, 21))):
         out[f'{side}_hip'] = ('hip', hip, swing_twist(pose.local[:, hip], unit(pose.rest[knee] - pose.rest[hip]))[1])
         out[f'{side}_knee'] = ('knee', knee, swing_twist(pose.local[:, knee], unit(pose.rest[ankle] - pose.rest[knee]))[1])
         out[f'{side}_shoulder'] = ('shoulder', shoulder, swing_twist(pose.local[:, shoulder], unit(pose.rest[elbow] - pose.rest[shoulder]))[1])
         forearm = unit(pose.rest[wrist] - pose.rest[elbow])
-        out[f'{side}_elbow'] = ('elbow', elbow, swing_twist(pose.local[:, elbow], forearm)[1])
+        out[f'{side}_elbow'] = ('elbow', elbow, elbow_twist(pose.local[:, elbow], pose.rest, shoulder, elbow, wrist, hinge[elbow]))
         out[f'{side}_wrist'] = ('wrist', wrist, swing_twist(pose.local[:, wrist], forearm)[1])
     return out
 
