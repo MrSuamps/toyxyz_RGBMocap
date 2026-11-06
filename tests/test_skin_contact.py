@@ -2,6 +2,7 @@
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 from scipy.spatial.transform import Rotation
@@ -120,6 +121,11 @@ def synthetic_skin():
 
 
 class LoopTest(unittest.TestCase):
+    def setUp(self):
+        # These cases lay the palm on the skin, as when the video sees the captured hand pointing elsewhere.
+        patcher = mock.patch.object(sc, 'hand_touch', lambda *a, **k: (None, dict(mode='palm laid on the skin')))
+        patcher.start(); self.addCleanup(patcher.stop)
+
     def test_penetration_loop_pushes_the_hand_out(self):
         skin = synthetic_skin()
         root, q = clip()

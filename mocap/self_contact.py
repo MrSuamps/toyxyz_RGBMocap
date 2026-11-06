@@ -23,6 +23,9 @@ LEGS = ((1, 4, 7), (2, 5, 8))
 ARM_CONFIG = dict(elbow_limit_deg=90., collar_limit_deg=20., iterations=150)
 REACH_ELBOW_DEG = 165.
 ELBOW_MAX_DEG = 170.
+# Largest in-plane elbow flexion about the hinge (active range ~150 deg, AAOS); a goal nearer the shoulder leaves the hand
+# short instead of folding the forearm through the upper arm.
+ELBOW_FOLD_DEG = 150.
 KNEE_MAX_DEG = 170.
 RECIPROCAL_MARGIN_M = .01
 # Goals nearer the shoulder than the wrist widen the planner's elbow increment bound up to this, with a margin.
@@ -72,6 +75,8 @@ PART_SEGMENTS = {'Foot': ('foot', 'shin'), 'ToeBase': ('foot', 'shin'), 'Leg': (
 SKIN_STANDOFF_M = .002
 PUSH_MARGIN_M = .003
 PUSH_ITERATIONS = 4
+# Extra rounds of a hand without a laid palm: its turned wrist and a fast-moving target settle more slowly.
+PUSH_EXTRA_ROUNDS = 4
 PENETRATION_TOLERANCE_M = .002
 # A hand floating more than this off the skin is settled back onto it, by at most SETTLE_MAX_M past its anchor.
 SETTLE_GAP_M = .004
@@ -86,8 +91,12 @@ SWIVEL_WEIGHT = .02
 SWIVEL_STEP_WEIGHT = .2
 NEAR_M = .05
 ARM_CLEARANCE_M = .003
-# Forearm roll the elbow may take over from the wrist (anatomy review's elbow twist limit).
+# Share of the video upper-arm cost (video_arm_cost) in that swivel: ~1 mm of clearance per 8 deg of 2D upper-arm error.
+CLEAR_VIDEO_WEIGHT = .25
+# Forearm roll the elbow may take over from the wrist (anatomy review's elbow twist limit), measured after the hinge
+# flexion (elbow_parts); hand-search cost per degree past it, as UPPER_TWIST_WEIGHT for the shoulder.
 ELBOW_TWIST_DEG = 80.
+ELBOW_TWIST_WEIGHT = 2.
 # Elbow hinge axes in the shoulder (upper arm) frame, as limb_placement.CHAINS.
 ARM_HINGES = ((0., -1., 0.), (0., 1., 0.))
 # Hand search on a skin anchor (costs in degrees of wrist excess): hand roll candidates about the palm normal and arm swivel
@@ -131,6 +140,13 @@ ANCHOR_RADIUS_M = .15
 ANCHOR_SOURCE_WEIGHT = .25
 ANCHOR_VISIBLE_M = .03
 ANCHOR_JOINT_WEIGHT = .1
+# Grip off keeps the hand's world rotation and touches with its nearest skin (palm, back, knuckles) unless confident video
+# hand keypoints see the source hand pointing further than this away (median deg); then the palm is laid on the skin.
+KEEP_HAND_VIDEO_DEG = 30.
+# A hand whose skin already lies within these of the target skin on every frame of an automatic hold is left as captured
+# (review's contact_gap and self_penetration thresholds).
+TOUCH_GAP_M = .015
+TOUCH_DEPTH_M = .01
 
 
 def quat_matrix(q):
@@ -163,11 +179,13 @@ def interior(a, b, c):
     return np.rad2deg(np.arccos(np.clip(cos, -1, 1)))
 
 
-def ease_weights(lo, hi, a, b, ease):
-    """Smoothstep up over [a-ease, a), 1 on [a, b), down over [b, b+ease); every ease frame is strictly inside (0, 1)."""
+def ease_weights(lo, hi, a, b, ease, ease_out=None):
+    """Smoothstep up over [a-ease, a), 1 on [a, b), down over [b, b+ease_out) (default ease); every ease frame is strictly
+    inside (0, 1)."""
+    out = ease if ease_out is None else ease_out
     t = np.arange(lo, hi, dtype=float); x = np.ones(len(t))
     x[t < a] = (t[t < a] - (a - ease - 1)) / (ease + 1)
-    x[t >= b] = (b + ease - t[t >= b]) / (ease + 1)
+    x[t >= b] = (b + out - t[t >= b]) / (out + 1)
     x = np.clip(x, 0, 1)
     return x * x * (3 - 2 * x)
 
@@ -281,8 +299,24 @@ def solve_arms(rest, root, quat, prior, offsets, fps, first, goals, config):
     return np.asarray(out, float), report
 
 
-def clamp_elbows(rest, root, quat, hands, limits=None):
-    """Flex elbows straighter than their limit (deg, per hand scalar or per frame) about the hinge; keep wrist world rotation."""
+def hinge_flex(u, forearm, axis):
+    """In-plane elbow flexion (deg) of forearm directions (..., 3) in the shoulder frame about the hinge axis; a fold past 180
+    reads as more flexion, not as hyperextension (real hyperextension stays far below 90)."""
+    flex = np.rad2deg(np.arctan2(np.cross(u, forearm) @ axis, forearm @ u))
+    return np.where(flex < -90, flex + 360, flex)
+
+
+def elbow_flex(rest, quat, h):
+    """In-plane elbow flexion (deg, hinge_flex) of arm h on local quats (m, 22, 4)."""
+    from .mixamo_rig import align
+    _, shoulder, elbow, wrist = ARMS[h]; sign = 1 if h == 0 else -1
+    u = rest[elbow] - rest[shoulder]
+    return hinge_flex(u, quat_matrix(quat[:, elbow]) @ (rest[wrist] - rest[elbow]), align([sign, 0, 0], u) @ np.array([0., -sign, 0.]))
+
+
+def clamp_elbows(rest, root, quat, hands, limits=None, folds=None):
+    """Flex elbows straighter than their interior limit (deg, per hand scalar or per frame) and open elbows folded past their
+    in-plane flexion limit (folds, default ELBOW_FOLD_DEG) about the hinge; keep the wrist world rotation."""
     from .correction import fk
     from .mixamo_rig import align
     from .contact_arm_plan import align_many
@@ -290,16 +324,19 @@ def clamp_elbows(rest, root, quat, hands, limits=None):
     for h in hands:
         collar, shoulder, elbow, wrist = ARMS[h]; sign = 1 if h == 0 else -1
         limit = np.broadcast_to(ELBOW_MAX_DEG if limits is None else limits[h], (len(root),))
-        ids = np.flatnonzero(interior(j[:, shoulder], j[:, elbow], j[:, wrist]) > limit + 1e-6)
-        if not len(ids):continue
-        limit = limit[ids, None]
+        fold = np.broadcast_to(ELBOW_FOLD_DEG if folds is None else folds[h], (len(root),))
         u = rest[elbow] - rest[shoulder]; v0 = rest[wrist] - rest[elbow]
         axis = align([sign, 0, 0], u) @ np.array([0., -sign, 0.])
-        angles = np.deg2rad(np.linspace(-40, 40, 321)); bends = Rotation.from_rotvec(angles[:, None] * axis).as_matrix()
+        flexed = hinge_flex(u, local[:, elbow] @ v0, axis)
+        ids = np.flatnonzero((interior(j[:, shoulder], j[:, elbow], j[:, wrist]) > limit + 1e-6) | (flexed > fold + 1e-6))
+        if not len(ids):continue
+        limit = limit[ids, None]; fold = fold[ids, None]
+        angles = np.deg2rad(np.r_[np.linspace(-60, -40.25, 80), np.linspace(-40, 40, 321)]); bends = Rotation.from_rotvec(angles[:, None] * axis).as_matrix()
         forearm = np.einsum('kij,tjl,l->tki', bends, local[ids, elbow], v0)
         angle = 180 - np.rad2deg(np.arccos(np.clip(forearm @ u / np.linalg.norm(u) / np.linalg.norm(v0), -1, 1)))
-        cost = np.where(angle <= limit, np.abs(angles)[None], np.inf)
-        best = np.where(np.isfinite(cost.min(1)), cost.argmin(1), angle.argmin(1))
+        excess = np.maximum(angle - limit, 0) + np.maximum(hinge_flex(u, forearm, axis) - fold, 0)
+        cost = np.where(excess <= 1e-9, np.abs(angles)[None], np.inf)
+        best = np.where(np.isfinite(cost.min(1)), cost.argmin(1), excess.argmin(1))
         new_elbow = bends[best] @ local[ids, elbow]
         upper = g[ids, shoulder]
         old_end = np.einsum('tij,tj->ti', upper, u + np.einsum('tij,j->ti', local[ids, elbow], v0))
@@ -313,14 +350,18 @@ def clamp_elbows(rest, root, quat, hands, limits=None):
     return quat, clamped
 
 
-def blend(rest, root, start, solved, weights, joints, distal):
-    """Slerp local rotations of joints by weights, then restore the distal joints' world rotation from start."""
+def blend(rest, root, start, solved, weights, joints, distal, follow=()):
+    """Slerp local rotations of joints by weights, then restore the distal joints' world rotation from start; distal joints
+    in follow instead take the world rotation slerped from start to solved by the weights."""
     from .correction import fk, PARENTS
     out = start.copy()
     out[:, joints] = slerp(start[:, joints], solved[:, joints], weights[:, None])
     _, before_world = fk(rest, root, start); _, world = fk(rest, root, out)
+    after_world = fk(rest, root, solved)[1] if follow else None
     for d in distal:
-        out[:, d] = matrix_quat(world[:, PARENTS[d]].swapaxes(-1, -2) @ before_world[:, d])
+        target = before_world[:, d]
+        if d in follow:target = quat_matrix(slerp(matrix_quat(target), matrix_quat(after_world[:, d]), weights))
+        out[:, d] = matrix_quat(world[:, PARENTS[d]].swapaxes(-1, -2) @ target)
     return out
 
 
@@ -750,12 +791,13 @@ def arm_clearance(skin, root, quats, rows, arms, names, stride=3):
     return out
 
 
-def clear_arm(rest, skin, root, q, rows, h, names, arms, fps):
+def clear_arm(rest, skin, root, q, rows, h, names, arms, fps, video=None):
     """Swivel the elbow about the shoulder-wrist line where the forearm or upper arm comes closer than ARM_CLEARANCE_M to
     (or sinks into) the target limb, keeping the hand.
 
     Candidates are scored on the flagged frames (and a few around them) by the clearance shortfall plus a small cost per
-    degree; a Viterbi path over all frames keeps the swivel continuous. Returns (quats, swivel degrees (m,), frames that needed it).
+    degree (and with video the 2D upper-arm and elbow error, video_arm_cost); a Viterbi path over all frames keeps the swivel
+    continuous. Returns (quats, swivel degrees (m,), frames that needed it).
     """
     m = len(root)
     clear = arm_clearance(skin, root, [q], rows, arms, names)[0]
@@ -765,6 +807,16 @@ def clear_arm(rest, skin, root, q, rows, h, names, arms, fps):
     turned = [q[near] if degrees == 0 else swivel_arm(rest, root[near], q[near], h, np.full(len(near), degrees)) for degrees in SWIVELS_DEG]
     unary = np.abs(SWIVELS_DEG)[None] * SWIVEL_WEIGHT * np.ones((m, 1))
     unary[near] += 1000 * np.maximum(ARM_CLEARANCE_M - arm_clearance(skin, root[near], turned, rows[near], arms, names), 0).T
+    if video is not None:
+        # The video elbow keeps the swivel from swinging the elbow out where a little contact of the arm would do.
+        from .correction import fk
+        from .limb_placement import alignment
+        _, shoulder, elbow, _ = ARMS[h]
+        offset, torso = alignment(video, fk(rest, root, q)[0], rows)
+        for k, candidate in enumerate(turned):
+            jc = fk(rest, root[near], candidate)[0]
+            cost = video_arm_cost(video, h, rows[near], jc[:, shoulder], jc[:, elbow][:, None], (offset[near], torso[near]))
+            unary[near, k] += CLEAR_VIDEO_WEIGHT * cost[:, 0]
     path = viterbi(unary, SWIVEL_STEP_WEIGHT * np.abs(SWIVELS_DEG[:, None] - SWIVELS_DEG[None]))
     degrees = gaussian_filter1d(SWIVELS_DEG[path].astype(float), max(.5, fps * .05), mode='nearest')
     return swivel_arm(rest, root, q, h, degrees), degrees, int(bad.sum())
@@ -777,31 +829,64 @@ def twist_deg(local, axis):
     return np.rad2deg(2 * np.arctan2(q[:, :3] @ axis, q[:, 3])).reshape(np.shape(local)[:-2])
 
 
-def roll_forearm(rest, root, q, h, fps):
-    """Roll the forearm about its own bone (elbow local twist) where that brings the wrist into its limits; the wrist position
-    and world rotation are kept. SMPL shares pronation between elbow and wrist, so the elbow takes up to ELBOW_TWIST_DEG."""
+def elbow_hinge(rest, h):
+    """Unit elbow hinge in the shoulder (upper arm) frame, orthogonal to the rest upper arm (as anatomy's hinge_bend)."""
+    _, shoulder, elbow, _ = ARMS[h]
+    u = unit(rest[elbow] - rest[shoulder]); axis = np.asarray(ARM_HINGES[h], float)
+    return unit(axis - (axis @ u) * u)
+
+
+def elbow_parts(local, rest, h):
+    """(in-plane flexion, off-plane angle, forearm twist) degrees of elbow-local rotations (..., 3, 3).
+
+    Flexion is about the hinge (elbow_hinge, positive flexed, 180 folded back onto the upper arm), the off-plane angle is the
+    forearm's tilt out of the hinge plane, and the twist is the roll about the forearm left after the hinge flexion is
+    undone. The SMPL rest forearm is not orthogonal to the hinge (left ~20 deg), so a plain swing-twist about the rest forearm
+    reads a pure 150 deg hinge flexion as ~100 deg of twist.
+    """
+    _, shoulder, _, _ = ARMS[h]
+    a = elbow_hinge(rest, h); u = unit(rest[ARMS[h][2]] - rest[shoulder]); t = forearm_axis(rest, h)
+    local = np.asarray(local, float); v = local @ t
+    flex = np.rad2deg(np.arctan2(np.cross(u, v) @ a, v @ u))
+    relative = flex - np.rad2deg(np.arctan2(np.cross(u, t) @ a, t @ u))
+    off = np.rad2deg(np.arcsin(np.clip(v @ a, -1, 1)))
+    undo = Rotation.from_rotvec((-np.deg2rad(relative).reshape(-1))[:, None] * a).as_matrix().reshape(local.shape)
+    return flex, off, twist_deg(undo @ local, t)
+
+
+def roll_forearm(rest, root, q, h, fps, weights=None):
+    """Roll the forearm about its own bone (elbow local twist) where that brings the wrist into its limits or the elbow twist
+    (elbow_parts) back within ELBOW_TWIST_DEG; the wrist position and world rotation are kept. SMPL shares pronation between
+    elbow and wrist, so the roll is spread over both. weights (m,) scale the roll (ease frames)."""
     from .correction import fk
     _, g = fk(rest, root, q); _, _, elbow, wrist = ARMS[h]; t = forearm_axis(rest, h)
     local_e = quat_matrix(q[:, elbow]); local_w = g[:, elbow].swapaxes(-1, -2) @ g[:, wrist]
-    if rotation_angle(local_w, clamp_wrist(local_w, rest, h)).max() < .5:return q
+    twist = elbow_parts(local_e, rest, h)[2]
+    if rotation_angle(local_w, clamp_wrist(local_w, rest, h)).max() < .5 and np.abs(twist).max() <= ELBOW_TWIST_DEG:return q
     rolls = np.arange(-90., 91., 5.); spin = Rotation.from_rotvec(np.deg2rad(rolls)[:, None] * t).as_matrix()
-    elbow_twist = twist_deg(local_e[:, None] @ spin[None], t)
+    # A roll about the forearm adds to the elbow twist left after the hinge flexion.
+    elbow_twist = wrap_deg(twist[:, None] + rolls[None])
     turned = spin.swapaxes(-1, -2)[None] @ local_w[:, None]
-    cost = rotation_angle(turned, clamp_wrist(turned, rest, h)) + .02 * np.abs(rolls) + 10 * np.maximum(np.abs(elbow_twist) - ELBOW_TWIST_DEG, 0)
+    cost = rotation_angle(turned, clamp_wrist(turned, rest, h)) + .02 * np.abs(rolls) + 10 * np.maximum(elbow_twist - ELBOW_TWIST_DEG, 0)
     roll = gaussian_filter1d(rolls[viterbi(cost, .05 * np.abs(rolls[:, None] - rolls[None]))], max(.5, fps * .05), mode='nearest')
+    if weights is not None:roll = roll * weights
     spin = Rotation.from_rotvec(np.deg2rad(roll)[:, None] * t).as_matrix()
     out = q.copy(); out[:, elbow] = matrix_quat(local_e @ spin); out[:, wrist] = matrix_quat(spin.swapaxes(-1, -2) @ local_w)
     return out
 
 
-def limit_wrist_rows(rest, root, q, h, fps=None):
+def limit_wrist_rows(rest, root, q, h, fps=None, weights=None):
     """q with hand h's wrist-local rotations pulled into the wrist limits (an elbow swivel keeps the wrist world rotation),
-    first rolling the forearm when fps is given."""
+    first rolling the forearm when fps is given; weights (m,) blend each frame from q (0) to the limited pose (1)."""
     from .correction import fk
-    if fps is not None:q = roll_forearm(rest, root, q, h, fps)
+    if fps is not None:q = roll_forearm(rest, root, q, h, fps, weights)
     _, g = fk(rest, root, q); _, _, elbow, wrist = ARMS[h]
     local = g[:, elbow].swapaxes(-1, -2) @ g[:, wrist]
-    out = q.copy(); out[:, wrist] = matrix_quat(clamp_wrist(local, rest, h))
+    out = q.copy(); clamped = clamp_wrist(local, rest, h); rows = np.flatnonzero((clamped != local).any((1, 2)))
+    if weights is None:
+        out[:, wrist] = matrix_quat(clamped)
+    elif len(rows):
+        out[rows, wrist] = slerp(q[rows, wrist], matrix_quat(clamped[rows]), weights[rows])
     return out
 
 
@@ -818,20 +903,38 @@ def arm_groups(h, part, side):
     return groups + ([SIDES[h] + '_upperarm'] if part in LEG_PARTS or part in ('Head', 'Neck', 'Hand', 'ForeArm') else [])
 
 
-def hand_contact(skin, root, quat, rows, h, names, fingers=None, stride=1, group=None, arm=(), arm_names=None):
+def hand_contact(skin, root, quat, rows, h, names, fingers=None, stride=1, group=None, arm=(), arm_names=None, nearest=False):
     """Per frame against the named segments: (depth (m,), signed skin gap (m,), push (m, 3), arm depth (m,)) of hand h
-    (or `group`); arm depth is the deepest of the `arm` segments in `arm_names` (default: names)."""
+    (or `group`); arm depth is the deepest of the `arm` segments in `arm_names` (default: names). nearest adds the move (m, 3)
+    from the closest outside hand point to the skin (0 where none is near)."""
     group = group or SIDES[h] + '_hand'
     every = list(dict.fromkeys(list(names) + list(arm_names or ())))
     posed = skin.vertices(root, quat, rows, [group] + list(arm) + every, fingers)
-    m = len(root); depth = np.zeros(m); gap = np.full(m, np.nan); push = np.zeros((m, 3)); arm_depth = np.zeros(m)
+    m = len(root); depth = np.zeros(m); gap = np.full(m, np.nan); push = np.zeros((m, 3)); arm_depth = np.zeros(m); toward = np.zeros((m, 3))
     for t in range(m):
         parts = [posed[name][t, ::stride] for name in [group] + list(arm)]
         measured = distances(parts, {name: posed[name][t] for name in every}, skin.segments, every)
         r = combine([summarise(parts[0], *measured[0][every.index(name)]) for name in names], names)
         depth[t], gap[t], push[t] = r['depth'], signed_gap(r), r['push']
+        if r['point'] is not None:toward[t] = r['surface'] - r['point']
         if arm:arm_depth[t] = max(0., -min(part[every.index(name)][0].min(initial=np.inf) for part in measured[1:] for name in arm_names or names))
-    return depth, gap, push, arm_depth
+    return (depth, gap, push, arm_depth) + ((toward,) if nearest else ())
+
+
+def push_directions(vectors, active, fallback, fps):
+    """Unit directions (m, 3) of the per-frame vectors on active frames, smoothed in time; fallback (m, 3) elsewhere."""
+    v = np.where(active[:, None], unit(vectors), 0.); w = active.astype(float)
+    if active.any():v, w = (gaussian_filter1d(x, max(.5, fps * .05), axis=0, mode='nearest') for x in (v, w))
+    return np.where(((w > .5) & (np.linalg.norm(v, axis=1) > .3 * w))[:, None], unit(v), fallback)
+
+
+def arm_out_of_range(rest, root, q, h):
+    """Whether arm h's wrist leaves its limits or its elbow twist (elbow_parts) passes ELBOW_TWIST_DEG on any frame."""
+    from .correction import fk
+    _, g = fk(rest, root, q); _, _, elbow, wrist = ARMS[h]
+    local = g[:, elbow].swapaxes(-1, -2) @ g[:, wrist]
+    return bool(rotation_angle(local, clamp_wrist(local, rest, h)).max() > .5 or
+                np.abs(elbow_parts(quat_matrix(q[:, elbow]), rest, h)[2]).max() > ELBOW_TWIST_DEG + .5)
 
 
 def skin_offset(skin, root, quat, rows, h, part, side, base, frame, palm):
@@ -919,6 +1022,38 @@ def skin_anchor(skin, rest, root, quat, rows, h, tj, part, side, palm, video=Non
                   video=float(np.asarray(video_cost)[best]) if seen.any() else None,
                   visible=float(np.asarray(visible_cost)[best]) if seen.any() else None))
     return joint, np.median(local, 0), local_normal, report
+
+
+def hand_touch(skin, rest, root, quat, rows, h, part, side, offsets, video=None, step=2):
+    """The hand point that touches the target when a grip-off hand keeps its world rotation: (touch, report).
+
+    The touching point is the hand skin vertex (palm, back, side, knuckles or fingers) nearest the target skin over the interval
+    (median signed distance), so a fist or the back of a hand can rest on the body. touch holds that vertex's world points
+    (m, 3) and the palm point's offset from it in the wrist frame (shift_local_m). None when confident video hand keypoints see
+    the source hand pointing more than KEEP_HAND_VIDEO_DEG away (median): the palm is laid on the skin then.
+    """
+    from .correction import fk
+    j, g = fk(rest, root, quat); _, _, elbow, wrist = ARMS[h]
+    report = dict(mode='kept hand rotation')
+    if video is not None:
+        ok = video.hand(h, rows)[1] > 0
+        if ok.any():
+            local = g[ok, elbow].swapaxes(-1, -2) @ g[ok, wrist]
+            error = float(np.median(video_cost(skin.rest, h, g[ok, elbow], j[ok, wrist], g[ok, wrist], video, rows[ok], local[:, None])[1][:, 0]))
+            report.update(video_direction_error_median_deg=error, confident_frames=int(ok.sum()))
+            if error > KEEP_HAND_VIDEO_DEG:return None, dict(report, mode='palm laid on the skin (source hand off the video)')
+    group = SIDES[h] + '_hand'; names = segment_names(part, side)[:2]
+    posed = skin.vertices(root, quat, rows, [group] + names)
+    ids = np.arange(0, len(skin.groups[group]), step)
+    sd = np.stack([np.min([signed_distance(posed[group][t, ids], posed[name][t], skin.segments[name], .5)[0] for name in names], 0)
+                   for t in range(len(root))])
+    k = int(np.argmin(np.median(sd, 0))); points = posed[group][:, ids[k]]
+    palm = j[:, wrist] + np.einsum('tij,j->ti', g[:, wrist], offsets[h])
+    shift = np.median(np.einsum('tji,tj->ti', g[:, wrist], palm - points), 0)
+    vertex = int(skin.groups[group][ids[k]]); facing = (offsets[h] - shift) @ PALM_NORMAL
+    surface = 'fingers' if skin.weights[vertex].argmax() >= 25 else 'palm' if facing > .01 else 'back of the hand' if facing < -.01 else 'side of the hand'
+    report.update(vertex=vertex, surface=surface, source_gap_median_m=float(np.median(sd[:, k])), palm_offset_m=float(np.linalg.norm(shift)))
+    return dict(points=points, shift_local_m=shift), report
 
 
 def push_size(depth, weights, fps):
@@ -1164,9 +1299,12 @@ def arm_pose(rest, j, g, elbow_local, h, target, swivel):
     axis = unit(np.asarray(ARM_HINGES[h]) - (np.asarray(ARM_HINGES[h]) @ u) * u / (l1 * l1))
     v = bend @ fore; along = (v @ axis)[:, None] * axis; perp = v - along
     span = goal - S; d = np.linalg.norm(span, axis=1)
-    dc = np.clip(d, abs(l1 - l2) + 1e-3, (l1 + l2) * REACH_FRACTION)
-    # |u + R(axis, phi) v| = dc fixes the signed flexion phi about the hinge (positive = flexed, as limb_placement.bend).
-    cosine = (dc * dc - l1 * l1 - l2 * l2) / (2 * l1 * np.maximum(np.linalg.norm(perp, axis=1), 1e-9))
+    # |u + R(axis, phi) v| = dc fixes the signed flexion phi about the hinge (positive = flexed, as limb_placement.bend); the
+    # elbow folds no further than ELBOW_FOLD_DEG, so a goal nearer the shoulder leaves the hand short.
+    radius = np.maximum(np.linalg.norm(perp, axis=1), 1e-9)
+    folded = np.sqrt(np.maximum(l1 * l1 + l2 * l2 + 2 * l1 * radius * math.cos(math.radians(ELBOW_FOLD_DEG)), 0))
+    dc = np.maximum(np.clip(d, abs(l1 - l2) + 1e-3, (l1 + l2) * REACH_FRACTION), folded)
+    cosine = (dc * dc - l1 * l1 - l2 * l2) / (2 * l1 * radius)
     phi = np.arccos(np.clip(cosine, -1, 1)); phi0 = np.arctan2(np.cross(u, perp) @ axis, perp @ u)
     bend = Rotation.from_rotvec((phi - phi0)[:, None] * axis).as_matrix() @ bend
     reach = u + bend @ fore
@@ -1175,7 +1313,7 @@ def arm_pose(rest, j, g, elbow_local, h, target, swivel):
     forearm = upper @ bend
     E = S + upper @ u; W = E + forearm @ fore
     return (upper.reshape(shape + (3, 3)), forearm.reshape(shape + (3, 3)), E.reshape(shape + (3,)), W.reshape(shape + (3,)),
-            np.maximum(d - dc, 0).reshape(shape))
+            (np.maximum(d - dc, 0) + np.maximum(folded - d, 0)).reshape(shape))
 
 
 def wrist_excess(rest, h, upper, forearm, hand):
@@ -1186,8 +1324,8 @@ def wrist_excess(rest, h, upper, forearm, hand):
     local = np.swapaxes(forearm, -1, -2) @ hand; elbow = np.swapaxes(upper, -1, -2) @ forearm
     turned = np.swapaxes(spin, -1, -2) @ local[..., None, :, :]
     excess = rotation_angle(turned, clamp_wrist(turned.reshape(-1, 3, 3), rest, h).reshape(turned.shape))
-    twist = twist_deg((elbow[..., None, :, :] @ spin).reshape(-1, 3, 3), t).reshape(turned.shape[:-2])
-    return (excess + .02 * np.rad2deg(np.abs(rolls)) + np.maximum(np.abs(twist) - ELBOW_TWIST_DEG, 0)).min(-1)
+    twist = wrap_deg(elbow_parts(elbow, rest, h)[2][..., None] + FOREARM_ROLLS_DEG)
+    return (excess + .02 * np.rad2deg(np.abs(rolls)) + ELBOW_TWIST_WEIGHT * np.maximum(twist - ELBOW_TWIST_DEG, 0)).min(-1)
 
 
 def wrap_deg(a):
@@ -1385,7 +1523,7 @@ def curl_fingers(current, target, weights):
     return quat_matrix(slerp(q0, q1, np.repeat(weights[:, None], 15, 1)))
 
 
-def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_ranges, skin=None, video=None):
+def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_ranges, skin=None, video=None, room=None):
     from .correction import fk, PARENTS
     from .contact_arm_plan import source_reach_gap
     started = time.perf_counter(); n = len(roots); a, b = interval
@@ -1396,30 +1534,46 @@ def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_range
     base, frame = target_base(j, g, p, tj, part)
     offset = local_offset(track, part, base, frame, p[:, h]); entry['goal'] = 'joint offset'
     normal = unit(offset if np.linalg.norm(offset) > 1e-9 else np.array([0., 0., 1.]))
-    anchor = None
+    anchor = touch = None
+    if skin is not None and track['offset'] == 'auto' and track['distance'] == 'auto':
+        names = segment_names(part, side)
+        _, touching = hand_contact(skin, np.asarray(roots[a:b], float), np.asarray(quats[a:b], float), np.arange(a, b), h, names)[:2]
+        if np.isfinite(touching).all() and (touching >= -TOUCH_DEPTH_M).all() and (touching <= TOUCH_GAP_M).all():
+            return None, dict(entry, skipped='the hand already touches the target', skin_gap_min_m=float(touching.min()),
+                              skin_gap_max_m=float(touching.max()))
     if skin is not None and track['offset'] == 'auto' and track['distance'] == 'auto' and part == 'Hand':
         offset, normal, entry['goal'] = skin_offset(skin, np.asarray(roots[a:b], float), np.asarray(quats[a:b], float), np.arange(a, b), h, part, side,
                                                     base, frame, p[:, h])
         entry['goal'] = 'skin of ' + entry['goal']
     elif skin is not None and track['offset'] == 'auto' and track['distance'] == 'auto':
-        anchor, offset, normal, entry['anchor'] = skin_anchor(skin, rest, np.asarray(roots[a:b], float), np.asarray(quats[a:b], float), np.arange(a, b),
-                                                              h, tj, part, side, p[:, h], video)
+        window = (np.asarray(roots[a:b], float), np.asarray(quats[a:b], float), np.arange(a, b))
+        if track['grip'] == 'off':
+            touch, entry['touch'] = hand_touch(skin, rest, *window, h, part, side, offsets, video)
+        point = p[:, h] if touch is None else touch['points']
+        anchor, offset, normal, entry['anchor'] = skin_anchor(skin, rest, *window, h, tj, part, side, point, video if touch is None else None)
         base, frame = j[:, anchor], g[:, anchor]; entry['goal'] = 'skin of ' + entry['anchor']['segment']
 
     def frame_of(jj, gg, pp):
         return target_base(jj, gg, pp, tj, part) if anchor is None else (jj[:, anchor], gg[:, anchor])
-    travel = float(np.linalg.norm(p[:, h] - base - np.einsum('tij,j->ti', frame, offset), axis=1).max())
-    ease = max(6, math.ceil(travel * 100 / 3))
-    lo = max(0, a - ease); hi = min(n, b + ease)
+
+    def hand_shift(gg):
+        """Palm point minus the touching hand point (0 when the palm itself is the goal), in world axes."""
+        return 0. if touch is None else np.einsum('tij,j->ti', gg[:, ARMS[h][3]], touch['shift_local_m'])
+    travel = float(np.linalg.norm(p[:, h] - base - np.einsum('tij,j->ti', frame, offset) - hand_shift(g), axis=1).max())
+    ease = max(6, math.ceil(travel * 100 / 3)) if track.get('ease', 'auto') == 'auto' else int(track['ease'])
+    # Eases stay inside the gaps to the same hand's neighbouring holds, so consecutive holds blend from one goal to the next.
+    ease_in, ease_out = (ease, ease) if room is None else (min(ease, room[0]), min(ease, room[1]))
+    lo = max(0, a - ease_in); hi = min(n, b + ease_out)
     entry.update(offset_local_m=offset.tolist(), travel_m=travel, ease_frames=ease, window=[lo, hi])
+    if (ease_in, ease_out) != (ease, ease):entry['ease_frames_in_out'] = [int(ease_in), int(ease_out)]
     if hi - lo < 3:return None, dict(entry, skipped='interval shorter than three frames')
     root = np.asarray(roots[lo:hi], float); start = np.asarray(quats[lo:hi], float); work = start.copy()
-    weights = ease_weights(lo, hi, a, b, ease); inside = slice(a - lo, b - lo)
+    weights = ease_weights(lo, hi, a, b, ease_in, ease_out); inside = slice(a - lo, b - lo)
 
     def goals(q):
         jj, gg = fk(rest, root, q); pp, _, _ = palms(rest, root, q, offsets)
         bb, ff = frame_of(jj, gg, pp)
-        return jj, gg, pp, bb + np.einsum('tij,j->ti', ff, offset)
+        return jj, gg, pp, bb + np.einsum('tij,j->ti', ff, offset) + hand_shift(gg)
 
     def too_close(jj, gg, goal):
         """Frames whose wrist goal is nearer the shoulder than the current wrist: the elbow must bend, nothing can move closer."""
@@ -1488,12 +1642,18 @@ def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_range
     rows = np.arange(lo, hi); names = segment_names(part, side) if skin is not None else []; arms = arm_groups(h, part, side)[1:] if names else []
     clear_names = arm_targets(part, side)
     # A skin anchor lays the palm on the skin (hand_search); otherwise grip auto fits the wrist to the video hand.
-    palm_turn = anchor is not None
+    palm_turn = anchor is not None and touch is None
     fit = track['grip'] == 'auto' and bool(names) and video is not None and not palm_turn
     if fit or palm_turn:distal.remove(ARMS[h][3])
+    def limited_wrist(arm):
+        _, ga = fk(rest, root, limit_wrist_rows(rest, root, arm, h, fps))
+        return ga[:, ARMS[h][3]], np.ones(len(root), bool), {}
+
     # Penetration loop: after each solve the posed skin is checked and the goal pushed out of the target by the depth.
     size = np.zeros(hi - lo); push = np.zeros((hi - lo, 3)); share = .5 if len(hands) == 2 else 1.; history = []; hand_angles = None
-    for attempt in range(PUSH_ITERATIONS + ANCHOR_EXTRA_ROUNDS + 1 if names else 1):
+    pushed = np.zeros((hi - lo, 3)); settle = np.zeros((hi - lo, 3)); limits = None
+    rounds = PUSH_ITERATIONS + ANCHOR_EXTRA_ROUNDS + (0 if palm_turn else PUSH_EXTRA_ROUNDS)
+    for attempt in range(rounds + 1 if names else 1):
         moved = dict(arm_goals); moved[h] = arm_goals[h] + push * share
         if len(hands) == 2:moved[hands[1]] = arm_goals[hands[1]] - push * share
         solved, arm_report = solve_arms(rest, root, work, prior, offsets, fps, lo, moved, config)
@@ -1501,6 +1661,10 @@ def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_range
         if not attempt:
             facing, _, segment, _, gs = grip_geometry(rest, root, solved, offsets, tj, arm_goals[h])
             palm_before = angle_between(gs[:, ARMS[h][3]] @ PALM_NORMAL, facing)[inside]
+        if not (fit or palm_turn) and (limits is not None or arm_out_of_range(rest, root, solved, h)):
+            # The kept hand rotation is out of the wrist's range on the moved arm: the forearm takes part of the roll, the rest
+            # turns the hand as little as the limits need, and the arm is solved again for the turned palm.
+            solved, arm_report, clamped, limits = turn_wrist(rest, root, prior, solved, offsets, fps, lo, moved, hands, h, config, limited_wrist)
         grip = 'off'
         if track['grip'] == 'auto':
             grip = dict(mode='auto', wrist='source (no hand keypoints or skin)')
@@ -1517,28 +1681,43 @@ def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_range
                                                       video, rows, hand_angles, track['grip'] == 'auto')
             grip = dict(mode=track['grip'], **turned, wrist='palm')
         if arms:
-            solved, swivel, swivel_frames = clear_arm(rest, skin, root, solved, rows, h, clear_names, arms, fps)
+            solved, swivel, swivel_frames = clear_arm(rest, skin, root, solved, rows, h, clear_names, arms, fps, None if palm_turn else video)
             if fit or palm_turn:solved = limit_wrist_rows(rest, root, solved, h, fps)
-        final = blend(rest, root, start, solved, weights, sorted(set(joints)), distal)
+        final = blend(rest, root, start, solved, weights, sorted(set(joints)), distal, [ARMS[h][3]] if limits is not None else [])
         j0, g0 = fk(rest, root, start); js, _ = fk(rest, root, solved)
-        # Slerping twisted elbow frames can straighten past both ends; never end straighter than the limit or the source.
-        final, eased_clamped = clamp_elbows(rest, root, final, hands, {k: np.maximum(ELBOW_MAX_DEG, interior(*(j0[:, ARMS[k][i]] for i in (1, 2, 3))))
-                                                                      for k in hands})
+        # Slerping twisted elbow frames can straighten or fold past both ends; never end beyond the limits or the source.
+        straight = {k: np.maximum(ELBOW_MAX_DEG, interior(*(j0[:, ARMS[k][i]] for i in (1, 2, 3)))) for k in hands}
+        final, eased_clamped = clamp_elbows(rest, root, final, hands, straight, {k: np.maximum(ELBOW_FOLD_DEG, elbow_flex(rest, start, k)) for k in hands})
+        # Every path keeps the wrist and elbow twist in range, the forearm taking part of the roll; ease frames only partly.
+        for k in hands:final = limit_wrist_rows(rest, root, final, k, fps, weights)
         if not names:break
-        depth, gap = hand_contact(skin, root, final, rows, h, names, stride=1 if palm_turn else 2)[:2]
+        depth, gap, out, _, toward = hand_contact(skin, root, final, rows, h, names, stride=1 if palm_turn else 2, nearest=True)
         history.append(float(depth.max()))
+        frame_now = fk(rest, root, final)[1][:, tj if anchor is None else anchor]
         if not palm_turn:
-            if depth.max() <= PENETRATION_TOLERANCE_M or attempt == PUSH_ITERATIONS:break
-            size = size + push_size(depth, weights, fps)
-        else:
-            # The hand on an anchor keeps its roll and swivel, so the goal moves frame by frame: out of the skin where it sinks
-            # in, back onto it where it floats (full-contact frames only).
+            # Out along the measured push (a fixed offset's own direction can run along the target limb) until the depth is
+            # gone, and back toward the nearest skin where the hand floats on full-contact frames, by at most SETTLE_MAX_M.
             loose = np.where(weights >= 1, np.nan_to_num(gap, nan=0.) - SKIN_STANDOFF_M, 0.); loose[loose < SETTLE_GAP_M] = 0.
-            if (depth.max() <= ANCHOR_DEPTH_M and not loose.any()) or attempt == PUSH_ITERATIONS + ANCHOR_EXTRA_ROUNDS:break
-            step = np.where(depth > ANCHOR_DEPTH_M, (depth + PUSH_MARGIN_M) / np.maximum(weights, .25), -loose)
-            size = np.maximum(size + gaussian_filter1d(step, .5, mode='nearest') + np.maximum(step, 0) / 2, -SETTLE_MAX_M)
+            if (depth.max() <= PENETRATION_TOLERANCE_M and not loose.any()) or attempt == rounds:break
+            fallback = frame_now @ normal
+            step = push_size(depth, weights, fps)[:, None] * push_directions(out, depth > 0, fallback, fps)
+            pushed = pushed + np.einsum('tji,tj->ti', frame_now, step)
+            step = gaussian_filter1d(loose, .5, mode='nearest')[:, None] * push_directions(toward, loose > 0, -fallback, fps)
+            settle = settle + np.einsum('tji,tj->ti', frame_now, step)
+            # A settle may take back a push spread in time onto a frame that never sank in.
+            room = SETTLE_MAX_M + np.linalg.norm(pushed, axis=1)
+            settle = settle * np.minimum(1, room / np.maximum(np.linalg.norm(settle, axis=1), 1e-12))[:, None]
+            push = np.einsum('tij,tj->ti', frame_now, pushed + settle)
+            continue
+        # The hand on an anchor keeps its roll and swivel, so the goal moves frame by frame: out of the skin where it sinks in,
+        # back onto it where it floats (full-contact frames only).
+        loose = np.where(weights >= 1, np.nan_to_num(gap, nan=0.) - SKIN_STANDOFF_M, 0.); loose[loose < SETTLE_GAP_M] = 0.
+        if (depth.max() <= ANCHOR_DEPTH_M and not loose.any()) or attempt == PUSH_ITERATIONS + ANCHOR_EXTRA_ROUNDS:break
+        step = np.where(depth > ANCHOR_DEPTH_M, (depth + PUSH_MARGIN_M) / np.maximum(weights, .25), -loose)
+        size = np.maximum(size + gaussian_filter1d(step, .5, mode='nearest') + np.maximum(step, 0) / 2, -SETTLE_MAX_M)
         # Along the contact point's skin normal, which moves with the target.
-        push = size[:, None] * (fk(rest, root, final)[1][:, tj if anchor is None else anchor] @ normal)
+        push = size[:, None] * (frame_now @ normal)
+    if limits is not None:entry['wrist_limit'] = limits
     changed = weights > 0
     if names:
         depth, gap, _, arm_depth = hand_contact(skin, root, final, rows, h, names, arm=arms, arm_names=clear_names)
@@ -1557,7 +1736,7 @@ def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_range
             grip['fingers'] = dict(hand=h, window=[int(lo), int(hi)], weights=curl.tolist(), curled_frames=curled)
     jf, gf = fk(rest, root, final); pf, _, _ = palms(rest, root, final, offsets)
     bf, ff = frame_of(jf, gf, pf)
-    pin = (arm_goals[h] if part == 'Hand' and len(hands) == 2 else bf + np.einsum('tij,j->ti', ff, offset)) + push * share
+    pin = (arm_goals[h] if part == 'Hand' and len(hands) == 2 else bf + np.einsum('tij,j->ti', ff, offset) + hand_shift(gf)) + push * share
     residual = np.linalg.norm(pf[:, h] - pin, axis=1)[inside]
     elbows = {}
     for k in hands:
@@ -1570,8 +1749,9 @@ def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_range
                             interior_min_deg=float(eased[changed].min()), source_interior_max_deg=float(source[changed].max()), ease_fold_deg=fold,
                             ease_overshoot_deg=float(np.maximum(eased - np.maximum(source, full), 0)[ease_frames].max())
                             if ease_frames.any() else 0.)
-    wrist_change = max(float(np.rad2deg(Rotation.from_matrix((g0[:, ARMS[k][3]].swapaxes(-1, -2) @ gf[:, ARMS[k][3]])[changed]).magnitude()).max())
-                       for k in hands)
+    turned = {k: float(np.rad2deg(Rotation.from_matrix((g0[:, ARMS[k][3]].swapaxes(-1, -2) @ gf[:, ARMS[k][3]])[changed]).magnitude()).max())
+              for k in hands}
+    wrist_change = max(turned.values()); entry['wrists_turned'] = [k for k, v in turned.items() if v > 1e-3]
     entry.update(residual_max_m=float(residual.max()), residual_median_m=float(np.median(residual)), full_contact_frames=int(b - a),
                  palm_to_target_joint_median_m=float(np.median(np.linalg.norm(pf[:, h] - jf[:, tj], axis=1)[inside])),
                  palm_to_target_joint_max_m=float(np.linalg.norm(pf[:, h] - jf[:, tj], axis=1)[inside].max()),
@@ -1596,6 +1776,15 @@ def solve_interval(rest, roots, quats, offsets, fps, track, interval, foot_range
     return (lo + int(ids[0]), lo + int(ids[-1]) + 1, sorted(set(joints)), result), entry
 
 
+def ease_room(work, index, n):
+    """(frames before, frames after) interval index of work [(track, (start, end))] has up to the nearest interval held by the
+    same hand (n when none); None when no other interval of that hand exists."""
+    track, (a, b) = work[index]
+    others = [r for k, (t, r) in enumerate(work) if k != index and t['effector'] == track['effector']]
+    if not others:return None
+    return (min([a - e for s, e in others if e <= a], default=n), min([s - b for s, e in others if s >= b], default=n))
+
+
 def apply(rest, out_roots, out_quats, offsets, fps, tracks, foot_ranges, emit=lambda *a, **k: None, skin=None, video=None):
     """Solve enabled tracks in order on the corrected pose, mutating out_quats; None when nothing is enabled.
 
@@ -1606,14 +1795,14 @@ def apply(rest, out_roots, out_quats, offsets, fps, tracks, foot_ranges, emit=la
     started = time.perf_counter(); rest = np.asarray(rest, float)[:22]; offsets = np.asarray(offsets, float)
     entries = []; changed = []; warnings = []; wrists = []; fingers = []
     for index, (track, interval) in enumerate(work):
-        update, entry = solve_interval(rest, out_roots, out_quats, offsets, fps, track, interval, foot_ranges, skin, video)
+        room = ease_room(work, index, len(out_roots))
+        update, entry = solve_interval(rest, out_roots, out_quats, offsets, fps, track, interval, foot_ranges, skin, video, room)
         entries.append(entry)
         if update is not None:
             s, e, joints, values = update
             out_quats[s:e, joints] = values[:, joints].astype(out_quats.dtype)
             changed.append(dict(joints=[int(x) for x in joints], start=int(s), end=int(e)))
-            if isinstance(entry['grip'], dict) and entry['grip'].get('wrist') in ('video', 'palm'):
-                wrists.append(dict(joint=ARMS[0 if track['effector'] == 'LeftHand' else 1][3], start=int(s), end=int(e)))
+            for k in entry['wrists_turned']:wrists.append(dict(joint=ARMS[k][3], start=int(s), end=int(e)))
             if isinstance(entry['grip'], dict) and 'fingers' in entry['grip']:
                 fingers.append(entry['grip']['fingers'])
             if entry['residual_max_m'] > .03:

@@ -5,6 +5,7 @@ Command-line frames are inclusive A-B result frames (as in `review`); the store 
 from __future__ import annotations
 
 import argparse
+import re
 import time
 from pathlib import Path
 
@@ -51,6 +52,7 @@ def register(commands, common):
     group.add_argument('--offset', metavar='X,Y,Z', help='contact point in the target joint frame (metres), or auto')
     group.add_argument('--reciprocal', choices=('off', 'auto', 'always'), help='move the target limb too: off, auto (when out of reach), always')
     group.add_argument('--grip', choices=('off', 'auto'), help='orient the palm and wrap the fingers around the target')
+    group.add_argument('--ease', metavar='N', help='frames the hand eases in and out of each interval (0-120), or auto (from its travel)')
     parents = [common, target]
 
     p = actions.add_parser('list', parents=parents, help='show tracks, ranges, settings and last residuals')
@@ -63,6 +65,7 @@ def register(commands, common):
     p.add_argument('--id', metavar='ID', help='track id (default from the pair, e.g. rh-rf)')
     p.add_argument('--disabled', action='store_true', help='add the track switched off')
     p.set_defaults(handler=cmd_add)
+    numbers_as_values(p)
 
     p = actions.add_parser('edit', parents=parents + [settings], help='change a track')
     p.add_argument('--id', required=True, metavar='ID')
@@ -75,6 +78,7 @@ def register(commands, common):
     switch.add_argument('--enable', dest='enabled', action='store_const', const=True, help='switch the track on')
     switch.add_argument('--disable', dest='enabled', action='store_const', const=False, help='switch the track off')
     p.set_defaults(handler=cmd_edit)
+    numbers_as_values(p)
 
     p = actions.add_parser('remove', parents=parents, help='remove a track, or all self-contacts')
     which = p.add_mutually_exclusive_group(required=True)
@@ -239,6 +243,23 @@ def parse_distance(value):
         raise CliError('--distance expects metres or auto', EXIT_USAGE) from None
 
 
+def numbers_as_values(parser):
+    """Let option values start with a minus, as --offset -0.05,0,-0.14: argparse reads only plain negative numbers as values."""
+    parser._negative_number_matcher = re.compile(r'^-\d+$|^-\d*\.\d+$|^-?\d*\.?\d+(,-?\d*\.?\d+)+$')
+
+
+def parse_ease(value):
+    if value is None or str(value).lower() == 'auto':
+        return 'auto'
+    try:
+        frames = int(value)
+    except ValueError:
+        frames = -1
+    if not 0 <= frames <= 120:
+        raise CliError('--ease expects 0-120 frames or auto', EXIT_USAGE)
+    return frames
+
+
 def parse_offset(value):
     if value is None or str(value).lower() == 'auto':
         return 'auto'
@@ -376,7 +397,8 @@ def describe(track):
     distance = track['distance'] if track['distance'] == 'auto' else f'{track["distance"]:g} m'
     return [f'{track["id"]}: {track["effector"]} -> {track["target"]}{state}',
             f'    frames {inclusive(track["ranges"])}   suggested {inclusive(track["automatic"])}',
-            f'    distance {distance}, offset {offset}, reciprocal {track["reciprocal"]}, grip {track["grip"]}, source {track["source"]}']
+            f'    distance {distance}, offset {offset}, reciprocal {track["reciprocal"]}, grip {track["grip"]}, ease {track.get("ease", "auto")}, '
+            f'source {track["source"]}']
 
 
 def describe_foot(entry):
@@ -529,6 +551,8 @@ def track_settings(args, track):
         track['distance'] = parse_distance(args.distance)
     if args.offset is not None:
         track['offset'] = parse_offset(args.offset)
+    if args.ease is not None:
+        track['ease'] = parse_ease(args.ease)
     for key in ('reciprocal', 'grip'):
         if getattr(args, key) is not None:
             track[key] = getattr(args, key)

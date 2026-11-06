@@ -383,9 +383,11 @@ arrow and the angle are left out (noted in `sheet.json`) and the crop is sized f
 ```
 rgbmocap-cli.cmd contacts list    --project P [--model M]
 rgbmocap-cli.cmd contacts add     --project P --effector RightHand --target RightFoot --frames 345-420[,500-510]
-                                  [--distance M|auto] [--offset X,Y,Z|auto] [--reciprocal off|auto|always] [--grip off|auto] [--id ID] [--disabled]
+                                  [--distance M|auto] [--offset X,Y,Z|auto] [--reciprocal off|auto|always] [--grip off|auto]
+                                  [--ease N|auto] [--id ID] [--disabled]
 rgbmocap-cli.cmd contacts edit    --project P --id ID [--frames ...] [--add-frames ...] [--remove-frames ...] [--accept]
                                   [--target BONE] [--enable|--disable] [--distance ...] [--offset ...] [--reciprocal ...] [--grip ...]
+                                  [--ease ...]
 rgbmocap-cli.cmd contacts remove  --project P --id ID | --all
 rgbmocap-cli.cmd contacts suggest --project P [--accept] [--min-severity high|medium|low] [--result KIND]
 ```
@@ -399,9 +401,21 @@ edits and shared with the app. The project needs a corrected result first (`corr
 - `--frames` are inclusive result frames `A-B` (the numbers `review` reports), several separated by commas; files store
   them zero-based and end-exclusive. `edit --frames` replaces the intervals, `--add-frames`/`--remove-frames` change them.
 - Per-track settings: `--distance` (palm-to-target metres, default auto), `--offset` (contact point in the target joint's
-  frame, metres, default auto), `--reciprocal` (move the target limb too: `off`, `auto` when the arm cannot reach,
-  `always`; default auto), `--grip` (`auto` turns the palm toward the target and wraps the fingers; default off).
-- One hand holds one target at a time: two enabled tracks of the same hand may not overlap in frames.
+  frame, metres, default auto; negative values may follow a space, `--offset -0.05,0,-0.14`), `--reciprocal` (move the
+  target limb too: `off`, `auto` when the arm cannot reach, `always`; default auto), `--grip` (`auto` turns the palm toward
+  the target and wraps the fingers; default off), `--ease` (frames the hand blends in before and out after each interval,
+  0-120; default auto: 6 frames, more for a long travel, 1 frame per 3 cm).
+- One hand holds one target at a time: two enabled tracks of the same hand may not overlap in frames. Eases stay inside the
+  gap to the same hand's neighbouring interval, so consecutive holds blend from one goal to the next within that gap.
+- How `correct` solves a track: with grip off and an automatic contact point the hand keeps its captured world rotation and
+  touches with its skin nearest the target (palm, back of the hand, knuckles or fingertips), at the target skin point
+  nearest that; when confident video hand keypoints see the captured hand pointing more than 30 deg away, the palm is laid
+  on the skin instead (as grip auto). A hold whose hand skin already lies within 1.5 cm of the target skin (and less than
+  1 cm inside) on every frame is left as captured (`skipped` in `list`). On every path the wrist is kept inside its range
+  and the elbow twist within 80 deg (the forearm takes part of the roll, the rest turns the hand as little as needed) and
+  the elbow flexes at most 150 deg about its hinge: a goal nearer the shoulder leaves the hand short instead of folding the
+  forearm through the upper arm. A hand that sinks into the target is pushed out along the measured penetration until the
+  depth is gone, and a floating hand settles back onto the skin.
 - `suggest` reviews the uncorrected base result (ExMR; `--result` to choose another) and stores each finding as
   suggested (`automatic`) intervals on the track for that hand and target, creating it if needed:
   - `missed_contact` (MC): the `review` check, a hand touching a body part in the video but apart in 3D.

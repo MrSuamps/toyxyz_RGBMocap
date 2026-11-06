@@ -13,7 +13,8 @@ SELF_UNDO = 'self-contact'
 EFFECTORS = ('LeftHand', 'RightHand')
 RECIPROCAL = ('off', 'auto', 'always')
 GRIP = ('off', 'auto')
-DEFAULTS = dict(offset='auto', distance='auto', reciprocal='auto', grip='off', enabled=True, source='user')
+EASE_MAX = 120
+DEFAULTS = dict(offset='auto', distance='auto', reciprocal='auto', grip='off', ease='auto', enabled=True, source='user')
 ROW_COLORS = ('#d9a650', '#62c0a0', '#d77f9e', '#9d97e3', '#bfbf62', '#6fb3d9')
 ABBREVIATIONS = {'hips': 'Hip', 'spine': 'Sp', 'spine1': 'Sp1', 'spine2': 'Sp2', 'neck': 'Nk', 'head': 'Hd'}
 
@@ -195,7 +196,7 @@ class SelfContactRows:
     def update_settings(self, index, **changes):
         tracks = self._copy()
         track = tracks[index]
-        unknown = set(changes) - {'target', 'distance', 'offset', 'reciprocal', 'grip', 'enabled'}
+        unknown = set(changes) - {'target', 'distance', 'offset', 'reciprocal', 'grip', 'ease', 'enabled'}
         if unknown:
             raise ValueError('Unknown self-contact setting: ' + ', '.join(sorted(unknown)))
         if 'target' in changes:
@@ -205,6 +206,9 @@ class SelfContactRows:
         distance = changes.get('distance', track['distance'])
         if distance != 'auto' and (isinstance(distance, bool) or not isinstance(distance, (int, float)) or not 0 <= distance < 10):
             raise ValueError('Distance must be "auto" or metres between 0 and 10')
+        ease = changes.get('ease', track.get('ease', 'auto'))
+        if ease != 'auto' and (isinstance(ease, bool) or not isinstance(ease, int) or not 0 <= ease <= EASE_MAX):
+            raise ValueError(f'Ease must be "auto" or 0-{EASE_MAX} frames')
         track.update(changes)
         if 'distance' in changes and distance != 'auto':
             track['distance'] = float(distance)
@@ -262,7 +266,7 @@ class PairDialog:
 
     @staticmethod
     def ask(parent, track=None):
-        from PySide6.QtWidgets import QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout
+        from PySide6.QtWidgets import QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout, QSpinBox
         from .mixamo_rig import BODY_NAMES
         from .self_contact_store import arm_chain
         dialog = QDialog(parent)
@@ -304,6 +308,17 @@ class PairDialog:
                            ('auto', 'Auto: turn the palm onto the target and curl the fingers')):
             grip.addItem(text, name)
         grip.setCurrentIndex(grip.findData(track['grip'] if track else 'off'))
+        smart = QCheckBox('Automatic ease (from the hand travel)')
+        ease = QSpinBox()
+        ease.setRange(0, EASE_MAX)
+        ease.setSuffix(' frames')
+        ease.setToolTip('Frames over which the hand blends into and out of each held interval; neighbouring holds of the same hand '
+                        'share the frames between them.')
+        current = track.get('ease', 'auto') if track else 'auto'
+        smart.setChecked(current == 'auto')
+        ease.setValue(6 if current == 'auto' else int(current))
+        ease.setEnabled(current != 'auto')
+        smart.toggled.connect(lambda on: ease.setEnabled(not on))
         enabled = QCheckBox('Apply this pair')
         enabled.setChecked(track['enabled'] if track else True)
         form.addRow('Hand', effector)
@@ -312,6 +327,8 @@ class PairDialog:
         form.addRow('Palm distance', distance)
         form.addRow('Reciprocal', reciprocal)
         form.addRow('Grip', grip)
+        form.addRow(smart)
+        form.addRow('Ease', ease)
         form.addRow(enabled)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         buttons.accepted.connect(dialog.accept)
@@ -322,7 +339,8 @@ class PairDialog:
                 return None
             return dict(effector=effector.currentData(), target=target.currentData(),
                         distance='auto' if automatic.isChecked() else float(distance.value()),
-                        reciprocal=reciprocal.currentData(), grip=grip.currentData(), enabled=enabled.isChecked())
+                        reciprocal=reciprocal.currentData(), grip=grip.currentData(), ease='auto' if smart.isChecked() else int(ease.value()),
+                        enabled=enabled.isChecked())
         finally:
             dialog.deleteLater()
 

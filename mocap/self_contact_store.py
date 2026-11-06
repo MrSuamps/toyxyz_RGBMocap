@@ -13,7 +13,9 @@ VERSION = 1
 EFFECTORS = ('LeftHand', 'RightHand')
 RECIPROCAL = ('off', 'auto', 'always')
 GRIP = ('off', 'auto')
-KEYS = ('id', 'effector', 'target', 'offset', 'distance', 'reciprocal', 'grip', 'enabled', 'ranges', 'automatic', 'source')
+KEYS = ('id', 'effector', 'target', 'offset', 'distance', 'reciprocal', 'grip', 'ease', 'enabled', 'ranges', 'automatic', 'source')
+# Ease frames before and after each interval: 'auto' (from the hand's travel) or a count; written only when set.
+EASE_MAX = 120
 ID_PATTERN = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,63}')
 UNSIDED = ('Hips', 'Spine', 'Spine1', 'Spine2', 'Neck', 'Head')
 FEET = ('LeftFoot', 'RightFoot')
@@ -78,7 +80,7 @@ def _applied_content(frames, fps, tracks, rows):
     entry; only their suggestions and provenance are left out.
     """
     def strip(entry):
-        return {key: value for key, value in entry.items() if key not in ('automatic', 'source')}
+        return {key: value for key, value in entry.items() if key not in ('automatic', 'source') and not (key == 'ease' and value == 'auto')}
     held = [strip(t) for t in tracks if t['enabled'] and t['ranges']]
     kept = {key: [strip(e) for e in entries] for key, entries in rows.items() if entries}
     if not held and not kept:
@@ -163,6 +165,9 @@ def _track(raw, frames, index):
     grip = raw.get('grip', 'off')
     if grip not in GRIP:
         raise ValueError(f'{label}: grip must be one of {", ".join(GRIP)}, got {grip!r}')
+    ease = raw.get('ease', 'auto')
+    if ease != 'auto' and (isinstance(ease, bool) or not isinstance(ease, int) or not 0 <= ease <= EASE_MAX):
+        raise ValueError(f'{label}: ease must be "auto" or 0-{EASE_MAX} frames, got {ease!r}')
     enabled = raw.get('enabled', True)
     if not isinstance(enabled, bool):
         raise ValueError(f'{label}: enabled must be true or false')
@@ -171,7 +176,7 @@ def _track(raw, frames, index):
         raise ValueError(f'{label}: source must be a string')
     if name is not None and (not isinstance(name, str) or not ID_PATTERN.fullmatch(name)):
         raise ValueError(f'{label}: id must be 1-64 letters, digits, ".", "_" or "-"')
-    return dict(id=name, effector=effector, target=target, offset=offset, distance=distance, reciprocal=reciprocal, grip=grip,
+    return dict(id=name, effector=effector, target=target, offset=offset, distance=distance, reciprocal=reciprocal, grip=grip, ease=ease,
                 enabled=enabled, ranges=_ranges(raw.get('ranges', []), frames, label + ' ranges'),
                 automatic=_ranges(raw.get('automatic', []), frames, label + ' automatic'), source=source)
 
@@ -350,7 +355,8 @@ def save(project, base, tracks, context, articulation=None, placement=None, smoo
     applied = was if before is not False and content == before else None if content is None else current
     first, second = slot_names(base)
     filename = first if previous.get('file') == second else second
-    payload = [{**track, 'ranges': [list(p) for p in track['ranges']], 'automatic': [list(p) for p in track['automatic']]} for track in tracks]
+    payload = [{**{k: v for k, v in track.items() if not (k == 'ease' and v == 'auto')}, 'ranges': [list(p) for p in track['ranges']],
+                'automatic': [list(p) for p in track['automatic']]} for track in tracks]
     record = {'version': VERSION, 'revision': current, 'tracks': payload}
     if articulation:
         record['articulation'] = [{**e, 'ranges': [list(p) for p in e['ranges']], 'automatic': [list(p) for p in e['automatic']]} for e in articulation]

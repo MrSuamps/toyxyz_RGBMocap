@@ -73,10 +73,21 @@ class GripOffTest(unittest.TestCase):
             root, q = clip(); old_q = q.copy()
             new = sc.apply(REST, root, q, OFFSETS, FPS, tracks, [[], []])
             old = baseline.apply(REST, root.copy(), old_q, OFFSETS, FPS, tracks, [[], []])
-            self.assertEqual(q.tobytes(), old_q.tobytes(), tracks[0]['target'])
             self.assertEqual(new['changed'], old['changed'])
-            self.assertEqual(new['wrist_changed'], []); self.assertEqual(new['fingers'], [])
+            self.assertEqual(new['fingers'], [])
             self.assertEqual([e['grip'] for e in new['tracks']], ['off'] * len(new['tracks']))
+            if not new['wrist_changed'] and not any('wrist_limit' in e for e in new['tracks']):
+                self.assertEqual(q.tobytes(), old_q.tobytes(), tracks[0]['target'])
+                continue
+            # A kept hand rotation the moved arm cannot hold is rolled into the forearm and turned into the wrist's range (declared rows).
+            _, g = fk(REST, root.astype(float), q.astype(float))
+            for k in (0, 1):
+                twist = sc.elbow_parts(sc.quat_matrix(q[:, 18 + k].astype(float)), REST, k)[2]
+                self.assertLessEqual(np.abs(twist).max(), max(sc.ELBOW_TWIST_DEG + 1, np.abs(sc.elbow_parts(sc.quat_matrix(old_q[:, 18 + k].astype(float)), REST, k)[2]).max()))
+            for row in new['wrist_changed']:
+                h = 0 if row['joint'] == 20 else 1; s, e = row['start'], row['end']
+                local = g[s:e, 18 + h].swapaxes(-1, -2) @ g[s:e, 20 + h]
+                self.assertLess(sc.rotation_angle(local, sc.clamp_wrist(local, REST, h)).max(), 1., tracks[0]['target'])
 
     def test_publish_without_fingers_is_a_no_op(self):
         params = {'right_hand_pose': torch.zeros(N, 45), 'rot6d': torch.zeros(1, N, 52, 6)}
@@ -109,12 +120,12 @@ class GripTest(unittest.TestCase):
         self.assertLess(flexed[1], -.3); self.assertGreater(radial[2], .1); self.assertLess(pronated[1], -.5)
 
     def test_grip_auto_without_video_keeps_the_source_wrist(self):
-        """Without hand keypoints grip auto is grip off: same arm, wrist world rotation kept, nothing declared."""
+        """Without hand keypoints grip auto is grip off: same arm, wrist world rotation kept unless out of range."""
         for target, reciprocal in (('RightUpLeg', 'off'), ('RightFoot', 'auto'), ('LeftForeArm', 'off')):
             _, _, off_q, off = solve([track(target=target, reciprocal=reciprocal)])
             _, _, auto_q, auto = solve([track(target=target, reciprocal=reciprocal, grip='auto')])
             self.assertEqual(off_q.tobytes(), auto_q.tobytes(), target)
-            self.assertEqual(auto['wrist_changed'], []); self.assertEqual(auto['fingers'], [])
+            self.assertEqual(auto['wrist_changed'], off['wrist_changed']); self.assertEqual(auto['fingers'], [])
             self.assertEqual(auto['tracks'][0]['grip']['wrist'], 'source (no hand keypoints or skin)')
 
     def test_grip_twist_is_continuous(self):

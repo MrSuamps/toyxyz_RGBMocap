@@ -15,7 +15,7 @@ from .tooltips import tooltip_text
 TIMELINE_HELP = (
     "Self-contact rows (e.g. RH→RF: right hand holds right foot), one per pair: edit intervals like locks.\n"
     "Hatched intervals are suggestions: double-click or right-click to accept them.\n"
-    "Right-click: add a pair (+ Pair row), pair settings (distance, reciprocal, grip), disable, reset, remove.\n\n"
+    "Right-click: add a pair (+ Pair row), pair settings (distance, reciprocal, grip, ease), disable, reset, remove.\n\n"
     "L/R pose: foot articulation per interval (Match 2D, Pointe, Flat, Flexed).\n"
     "Drag to add an interval with the row's current mode; right-click to change mode, strength or limits (dancer allows full pointe).\n"
     "L/R arm 2D, L/R leg 2D: limb placement, fit the limb to the video's 2D keypoints (ExMR); right-click for strength.\n"
@@ -111,9 +111,10 @@ class SelfContactController(QObject):
         slider.sc_status = w.status.setText
         slider.sc_resized = lambda: QTimer.singleShot(0, self.fit_timeline)
         self.suggest_button = QPushButton('Suggest Contacts')
-        self.suggest_button.setToolTip(tooltip_text('Find frames where a hand probably touches the body (review missed-contact check) and '
-                                                    'show them as hatched suggestions on the self-contact rows. Accept them on the timeline, '
-                                                    'then Apply Correction. Does not run AI models.'))
+        self.suggest_button.setToolTip(tooltip_text('Find frames where a hand probably touches the body (review missed-contact check: touching in the video '
+                                                    'but apart in 3D) or rests sunk inside it (sustained, slow penetration of the body mesh), '
+                                                    'and show them as hatched suggestions on the self-contact rows. Accept them on the '
+                                                    'timeline, then Apply Correction. Does not run AI models.'))
         self.suggest_button.clicked.connect(self.suggest)
         actions = w.reset_footlocks_button.parentWidget().layout()
         actions.insertWidget(actions.indexOf(w.reset_footlocks_button) + 1, self.suggest_button)
@@ -162,7 +163,7 @@ class SelfContactController(QObject):
         self.suggest_button.setEnabled(ready and exmr)
         self.suggest_button.setText('Suggesting...' if self.suggesting() else 'Suggest Contacts')
         if not exmr:
-            self.suggest_button.setToolTip(tooltip_text('Suggestions use the review missed-contact check, which needs ExMR 2D keypoints.'))
+            self.suggest_button.setToolTip(tooltip_text('Suggestions need ExMR: the missed-contact check reads its 2D keypoints.'))
         available = self.overlay.available() or bool(self.overlay.message)
         self.show_original.setEnabled(available or self.show_original.isChecked())
         self.opacity.setEnabled(self.show_original.isChecked())
@@ -307,7 +308,7 @@ class SelfContactController(QObject):
         process.errorOccurred.connect(lambda error, p=process: self.suggest_finished(p, -1) if error == QProcess.FailedToStart else None)
         self.suggest_process = process
         w.stop_playback()
-        w.status.setText('Suggesting self-contacts from the review missed-contact check...')
+        w.status.setText('Suggesting self-contacts from the review missed-contact and sunk-hand checks...')
         process.start(program, args)
         self.sync()
 
@@ -330,10 +331,12 @@ class SelfContactController(QObject):
                 summary = value
                 break
         if code == 0 and summary is not None:
-            issues = len(summary.get('issues', []))
+            found = summary.get('issues', [])
+            issues, sunk = len(found), sum(i.get('check') == 'sunk_hand' for i in found)
             self.w.status.setText(f'{issues} suggested self-contact interval(s). Accept them on the hatched timeline rows, then Apply Correction.'
-                                  if issues else 'No missed hand contacts found.')
-            self.w.log.append(f'Suggest Contacts: {issues} missed contact(s) from {summary.get("reviewed", "the original motion")}.')
+                                  if issues else 'No missed or sunk hand contacts found.')
+            self.w.log.append(f'Suggest Contacts: {issues - sunk} missed contact(s) and {sunk} hand(s) resting inside the body '
+                              f'from {summary.get("reviewed", "the original motion")}.')
         else:
             message = (summary or {}).get('error') or (errors[-1] if errors else f'exit code {code}')
             self.w.status.setText('Suggest Contacts failed: ' + message)
